@@ -1503,7 +1503,14 @@ class ImagePreview(QWidget):
         if t is None or dims is None:
             return None
         local = t.inverted()[0].map(scene_pos)
-        return self.map_displayed_to_full(local.x(), local.y())
+        fx, fy = self.map_displayed_to_full(local.x(), local.y())
+        # Reject clicks outside the image (e.g. the gray margin around a
+        # displayed crop) so they can't spuriously match/delete a stroke or
+        # author one off-canvas.
+        W, H = dims
+        if not (0 <= fx < W and 0 <= fy < H):
+            return None
+        return fx, fy
 
     def _heal_hit_test(self, fx, fy):
         """Index of the topmost stroke whose footprint contains (fx, fy), or None."""
@@ -1628,6 +1635,8 @@ class ImagePreview(QWidget):
 
     def _draw_heal_ghost(self):
         self._remove_heal_ghost()
+        if self.current_pixmap is None or self.current_pixmap.isNull():
+            return
         t = self._image_transform()
         dims = self._full_dims()
         if t is None or dims is None or not self._heal_stroke_pts:
@@ -1733,6 +1742,8 @@ class ImagePreview(QWidget):
     def _visualize_pixmap(self, pixmap):
         """A high-contrast 'find the dust' rendering of the displayed pixmap
         (same geometry — coordinates are unaffected)."""
+        if pixmap is None or pixmap.isNull():
+            return pixmap
         try:
             import numpy as np
             import cv2

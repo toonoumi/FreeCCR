@@ -94,6 +94,46 @@ def test_full_heal_workflow(converted_image):
     assert ccr_backend.get_dust_strokes_by_index(idx) == []
 
 
+def test_autodetect_preserves_manual_strokes(converted_image):
+    """Re-running Auto-Detect (even at a new sensitivity) keeps manual strokes
+    and replaces — not accumulates — the auto ones (spec §3.6 / §9.5)."""
+    from core.ccr_backend import ccr_backend
+    mw, idx = converted_image
+    ip = mw.image_preview
+    ip.heal_action.setChecked(True)
+
+    ip.heal_press(QPointF(30, 30))      # a manual heal far from the spot
+    ip.heal_release(QPointF(30, 30))
+    manual_before = [s for s in ccr_backend.get_dust_strokes_by_index(idx)
+                     if s["source"] == "manual"]
+    assert len(manual_before) == 1
+
+    ip.sensitivity_combo.setCurrentIndex(2)   # High
+    ip.auto_detect_dust()
+    ip.sensitivity_combo.setCurrentIndex(0)   # Low
+    ip.auto_detect_dust()
+
+    strokes = ccr_backend.get_dust_strokes_by_index(idx)
+    manual_after = [s for s in strokes if s["source"] == "manual"]
+    autos = [s for s in strokes if s["source"] == "auto"]
+    assert len(manual_after) == 1                       # preserved
+    assert manual_after[0]["points"] == manual_before[0]["points"]
+    assert len(autos) <= 3                              # replaced, not accumulated
+
+
+def test_clicks_outside_image_are_noops(converted_image):
+    """Clicking far outside the image bounds must not create/delete strokes."""
+    from core.ccr_backend import ccr_backend
+    mw, idx = converted_image
+    ip = mw.image_preview
+    ip.heal_action.setChecked(True)
+    assert ip._heal_scene_to_full(QPointF(-500, -500)) is None
+    n = len(ccr_backend.get_dust_strokes_by_index(idx))
+    ip.heal_press(QPointF(-500, -500))
+    ip.heal_release(QPointF(-500, -500))
+    assert len(ccr_backend.get_dust_strokes_by_index(idx)) == n
+
+
 def test_heal_mode_blocked_until_converted(converted_image):
     from core.ccr_backend import ccr_backend
     mw, idx = converted_image
