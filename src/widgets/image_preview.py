@@ -17,6 +17,12 @@ import os
 
 _eyedropper_cursor_cache = None
 
+# Dust-healing overlay tints (RGB; QColor built lazily to avoid pre-QApplication
+# construction). auto = cyan-blue, manual = green, live drag ghost = amber.
+_HEAL_AUTO_RGB = (0, 180, 255)
+_HEAL_MANUAL_RGB = (0, 210, 0)
+_HEAL_GHOST_RGB = (255, 210, 0)
+
 def _eyedropper_cursor():
     """Small painter-drawn eyedropper cursor, hotspot at the tip (bottom-left)."""
     global _eyedropper_cursor_cache
@@ -138,7 +144,8 @@ class GraphicsImageView(QGraphicsView):
                                   or self._bw_drag_start is not None
                                   or self.parent_widget.crop_mode
                                   or self.parent_widget._area_drag is not None
-                                  or self.parent_widget._slice_drag is not None)
+                                  or self.parent_widget._slice_drag is not None
+                                  or self.parent_widget.heal_mode)
             if not interaction_active:
                 self._mid_pan = True
                 self._mid_pan_last = event.pos()
@@ -164,6 +171,12 @@ class GraphicsImageView(QGraphicsView):
                 self.parent_widget.slice_press(self.mapToScene(event.pos()))
             elif event.button() == Qt.RightButton:
                 self.parent_widget.slice_delete_at(self.mapToScene(event.pos()))
+            return
+        if self.parent_widget.heal_mode and self.parent_widget.pixmap_item is not None:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.heal_press(self.mapToScene(event.pos()))
+            elif event.button() == Qt.RightButton:
+                self.parent_widget.heal_remove_at(self.mapToScene(event.pos()))
             return
         if event.button() == Qt.LeftButton and self.wb_pick_mode and self.parent_widget.pixmap_item is not None:
             scene_pos = self.mapToScene(event.pos())
@@ -231,6 +244,9 @@ class GraphicsImageView(QGraphicsView):
             return
         if self.parent_widget.slice_mode:
             self.parent_widget.slice_move(self.mapToScene(event.pos()))
+            return
+        if self.parent_widget.heal_mode:
+            self.parent_widget.heal_move(self.mapToScene(event.pos()))
             return
         if self.bwpoint_mode and self._bw_drag_start is not None:
             self._bw_drag_end = self.mapToScene(event.pos())
@@ -341,6 +357,10 @@ class GraphicsImageView(QGraphicsView):
         if self.parent_widget.slice_mode:
             if event.button() == Qt.LeftButton:
                 self.parent_widget.slice_release()
+            return
+        if self.parent_widget.heal_mode:
+            if event.button() == Qt.LeftButton:
+                self.parent_widget.heal_release(self.mapToScene(event.pos()))
             return
         if self.bwpoint_mode and event.button() == Qt.LeftButton and self._bw_drag_start is not None:
             drag_start_scene = self._bw_drag_start
@@ -507,6 +527,8 @@ class GraphicsImageView(QGraphicsView):
         pw = self.parent_widget
         if pw is not None and pw.crop_mode:
             self.setCursor(Qt.CrossCursor)
+        elif pw is not None and pw.heal_mode:
+            self.setCursor(Qt.BlankCursor)   # the brush ring is the cursor
         elif self.wb_pick_mode:
             self.setCursor(_eyedropper_cursor())
         elif self.bwpoint_mode:
@@ -670,6 +692,54 @@ class ImagePreview(QWidget):
         self.toolbar.addAction(self.unconvert_action)
         add_spacer()
 
+        # --- Dust healing tools (gated to converted images) ---------------
+        self.heal_action = QAction("🩹 Heal", self)
+        self.heal_action.setCheckable(True)
+        self.heal_action.setToolTip(
+            "Dust healing: auto-detect spots, click a marked spot to remove the "
+            "detection, or click/drag to heal a missed spot or scratch.")
+        self.heal_action.toggled.connect(self.toggle_heal_mode)
+        self.toolbar.addAction(self.heal_action)
+        add_spacer()
+
+        self.auto_dust_action = QAction("Auto-Detect", self)
+        self.auto_dust_action.setToolTip("Automatically detect dust spots and "
+                                         "scratches on the current image.")
+        self.auto_dust_action.triggered.connect(self.auto_detect_dust)
+        self.toolbar.addAction(self.auto_dust_action)
+        add_spacer()
+
+        self.visualize_action = QAction("Visualize", self)
+        self.visualize_action.setCheckable(True)
+        self.visualize_action.setToolTip("Show a high-contrast view that makes "
+                                         "dust easy to spot (display only).")
+        self.visualize_action.toggled.connect(self.toggle_visualize)
+        self.toolbar.addAction(self.visualize_action)
+        add_spacer()
+
+        self.clear_dust_action = QAction("Clear Spots", self)
+        self.clear_dust_action.setToolTip("Remove all dust heal strokes.")
+        self.clear_dust_action.triggered.connect(self.clear_dust)
+        self.toolbar.addAction(self.clear_dust_action)
+        add_spacer()
+
+        self.brush_combo = QComboBox()
+        self.brush_combo.addItems(["Brush S", "Brush M", "Brush L"])
+        self.brush_combo.setCurrentIndex(1)   # M
+        self.brush_combo.setFixedWidth(78)
+        self.brush_combo.setToolTip("Manual heal brush size.")
+        self.brush_combo.currentIndexChanged.connect(self._on_brush_changed)
+        self.toolbar.addWidget(self.brush_combo)
+        add_spacer()
+
+        self.sensitivity_combo = QComboBox()
+        self.sensitivity_combo.addItems(["Sens Low", "Sens Med", "Sens High"])
+        self.sensitivity_combo.setCurrentIndex(1)   # Med
+        self.sensitivity_combo.setFixedWidth(86)
+        self.sensitivity_combo.setToolTip("Auto-detect sensitivity.")
+        self.toolbar.addWidget(self.sensitivity_combo)
+        add_spacer()
+
         self.export_action = QAction("Export…", self)
         self.export_action.triggered.connect(self.open_export_dialog)
         self.toolbar.addAction(self.export_action)
@@ -778,6 +848,18 @@ class ImagePreview(QWidget):
         self._slice_drag = None          # line dict being dragged, or None
         self._slice_worker = None
 
+        # Dust healing mode: click a marked spot to remove its detection, or
+        # click/drag to heal. Strokes live on the image (normalized, un-cropped
+        # space) and replay through apply_adjustments. See spec/dust-healing.md.
+        self.heal_mode = False
+        self.dust_visualize = False      # high-contrast "find the dust" view
+        self._heal_drag = False          # a manual stroke is being drawn
+        self._heal_stroke_pts = []       # in-progress stroke, full-image coords
+        self._heal_ring_item = None      # brush-size ring following the cursor
+        self._heal_ghost_items = []      # live preview of the stroke being drawn
+        self._dust_overlay_items = []    # markers for committed strokes
+        self._last_cursor_scene = None   # last cursor scene pos (for brush ring)
+
         # Coalesce a fine-rotation drag into a single undo step
         self._fine_rot_burst_active = False
         self._fine_rot_burst_timer = QTimer(self)
@@ -829,6 +911,11 @@ class ImagePreview(QWidget):
             self._exit_slice_mode()
         if self.area_mode:
             self._exit_area_mode()
+        if self.heal_mode:
+            self._exit_heal_mode()
+            self.heal_action.blockSignals(True)
+            self.heal_action.setChecked(False)
+            self.heal_action.blockSignals(False)
         self._release_hires(refresh=False)
         self.current_idx = None
         self._current_image_ref = None
@@ -864,6 +951,8 @@ class ImagePreview(QWidget):
         elif self.area_mode:
             # Esc leaves area editing: deselect back to the Whole Image layer.
             self._select_whole_image_layer()
+        elif self.heal_mode:
+            self.heal_action.setChecked(False)   # toggled -> toggle_heal_mode(False)
 
     def update_preview(self, idx):
         ''' Update the UI image based on the backend, using the index from the thumbnail list. '''
@@ -946,6 +1035,14 @@ class ImagePreview(QWidget):
             self._zoom = 1.0
             self._release_hires(refresh=False)
 
+        # Visualize mode: swap in a high-contrast "find the dust" rendering.
+        # Same geometry as the normal pixmap, so all heal coordinates are
+        # unaffected; display-only (never stored/exported).
+        if (self.dust_visualize and preview_img is not None
+                and not preview_img.isNull()
+                and ccr_backend.images[idx].converted):
+            preview_img = self._visualize_pixmap(preview_img)
+
         self.current_pixmap = preview_img
         self.current_fine_rotation = ccr_backend.get_image_fine_rotation_by_index(idx)
         self.rotation_slider.setValue(self.current_fine_rotation)
@@ -962,6 +1059,10 @@ class ImagePreview(QWidget):
         self._area_overlay_items = []
         self._slice_ghost_item = None
         self._slice_dim_item = None
+        # scene.clear() above dropped the dust overlay / brush ring / ghost items
+        self._dust_overlay_items = []
+        self._heal_ring_item = None
+        self._heal_ghost_items = []
         for _slice_line in self._slice_lines:
             _slice_line["item"] = None
 
@@ -1076,6 +1177,9 @@ class ImagePreview(QWidget):
         # Same for the area-edit overlay (handles sized from the view scale).
         if self.area_mode:
             self._draw_area_overlay()
+        # Dust heal markers are redrawn here too (scene.clear / zoom rescale).
+        if self.heal_mode:
+            self._draw_dust_overlay()
         # Slice overlay follows the (possibly changed) display transform; the
         # ghost is simply dropped (it reappears on the next mouse move). The
         # dim cast is rebuilt first so the lines render on top of it.
@@ -1242,11 +1346,410 @@ class ImagePreview(QWidget):
         self.current_converted = ccr_backend.get_converted_state_by_index(self.current_idx) if self.current_idx is not None else False
         self.unconvert_action.setEnabled(self.current_converted)
         self.export_action.setEnabled(any(img.converted for img in ccr_backend.images))
+        # Dust healing is only meaningful on the converted positive.
+        conv = self.current_converted
+        for w in (self.heal_action, self.auto_dust_action, self.visualize_action,
+                  self.clear_dust_action, self.brush_combo, self.sensitivity_combo):
+            w.setEnabled(conv)
+        if not conv and (self.heal_mode or self.dust_visualize):
+            # Leaving the converted state drops out of heal/visualize cleanly,
+            # without re-entering update_preview (we're often inside it here).
+            self._exit_heal_mode()
+            for act in (self.heal_action, self.visualize_action):
+                act.blockSignals(True)
+                act.setChecked(False)
+                act.blockSignals(False)
         parent = self.parent()
         if hasattr(parent.parent(), "sliders_panel"):
             print("Setting sliders enabled based on current_converted:", self.current_converted)
             parent.parent().sliders_panel.set_sliders_enabled(self.current_converted)
-        
+
+
+    # ===== Dust healing ===================================================
+    # Click a marked spot to remove its detection; click/drag to heal a missed
+    # spot or scratch. Strokes live on the image in normalized, un-cropped space
+    # and replay through apply_adjustments. Coordinate authoring/overlay use
+    # _image_transform() (coarse + fine rotation) so they are correct even when
+    # the straighten slider is non-zero. See spec/dust-healing.md.
+
+    def _image_transform(self):
+        """Scene<->preview-local map including coarse AND fine rotation (no
+        prescale): scene == img_transform(preview_local). Use this, not the
+        coarse-only _base_transform, for heal authoring and overlays."""
+        base = self._base_transform()
+        if base is None:
+            return None
+        t = QTransform(base)
+        if self.current_fine_rotation:
+            cx = self.current_pixmap.width() / 2.0
+            cy = self.current_pixmap.height() / 2.0
+            t.translate(cx, cy)
+            t.rotate(self.current_fine_rotation / 100.0)
+            t.translate(-cx, -cy)
+        return t if t.isInvertible() else None
+
+    def map_full_to_displayed(self, x, y):
+        """Inverse of map_displayed_to_full: full-image -> displayed-pixmap
+        coords (identity when no crop is being displayed)."""
+        if self._crop_display_transform is None:
+            return x, y
+        p = self._crop_display_transform.inverted()[0].map(QPointF(x, y))
+        return p.x(), p.y()
+
+    def _full_dims(self):
+        """(W, H) of the full un-cropped working image (resized_raw), or None."""
+        img = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        if img is None or img.resized_raw is None:
+            return None
+        h, w = img.resized_raw.shape[:2]
+        return w, h
+
+    def _brush_radius_norm(self):
+        from core.dust_removal import BRUSH_NORM
+        key = {0: "S", 1: "M", 2: "L"}.get(self.brush_combo.currentIndex(), "M")
+        return BRUSH_NORM[key]
+
+    def _on_brush_changed(self, _idx):
+        if self.heal_mode and self._last_cursor_scene is not None:
+            self._update_brush_ring(self._last_cursor_scene)
+
+    # ---- mode enter/leave ----
+    def toggle_heal_mode(self, checked):
+        if checked:
+            if self.current_idx is None or not getattr(self, "current_converted", False):
+                self.heal_action.blockSignals(True)
+                self.heal_action.setChecked(False)
+                self.heal_action.blockSignals(False)
+                return
+            if self.crop_mode:
+                self._exit_crop_mode()
+            if self.slice_mode:
+                self._exit_slice_mode()
+            if self.area_mode:
+                self._exit_area_mode()
+            self.view.bwpoint_mode = None
+            self.view.wb_pick_mode = False
+            self.heal_mode = True
+            self.update_preview(self.current_idx)   # redraws the stroke overlay
+            self.view.setCursor(Qt.BlankCursor)
+            self._heal_hint()
+        else:
+            self._exit_heal_mode()
+            if self.current_idx is not None:
+                self.update_preview(self.current_idx)
+
+    def _exit_heal_mode(self):
+        """Pure cleanup — never re-enters update_preview (callers refresh)."""
+        self.heal_mode = False
+        self._heal_drag = False
+        self._heal_stroke_pts = []
+        self._remove_brush_ring()
+        self._remove_heal_ghost()
+        self._remove_dust_overlay_items()
+        self.view.setCursor(Qt.ArrowCursor)
+
+    def toggle_visualize(self, checked):
+        self.dust_visualize = bool(checked) and getattr(self, "current_converted", False)
+        if self.current_idx is not None:
+            self.update_preview(self.current_idx)
+
+    # ---- toolbar actions ----
+    def auto_detect_dust(self):
+        if self.current_idx is None or not getattr(self, "current_converted", False):
+            return
+        if not self.heal_mode:
+            self.heal_action.setChecked(True)   # enters heal mode (via toggled)
+        key = {0: "low", 1: "med", 2: "high"}.get(
+            self.sensitivity_combo.currentIndex(), "med")
+        self._push_undo_for_current()
+        n_detected, n_replaced = ccr_backend.detect_dust_by_index(self.current_idx, key)
+        self._after_heal_change()
+        panel = self._sliders_panel()
+        if panel is not None:
+            msg = f"Detected {n_detected} spot(s)"
+            if n_replaced:
+                msg += f" (replaced {n_replaced} previous auto)"
+            try:
+                panel.set_temporary_hint(
+                    msg + ". Click a marked spot to remove it; click/drag to heal.",
+                    duration=5000)
+            except AttributeError:
+                pass
+
+    def clear_dust(self):
+        if self.current_idx is None:
+            return
+        if not ccr_backend.get_dust_strokes_by_index(self.current_idx):
+            return
+        self._push_undo_for_current()
+        ccr_backend.clear_dust_strokes_by_index(self.current_idx)
+        self._after_heal_change()
+
+    def _after_heal_change(self):
+        """Strokes changed: refresh canvas + thumbnail, update hint, persist."""
+        self.update_preview(self.current_idx)
+        try:
+            self.parent().parent().thumbnail_list.update_thumbnail(self.current_idx)
+        except Exception:
+            pass
+        self._heal_hint()
+        ccr_backend.save_catalog()
+
+    # ---- canvas interaction (called by GraphicsImageView) ----
+    def _heal_scene_to_full(self, scene_pos):
+        t = self._image_transform()
+        dims = self._full_dims()
+        if t is None or dims is None:
+            return None
+        local = t.inverted()[0].map(scene_pos)
+        return self.map_displayed_to_full(local.x(), local.y())
+
+    def _heal_hit_test(self, fx, fy):
+        """Index of the topmost stroke whose footprint contains (fx, fy), or None."""
+        dims = self._full_dims()
+        if dims is None:
+            return None
+        W, H = dims
+        L = max(W, H)
+        tol_img = 8.0 / max(self._view_scale(), 1e-6)
+        strokes = ccr_backend.get_dust_strokes_by_index(self.current_idx)
+        best = None
+        for i, st in enumerate(strokes):
+            hit = max(2.0, st.get("radius", 0.006) * L) + tol_img
+            for nx, ny in st.get("points", []):
+                if (nx * W - fx) ** 2 + (ny * H - fy) ** 2 <= hit * hit:
+                    best = i
+                    break
+        return best
+
+    def heal_press(self, scene_pos):
+        full = self._heal_scene_to_full(scene_pos)
+        if full is None:
+            return
+        hit = self._heal_hit_test(*full)
+        if hit is not None:
+            self._remove_stroke(hit)
+            self._heal_drag = False
+            self._heal_stroke_pts = []
+            return
+        self._heal_drag = True
+        self._heal_stroke_pts = [tuple(full)]
+        self._draw_heal_ghost()
+
+    def heal_move(self, scene_pos):
+        self._update_brush_ring(scene_pos)
+        if not self._heal_drag:
+            return
+        full = self._heal_scene_to_full(scene_pos)
+        if full is None:
+            return
+        fx, fy = full
+        dims = self._full_dims()
+        L = max(dims) if dims else 1080
+        min_gap = max(1.0, 0.5 * self._brush_radius_norm() * L)
+        if self._heal_stroke_pts:
+            lx, ly = self._heal_stroke_pts[-1]
+            if (fx - lx) ** 2 + (fy - ly) ** 2 < min_gap * min_gap:
+                return
+        self._heal_stroke_pts.append((fx, fy))
+        self._draw_heal_ghost()
+
+    def heal_release(self, scene_pos):
+        if not self._heal_drag:
+            return
+        full = self._heal_scene_to_full(scene_pos)
+        if full is not None:
+            self._heal_stroke_pts.append(tuple(full))
+        self._heal_drag = False
+        self._remove_heal_ghost()
+        self._commit_manual_stroke()
+
+    def heal_remove_at(self, scene_pos):
+        full = self._heal_scene_to_full(scene_pos)
+        if full is None:
+            return
+        hit = self._heal_hit_test(*full)
+        if hit is not None:
+            self._remove_stroke(hit)
+
+    def _remove_stroke(self, index):
+        self._push_undo_for_current()
+        ccr_backend.remove_dust_stroke_by_index(self.current_idx, index)
+        self._after_heal_change()
+
+    def _commit_manual_stroke(self):
+        pts = self._heal_stroke_pts
+        self._heal_stroke_pts = []
+        dims = self._full_dims()
+        if not pts or dims is None:
+            return
+        W, H = dims
+        norm = [[min(1.0, max(0.0, x / W)), min(1.0, max(0.0, y / H))]
+                for x, y in pts]
+        stroke = {
+            "points": norm,
+            "radius": self._brush_radius_norm(),
+            "connect": len(norm) > 1,
+            "kind": "scratch" if len(norm) > 1 else "spot",
+            "source": "manual",
+        }
+        self._push_undo_for_current()
+        ccr_backend.add_dust_stroke_by_index(self.current_idx, stroke)
+        self._after_heal_change()
+
+    # ---- overlay drawing ----
+    def _update_brush_ring(self, scene_pos):
+        self._last_cursor_scene = scene_pos
+        dims = self._full_dims()
+        if dims is None or not self.heal_mode:
+            self._remove_brush_ring()
+            return
+        r = self._brush_radius_norm() * max(dims)
+        rect = QRectF(scene_pos.x() - r, scene_pos.y() - r, 2 * r, 2 * r)
+        if self._heal_ring_item is None:
+            self._heal_ring_item = QGraphicsEllipseItem(rect)
+            pen = QPen(QColor(255, 255, 255, 235), 0, Qt.DashLine)
+            pen.setCosmetic(True)
+            self._heal_ring_item.setPen(pen)
+            self._heal_ring_item.setBrush(QBrush(QColor(255, 255, 255, 25)))
+            self._heal_ring_item.setZValue(50)
+            self.scene.addItem(self._heal_ring_item)
+        else:
+            self._heal_ring_item.setRect(rect)
+
+    def _remove_brush_ring(self):
+        if self._heal_ring_item is not None:
+            try:
+                self.scene.removeItem(self._heal_ring_item)
+            except Exception:
+                pass
+            self._heal_ring_item = None
+
+    def _draw_heal_ghost(self):
+        self._remove_heal_ghost()
+        t = self._image_transform()
+        dims = self._full_dims()
+        if t is None or dims is None or not self._heal_stroke_pts:
+            return
+        r = max(1.0, self._brush_radius_norm() * max(dims))
+        disp = [self.map_full_to_displayed(x, y) for x, y in self._heal_stroke_pts]
+        path = QPainterPath()
+        if len(disp) >= 2:
+            path.moveTo(disp[0][0], disp[0][1])
+            for dx, dy in disp[1:]:
+                path.lineTo(dx, dy)
+            item = QGraphicsPathItem(path)
+            pen = QPen(QColor(*_HEAL_GHOST_RGB, 130), 2 * r)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            item.setPen(pen)
+        else:
+            path.addEllipse(QPointF(disp[0][0], disp[0][1]), r, r)
+            item = QGraphicsPathItem(path)
+            item.setPen(QPen(QColor(*_HEAL_GHOST_RGB, 200), 0))
+            item.setBrush(QBrush(QColor(*_HEAL_GHOST_RGB, 90)))
+        item.setTransform(t)
+        item.setZValue(40)
+        self.scene.addItem(item)
+        self._heal_ghost_items.append(item)
+
+    def _remove_heal_ghost(self):
+        for it in self._heal_ghost_items:
+            try:
+                self.scene.removeItem(it)
+            except Exception:
+                pass
+        self._heal_ghost_items = []
+
+    def _draw_dust_overlay(self):
+        self._remove_dust_overlay_items()
+        if (not self.heal_mode or self.current_pixmap is None
+                or self.current_idx is None):
+            return
+        t = self._image_transform()
+        dims = self._full_dims()
+        if t is None or dims is None:
+            return
+        strokes = ccr_backend.get_dust_strokes_by_index(self.current_idx)
+        if not strokes:
+            return
+        W, H = dims
+        L = max(W, H)
+        scale = self._view_scale()
+        for st in strokes:
+            r = max(1.0, st.get("radius", 0.006) * L)
+            rgb = _HEAL_AUTO_RGB if st.get("source") == "auto" else _HEAL_MANUAL_RGB
+            disp = [self.map_full_to_displayed(nx * W, ny * H)
+                    for nx, ny in st.get("points", [])]
+            if not disp:
+                continue
+            path = QPainterPath()
+            if st.get("connect") and len(disp) >= 2:
+                path.moveTo(disp[0][0], disp[0][1])
+                for dx, dy in disp[1:]:
+                    path.lineTo(dx, dy)
+                item = QGraphicsPathItem(path)
+                pen = QPen(QColor(*rgb, 110), 2 * r)
+                pen.setCapStyle(Qt.RoundCap)
+                pen.setJoinStyle(Qt.RoundJoin)
+                item.setPen(pen)
+            else:
+                for dx, dy in disp:
+                    path.addEllipse(QPointF(dx, dy), r, r)
+                item = QGraphicsPathItem(path)
+                item.setPen(QPen(QColor(*rgb, 235), max(1.2 / scale, 0.4)))
+                item.setBrush(QBrush(QColor(*rgb, 70)))
+            item.setTransform(t)
+            item.setZValue(30)
+            self.scene.addItem(item)
+            self._dust_overlay_items.append(item)
+
+    def _remove_dust_overlay_items(self):
+        for it in self._dust_overlay_items:
+            try:
+                self.scene.removeItem(it)
+            except Exception:
+                pass
+        self._dust_overlay_items = []
+
+    def _heal_hint(self):
+        panel = self._sliders_panel()
+        if panel is None or self.current_idx is None:
+            return
+        strokes = ccr_backend.get_dust_strokes_by_index(self.current_idx)
+        n_auto = sum(1 for s in strokes if s.get("source") == "auto")
+        n_manual = len(strokes) - n_auto
+        try:
+            panel.set_hint(
+                f"<b>Dust healing.</b> {len(strokes)} spot(s) "
+                f"({n_auto} auto, {n_manual} manual).<br>"
+                "Click a marked spot to remove it; click or drag to heal a "
+                "missed spot/scratch. <b>Auto-Detect</b> finds spots; "
+                "<b>Visualize</b> reveals them. Ctrl+Z undo · Esc to exit.")
+        except AttributeError:
+            pass
+
+    def _visualize_pixmap(self, pixmap):
+        """A high-contrast 'find the dust' rendering of the displayed pixmap
+        (same geometry — coordinates are unaffected)."""
+        try:
+            import numpy as np
+            import cv2
+            qimg = pixmap.toImage().convertToFormat(QImage.Format_RGB888)
+            w, h = qimg.width(), qimg.height()
+            bpl = qimg.bytesPerLine()
+            buf = np.frombuffer(qimg.constBits(), np.uint8, count=bpl * h)
+            arr = buf.reshape(h, bpl)[:, :w * 3].reshape(h, w, 3)
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            hp = np.abs(gray - cv2.GaussianBlur(gray, (0, 0), 2.0))
+            hp = np.clip(hp * 8.0, 0, 255).astype(np.uint8)
+            vis = np.ascontiguousarray(cv2.cvtColor(hp, cv2.COLOR_GRAY2RGB))
+            out = QImage(vis.data, w, h, w * 3, QImage.Format_RGB888).copy()
+            return QPixmap.fromImage(out)
+        except Exception as e:
+            print(f"Dust visualize failed: {e}")
+            return pixmap
 
     def set_bwpoint_mode(self, mode):
         """mode: 'black' | 'white' | None"""
@@ -3151,6 +3654,7 @@ class HiResDetailWorker(QThread):
         # Deep copy: each area nests settings + geometry dicts the GUI thread
         # may mutate while this worker runs.
         self._areas = copy.deepcopy(getattr(img_obj, "area_layers", []))
+        self._dust_strokes = copy.deepcopy(getattr(img_obj, "dust_heal_strokes", []))
         self._contrast_base = img_obj.contrast_base
         self._temperature_base = img_obj.temperature_base
         self._brightness_base = img_obj.brightness_base
@@ -3177,7 +3681,8 @@ class HiResDetailWorker(QThread):
                 contrast_base=self._contrast_base,
                 temperature_base=self._temperature_base,
                 brightness_base=self._brightness_base,
-                areas_override=self._areas)
+                areas_override=self._areas,
+                dust_strokes_override=self._dust_strokes)
             if not self._converted:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives
