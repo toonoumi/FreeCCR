@@ -112,6 +112,12 @@ class CCRImage:
         # The global adjustment_settings is the implicit "whole image" layer;
         # areas composite additively on top of it (see spec/area-editing.md).
         self.area_layers: List[Dict[str, Any]] = list(areas) if areas else []
+        # Dust healing: a list of resolution-independent vector "strokes" (see
+        # core/dust_removal.py and spec/dust-healing.md). Normalized coords in
+        # the same un-rotated/un-cropped space as crop_rect; replayed in
+        # apply_adjustments so healing shows at every resolution. Per-image
+        # only (dust is physical to one frame) — excluded from copy/paste/sync.
+        self.dust_heal_strokes: List[Dict[str, Any]] = []
         # Which layer the adjustment panel currently edits: None = global
         # (whole image); otherwise the id of an area in area_layers. Session
         # state only — never persisted; always defaults to global on load.
@@ -555,7 +561,8 @@ class CCRImage:
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
-                          color_profile=None, areas_override=None) -> np.ndarray:
+                          color_profile=None, areas_override=None,
+                          dust_strokes_override=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently."""
@@ -567,6 +574,14 @@ class CCRImage:
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
+        # Dust healing runs FIRST (on the converted positive), before the
+        # early-return, so a heal-only edit still applies. Resolution
+        # independent: strokes are normalized to this array's dimensions.
+        strokes = (getattr(self, "dust_heal_strokes", None)
+                   if dust_strokes_override is None else dust_strokes_override)
+        if strokes:
+            from core.dust_removal import inpaint_dust
+            image = inpaint_dust(image, strokes)
         if not s and cb == 0 and tb == 0 and bb == 0 and not has_areas:
             # No slider/base/area adjustments — but Black & White still has to
             # map the image to a single luminance channel.
@@ -733,6 +748,9 @@ class CCRImage:
             # sub-dict) and a geometry dict — a shallow copy would alias the
             # live structure and a later edit would corrupt the snapshot.
             "area_layers": copy.deepcopy(getattr(self, "area_layers", [])),
+            # Each stroke nests a points list — deep-copy so a later edit
+            # can't corrupt the snapshot (same reasoning as area_layers).
+            "dust_heal_strokes": copy.deepcopy(getattr(self, "dust_heal_strokes", [])),
         }
 
     def push_undo_state(self) -> None:
@@ -761,6 +779,7 @@ class CCRImage:
         self.horizontal_mirrored = state["horizontal_mirrored"]
         self.vertical_mirrored = state["vertical_mirrored"]
         self.area_layers = copy.deepcopy(state.get("area_layers", []))
+        self.dust_heal_strokes = copy.deepcopy(state.get("dust_heal_strokes", []))
         # The previously-active area may have been added back/removed by this
         # undo; the panel re-resolves None -> global if the id is now stale.
         active_id = getattr(self, "active_area_id", None)

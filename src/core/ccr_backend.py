@@ -426,6 +426,52 @@ class CCRBackend:
         if reprocess:
             img.update_thumbnail_and_preview()
 
+    # --- Dust healing (see core/dust_removal.py, spec/dust-healing.md) ------
+    def get_dust_strokes_by_index(self, idx: int) -> list:
+        img = self._image_at(idx)
+        return list(getattr(img, "dust_heal_strokes", []) or []) if img else []
+
+    def detect_dust_by_index(self, idx: int, sensitivity: str = "med") -> tuple:
+        """Auto-detect dust on the converted positive. Replaces previous AUTO
+        strokes, keeps manual ones. Returns (n_detected, n_replaced)."""
+        img = self._image_at(idx)
+        if img is None or not getattr(img, "converted", False) \
+                or img.resized_raw is None:
+            return (0, 0)
+        from core.dust_removal import detect_dust
+        detected = detect_dust(img.resized_raw, sensitivity)
+        prev = list(getattr(img, "dust_heal_strokes", []) or [])
+        manual = [s for s in prev if s.get("source") != "auto"]
+        n_replaced = len(prev) - len(manual)
+        img.dust_heal_strokes = manual + detected
+        img.update_thumbnail_and_preview()
+        return (len(detected), n_replaced)
+
+    def add_dust_stroke_by_index(self, idx: int, stroke: dict) -> None:
+        img = self._image_at(idx)
+        if img is None:
+            return
+        img.dust_heal_strokes = (list(getattr(img, "dust_heal_strokes", []) or [])
+                                 + [dict(stroke)])
+        img.update_thumbnail_and_preview()
+
+    def remove_dust_stroke_by_index(self, idx: int, stroke_index: int) -> None:
+        img = self._image_at(idx)
+        if img is None:
+            return
+        strokes = list(getattr(img, "dust_heal_strokes", []) or [])
+        if 0 <= stroke_index < len(strokes):
+            del strokes[stroke_index]
+            img.dust_heal_strokes = strokes
+            img.update_thumbnail_and_preview()
+
+    def clear_dust_strokes_by_index(self, idx: int) -> None:
+        img = self._image_at(idx)
+        if img is None:
+            return
+        img.dust_heal_strokes = []
+        img.update_thumbnail_and_preview()
+
     def get_image_count(self) -> int:
         return len(self.images)
     

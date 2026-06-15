@@ -162,6 +162,8 @@ def serialize_image(img) -> dict:
         "brightness_base": int(img.brightness_base),
         "tint_balance_factor": float(getattr(img, "tint_balance_factor", 1.0)),
         "reference_frame": list(img.reference_frame) if img.reference_frame else None,
+        "dust_heal_strokes": [dict(s) for s in
+                              (getattr(img, "dust_heal_strokes", None) or [])],
     }
 
 
@@ -174,7 +176,8 @@ def _is_pristine(state: dict) -> bool:
             and state["crop_rect"] is None
             and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
             and not state["horizontal_mirrored"] and not state["vertical_mirrored"]
-            and state["reference_frame"] is None)
+            and state["reference_frame"] is None
+            and not state.get("dust_heal_strokes"))
 
 
 def _prune(catalog: dict) -> None:
@@ -369,6 +372,8 @@ def _restore_image(file_path: str, state: dict):
     crop = state.get("crop_rect")
     img.crop_rect = tuple(crop) if crop else None
     img.crop_angle = state.get("crop_angle", 0.0) or 0.0
+    from core.dust_removal import clean_strokes
+    img.dust_heal_strokes = clean_strokes(state.get("dust_heal_strokes"))
     img.tint_balance_factor = state.get("tint_balance_factor",
                                         getattr(img, "tint_balance_factor", 1.0))
 
