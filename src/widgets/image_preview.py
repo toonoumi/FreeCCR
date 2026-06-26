@@ -3745,6 +3745,10 @@ class HiResDetailWorker(QThread):
         self._positive_mode = ccr_backend.positive_mode
         ci = getattr(img_obj, "conversion_inputs", None)
         self._conversion_inputs = dict(ci) if ci else None
+        # AWB enable flag + cached gains, snapshotted so a concurrent toggle on
+        # the GUI thread can't tear this render (mirrors the other snapshots).
+        self._awb_enabled = getattr(img_obj, "awb_enabled", False)
+        self._awb_gains = getattr(img_obj, "awb_gains", None)
 
     def run(self):
         try:
@@ -3766,7 +3770,12 @@ class HiResDetailWorker(QThread):
                 temperature_base=self._temperature_base,
                 brightness_base=self._brightness_base,
                 exposure_base=self._exposure_base,
-                areas_override=self._areas)
+                areas_override=self._areas,
+                awb_enabled=self._awb_enabled,
+                awb_gains=self._awb_gains,
+                # Never run ONNX off the GUI thread: reuse the preview's cached
+                # gains, or skip AWB this frame (a later render applies them).
+                awb_allow_compute=False)
             if not self._converted and not self._positive_mode:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives

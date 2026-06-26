@@ -161,6 +161,9 @@ def serialize_image(img) -> dict:
         "areas": _areas_to_json(getattr(img, "area_layers", None)),
         "dust_spots": copy.deepcopy(getattr(img, "dust_spots", None) or []),
         "color_profile": getattr(img, "color_profile", "color"),
+        # AWB: only the enable flag is persisted; awb_gains are a per-image cache
+        # recomputed on load (they depend on the converted pixels).
+        "awb_enabled": bool(getattr(img, "awb_enabled", False)),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
         "rotation_angle": int(img.rotation_angle),
@@ -183,6 +186,7 @@ def _is_pristine(state: dict) -> bool:
             and not state.get("areas")
             and not state.get("dust_spots")
             and state.get("color_profile", "color") == "color"
+            and not state.get("awb_enabled")
             and state["crop_rect"] is None
             and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
             and not state["horizontal_mirrored"] and not state["vertical_mirrored"]
@@ -377,6 +381,7 @@ def _restore_image(file_path: str, state: dict):
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])
     img.color_profile = state.get("color_profile", "color")
+    img.awb_enabled = bool(state.get("awb_enabled", False))
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None
     crop = state.get("crop_rect")

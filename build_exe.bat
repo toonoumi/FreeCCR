@@ -15,7 +15,7 @@ REM generated C files (ccr_processor, __helpers) that crashed gcc 14.2 / clang 1
 REM and matches onnxruntime's toolchain. --jobs=6 bounds parallel compilation
 REM memory (24 cores would otherwise launch 24 cl.exe at once).
 nuitka --msvc=latest --jobs=6 --standalone --assume-yes-for-downloads --include-package=numpy --include-package=utils --enable-plugin=pyside6 ^
---include-data-dir=src/icons=icons --include-data-dir=LICENSES=LICENSES --windows-icon-from-ico=src/icons/freeccr_logo.ico ^
+--include-data-dir=src/icons=icons --include-data-dir=LICENSES=LICENSES --include-data-dir=src/models=models --windows-icon-from-ico=src/icons/freeccr_logo.ico ^
 --windows-console-mode=attach --include-package=pyopencl --include-data-dir="%PYOPENCL_CL_DIR%=pyopencl/cl" ^
 --include-package=onnxruntime --include-package-data=onnxruntime ^
 --nofollow-import-to=doctest --nofollow-import-to=IPython ^

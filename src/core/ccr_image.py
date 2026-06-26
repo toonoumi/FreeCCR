@@ -53,6 +53,7 @@ class CCRImage:
         slice_parent: Optional[Dict[str, Any]] = None,
         color_profile: str = "color",
         areas: Optional[List[Dict[str, Any]]] = None,
+        awb_enabled: bool = False,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -93,6 +94,18 @@ class CCRImage:
         # map the adjusted result to a single luminance channel. Affects both
         # the preview/thumbnail and the exported file.
         self.color_profile = color_profile if color_profile in ("color", "bw") else "color"
+        # Auto White Balance: when enabled, a learning-based per-channel gain
+        # (cached in awb_gains) is applied to the converted positive BEFORE the
+        # manual sliders, neutralising the colour cast without moving any slider.
+        # awb_gains is a derived cache (depends on the converted pixels AND the
+        # crop region — the cast is estimated from the kept area only), never
+        # persisted or synced; only the awb_enabled flag is. _awb_src_id holds the
+        # cache key (_awb_cache_key) the gains were computed under, so a
+        # re-conversion or a crop change invalidates them.
+        # See spec/auto-white-balance.md.
+        self.awb_enabled = bool(awb_enabled)
+        self.awb_gains = None
+        self._awb_src_id = None
         self.rotation_angle = rotation_angle
         self.fine_rotation_angle = fine_rotation_angle
         self.horizontal_mirrored = horizontal_mirrored
@@ -674,6 +687,16 @@ class CCRImage:
             # previous float divide + astype)
             return cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0)
 
+        # Invalidate cached AWB gains when the converted positive OR the crop
+        # changed (a convert/reconvert/reload replaces resized_raw; confirming a
+        # crop moves the region the cast is estimated from). Slider ticks change
+        # neither, so gains are reused across them — apply_adjustments recomputes
+        # only when None.
+        awb_key = self._awb_cache_key()
+        if getattr(self, "_awb_src_id", None) != awb_key:
+            self.awb_gains = None
+            self._awb_src_id = awb_key
+
         # Apply adjustments first
         adjusted_img = self.apply_adjustments(self.resized_raw)
 
@@ -774,10 +797,57 @@ class CCRImage:
             return image
         return apply_dust_removal(image, spots)
 
+    def _awb_cache_key(self):
+        """Identity of the data the AWB gains are computed from: the converted
+        positive (resized_raw) AND the crop region (the cast is estimated from
+        the kept area only). When this changes — a re-conversion replaces
+        resized_raw, or the crop moves — the cached gains are invalidated."""
+        return (id(self.resized_raw),
+                getattr(self, "crop_rect", None),
+                float(getattr(self, "crop_angle", 0.0) or 0.0))
+
+    def _apply_awb(self, image: np.ndarray, profile, awb_enabled, awb_gains,
+                   allow_compute: bool = True) -> np.ndarray:
+        """Apply the Auto White Balance gain to a converted positive, right
+        before the manual adjustments. `awb_enabled`/`awb_gains` are optional
+        request-time overrides (used by the zoom worker); None falls back to
+        live per-image state. No-op unless AWB is on and the profile is colour.
+
+        Gains are computed lazily from the preview positive (resized_raw),
+        restricted to the CROPPED region so the white balance matches what the
+        user keeps, and cached on self so preview/zoom/export share them.
+        Computation happens ONLY on the GUI render path (allow_compute=True,
+        single-threaded per image): the zoom worker passes allow_compute=False so
+        it never runs ONNX off the GUI thread (slow) nor races the GUI thread
+        writing the cache — it reuses the gains the preview already populated, or
+        skips AWB for that frame (the next render picks them up)."""
+        enabled = getattr(self, "awb_enabled", False) if awb_enabled is None else awb_enabled
+        if not enabled or profile != "color":
+            return image
+        from core import awb as _awb
+        gains = getattr(self, "awb_gains", None) if awb_gains is None else awb_gains
+        if gains is None:
+            if not allow_compute:
+                return image
+            # Derive from the whole-image preview positive, cropped to the kept
+            # region (apply_crop_to_image is a no-op when there's no crop), so the
+            # cast estimate ignores anything outside the crop. Same gains at every
+            # resolution; cache for reuse.
+            src = self.resized_raw if self.resized_raw is not None else image
+            src = apply_crop_to_image(src, getattr(self, "crop_rect", None),
+                                      getattr(self, "crop_angle", 0.0) or 0.0)
+            gains = _awb.compute_gains(src)
+            self.awb_gains = gains
+            self._awb_src_id = self._awb_cache_key()
+            if gains is None:
+                return image
+        return _awb.apply_gains(image, gains)
+
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
                           color_profile=None, areas_override=None,
-                          exposure_base=None) -> np.ndarray:
+                          exposure_base=None, awb_enabled=None,
+                          awb_gains=None, awb_allow_compute=True) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently."""
@@ -785,12 +855,20 @@ class CCRImage:
         # rest of the adjustment stage (and so a dust-only image is still
         # cleaned even when the early-return guard below would otherwise skip).
         image = self._apply_dust_removal(image)
+        profile = self.color_profile if color_profile is None else color_profile
+        # Auto White Balance: a per-channel gain applied to the converted
+        # positive RIGHT BEFORE all custom (slider) adjustments — it does NOT
+        # move any slider. Gains are computed once on the whole-image preview
+        # positive (resized_raw) and reused at every resolution; a B&W profile
+        # has no cast to correct, so it is skipped there. Overrides let the zoom
+        # worker pass a request-time snapshot (None falls back to live state).
+        image = self._apply_awb(image, profile, awb_enabled, awb_gains,
+                                awb_allow_compute)
         s = self.adjustment_settings if settings is None else settings
         cb = self.contrast_base if contrast_base is None else contrast_base
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
         eb = self.exposure_base if exposure_base is None else exposure_base
-        profile = self.color_profile if color_profile is None else color_profile
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
@@ -958,6 +1036,7 @@ class CCRImage:
         return {
             "adjustment_settings": dict(self.adjustment_settings),
             "color_profile": self.color_profile,
+            "awb_enabled": self.awb_enabled,
             "crop_rect": self.crop_rect,
             "crop_angle": self.crop_angle,
             "rotation_angle": self.rotation_angle,
@@ -992,6 +1071,11 @@ class CCRImage:
         state = self.undo_stack.pop()
         self.adjustment_settings = state["adjustment_settings"]
         self.color_profile = state.get("color_profile", "color")
+        # AWB enable is undone; gains are a derived cache, so drop them and let
+        # the next render recompute from the (restored) converted positive.
+        self.awb_enabled = state.get("awb_enabled", False)
+        self.awb_gains = None
+        self._awb_src_id = None
         self.crop_rect = state["crop_rect"]
         self.crop_angle = state.get("crop_angle", 0.0)
         self.rotation_angle = state["rotation_angle"]

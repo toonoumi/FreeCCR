@@ -22,7 +22,6 @@ def _new_slice_group() -> str:
 
 class CCRBackend:
     _instance = None
-    software_activated = False  # Flag to indicate if the backend is activated
 
     def __new__(cls):
         if cls._instance is None:
@@ -493,6 +492,9 @@ class CCRBackend:
         image_obj.horizontal_mirrored = False
         image_obj.vertical_mirrored = False
         image_obj.color_profile = "color"
+        image_obj.awb_enabled = False
+        image_obj.awb_gains = None
+        image_obj._awb_src_id = None
         # The conversion is gone, so the undo history (which never captured
         # the conversion anyway) would be inconsistent — drop it.
         image_obj.undo_stack = []
@@ -568,17 +570,16 @@ class CCRBackend:
         on the freshly re-decoded resized_raw, in place — so a profile re-grade
         keeps the conversion. No-op if there is no recipe to replay."""
         ci = getattr(image_obj, "conversion_inputs", None)
-        wm = not self.software_activated
         try:
             if ci is not None and ci.get("mode") == "bw":
                 black_point, white_point = ci["bw"]
                 processed = ccr_normalize_with_bwpoint(
-                    image_obj, black_point, white_point, water_mark=wm)
+                    image_obj, black_point, white_point)
             elif ci is not None and ci.get("mode") == "ref_params":
                 processed = ccr_normalize_with_refparams(
-                    image_obj, ci["p_lo"], ci["p_hi"], ci["od"], water_mark=wm)
+                    image_obj, ci["p_lo"], ci["p_hi"], ci["od"])
             elif image_obj.reference_frame is not None:
-                processed = ccr_normalize_with_reference(image_obj, water_mark=wm)
+                processed = ccr_normalize_with_reference(image_obj)
             else:
                 return
             if processed is not None:
@@ -621,7 +622,7 @@ class CCRBackend:
                 #reload the image if it has already been converted
                 image_obj.reload_image()
             try:
-                processed = ccr_normalize_with_reference(image_obj,water_mark=not self.software_activated)
+                processed = ccr_normalize_with_reference(image_obj)
                 image_obj.resized_raw = processed
                 image_obj.converted = True
                 # Snapshot what this conversion was baked with (the zoom
@@ -1005,7 +1006,6 @@ class CCRBackend:
                     # Positive mode: export the adjusted positive directly — no
                     # inversion, regardless of any leftover reference_frame.
                     ccr_export_positive(image_obj, output_path=output_path,
-                                        water_mark=not self.software_activated,
                                         jpg_out=jpg_output, jpg_quality=jpg_quality,
                                         max_long_side=max_long_side,
                                         output_colorspace=output_colorspace)
@@ -1016,7 +1016,6 @@ class CCRBackend:
                     # stored conversion constants at full resolution.
                     ccr_normalize_with_refparams(image_obj, ci["p_lo"], ci["p_hi"], ci["od"],
                                                  output_path=output_path,
-                                                 water_mark=not self.software_activated,
                                                  jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                  max_long_side=max_long_side,
                                                  output_colorspace=output_colorspace)
@@ -1026,7 +1025,6 @@ class CCRBackend:
                     black_point, white_point = ci["bw"]
                     ccr_normalize_with_bwpoint(image_obj, black_point, white_point,
                                                output_path=output_path,
-                                               water_mark=not self.software_activated,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace)
@@ -1034,13 +1032,13 @@ class CCRBackend:
                     # Legacy/un-snapshotted B/W point conversion — global anchors.
                     # white_point_bgr may be None → default-slope mode.
                     ccr_normalize_with_bwpoint(image_obj, self.black_point_bgr, self.white_point_bgr,
-                                               output_path=output_path, water_mark=not self.software_activated,
+                                               output_path=output_path,
                                                jpg_out=jpg_output, jpg_quality=jpg_quality,
                                                max_long_side=max_long_side,
                                                output_colorspace=output_colorspace)
                 else:
                     ccr_normalize_with_reference(image_obj, output_path=output_path,
-                                                 water_mark=not self.software_activated, jpg_out=jpg_output,
+                                                 jpg_out=jpg_output,
                                                  jpg_quality=jpg_quality, max_long_side=max_long_side,
                                                  output_colorspace=output_colorspace)
                 return True
@@ -1222,6 +1220,7 @@ class CCRBackend:
                 preloaded_full_size=img.original_full_size,
                 display_name=f"{stem}_copy{n}{ext}",
                 color_profile=img.color_profile,
+                awb_enabled=img.awb_enabled,
             )
             dup.reference_frame = img.reference_frame
             dup.conversion_inputs = (dict(img.conversion_inputs)
@@ -1404,6 +1403,7 @@ class CCRBackend:
                     slice_group=slice_group,
                     slice_parent=dict(slice_parent),
                     color_profile=img_obj.color_profile,
+                    awb_enabled=img_obj.awb_enabled,
                 )
                 child.conversion_inputs = child_ci
                 # Slices descend from the parent's loaded content — carry its
@@ -1549,6 +1549,7 @@ class CCRBackend:
                 slice_parent=(dict(parent_slice_parent)
                               if parent_slice_parent else None),
                 color_profile=template.color_profile,
+                awb_enabled=template.awb_enabled,
             )
         except Exception as e:
             print(f"Reset slice failed: could not re-decode "

@@ -232,7 +232,6 @@ class MainWindow(QMainWindow):
         self.undo_shortcut.activated.connect(self.undo_last_action)
 
         # Activation and verification checks are intentionally bypassed.
-        ccr_backend.software_activated = True
         _, license_type = validate_software()
         if license_type:
             self.setWindowTitle(f"FreeCCR - {license_type}")
@@ -1107,90 +1106,5 @@ class MainWindow(QMainWindow):
     def open_help_website(self):
         webbrowser.open(REPO_URL)
 
-class ActivationDialog(QDialog):
-    def __init__(self, parent=None, allow_deactivate=False):
-        super().__init__(parent)
-        self.setWindowTitle("Activate FreeCCR")
-        self.setMinimumWidth(theme.DIALOG_W_MD)
-        layout = QVBoxLayout(self)
-        theme.apply_panel_spacing(layout)
-        self.allow_deactivate = allow_deactivate
-
-        layout.addWidget(QLabel("Please activate your software to continue."))
-
-        self.email_input = QLineEdit(self)
-        self.email_input.setPlaceholderText("Email")
-        layout.addWidget(self.email_input)
-
-        self.key_input = QLineEdit(self)
-        self.key_input.setPlaceholderText("Activation Key")
-        layout.addWidget(self.key_input)
-
-        self.activate_btn = QPushButton("Activate", self)
-        self.activate_btn.clicked.connect(self.try_activate)
-        layout.addWidget(self.activate_btn)
-
-        self.eval_btn = QPushButton("I'm still evaluating", self)
-        self.eval_btn.clicked.connect(self.use_unpaid_version)
-        layout.addWidget(self.eval_btn)
-
-        self.buy_btn = QPushButton("I need to purchase a license", self)
-        self.buy_btn.clicked.connect(self.open_buy_page)
-        layout.addWidget(self.buy_btn)
-
-        if allow_deactivate:
-            self.deactivate_btn = QPushButton("Deactivate Current Key", self)
-            self.deactivate_btn.clicked.connect(self.deactivate_key)
-            layout.addWidget(self.deactivate_btn)
-
-            # Pre-fill fields with current activation info if available
-            from activation.activation import get_activation_key
-            from activation.activation import get_license_type
-            key = get_activation_key()
-            typ = get_license_type()
-            if key:
-                self.key_input.setText(key)
-                self.deactivate_btn.setEnabled(True)
-            else:
-                self.deactivate_btn.setEnabled(False)
-            if typ:
-                self.setWindowTitle(f"Activation ({typ})")
-
-    def try_activate(self):
-        email = self.email_input.text().strip()
-        key = self.key_input.text().strip()
-        if not email or not key:
-            QMessageBox.warning(self, "Input Required", "Please enter both email and activation key.")
-            return
-        from activation.activation import activate_software
-        if activate_software(key, email):
-            QMessageBox.information(self, "Activated", "Activation successful!")
-            self.accept()
-        else:
-            QMessageBox.critical(self, "Activation Failed", "Activation failed. Please check your key and email.")
-
-    def deactivate_key(self):
-        from activation.activation import deactivate_software
-        if QMessageBox.question(self, "Deactivate", "Are you sure you want to deactivate this key?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            if deactivate_software():
-                QMessageBox.information(self, "Deactivated", "Software deactivated. You can now enter a new key.")
-                self.key_input.clear()
-                self.email_input.clear()
-                ccr_backend.software_activated = False
-                self.setWindowTitle("Activate FreeCCR")
-            else:
-                QMessageBox.warning(self, "Failed", "Failed to deactivate. Maybe already deactivated?")
-            self.reject()
-
-    def use_unpaid_version(self):
-        QMessageBox.information(self, "Unpaid Version", "You are using the unpaid version. Exported images will have watermarks.")
-        self.reject()
-
-    def open_buy_page(self):
-        webbrowser.open("https://www.freeccr.com/buy")
-
-    def closeEvent(self, event):
-        if not self.allow_deactivate: #opening from within the app, skip the warning
-            QMessageBox.information(self, "Unpaid Version", "You are using the unpaid version. Exported images will have watermarks.")
-        self.reject()
-        event.ignore()
+# NOTE: the legacy ActivationDialog (license-key entry and related notices) was
+# removed — FreeCCR is a free project and no longer gates features or exports.

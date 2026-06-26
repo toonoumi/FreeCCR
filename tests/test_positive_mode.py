@@ -389,8 +389,7 @@ class TestPositiveExport:
     def test_writes_a_file(self, tmp_path):
         src = _asymmetric_image()
         dest = str(tmp_path / "out.tiff")
-        result = ccr_export_positive(_stub_image(src), output_path=dest,
-                                     water_mark=False)
+        result = ccr_export_positive(_stub_image(src), output_path=dest)
         assert result is None
         assert os.path.exists(dest)
 

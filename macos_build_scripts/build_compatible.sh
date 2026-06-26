@@ -77,6 +77,7 @@ python -m nuitka \
     --enable-plugin=pyside6 \
     --include-data-dir=src/icons=icons \
     --include-data-dir=LICENSES=LICENSES \
+    --include-data-dir=src/models=models \
     --deployment \
     --nofollow-import-to=doctest \
     --nofollow-import-to=unittest \

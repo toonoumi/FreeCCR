@@ -16,6 +16,10 @@ import copy
 # image's crop box (rect + angle) instead of adjustment keys.
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
+    # AWB is a per-image enable flag (not a slider); only the flag is synced —
+    # the gains are recomputed per image from its own pixels. Handled specially
+    # in _perform_sync_to_all, like "profile" and "crop".
+    ("awb", "Auto White Balance (on/off)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
     ("tone", "Tone (gain, brightness, contrast, ...)",
      ("exposure", "brightness", "highlights", "white_point",
@@ -468,6 +472,11 @@ class SlidersPanel(QWidget):
         # luminance channel (preview and export). Per-image, like the sliders.
         self.color_profile_row = self._create_color_profile_row()
 
+        # Auto White Balance — a checkbox row directly above Temperature. When
+        # ticked, a learning-based per-channel gain neutralises the colour cast
+        # before the manual sliders; it never moves the slider positions.
+        self.awb_row = self._create_awb_row()
+
         self.temperature_slider_layout = self.create_slider(
             "Temperature", gradient=theme.TEMP_GRADIENT)
         self.tint_slider_layout = self.create_slider(
@@ -483,6 +492,7 @@ class SlidersPanel(QWidget):
         self.sub_saturation_slider_layout = self.create_slider("Subtracted Sat")
 
         scroll_layout.addLayout(self.color_profile_row)
+        scroll_layout.addLayout(self.awb_row)
         scroll_layout.addLayout(self.temperature_slider_layout)
         scroll_layout.addLayout(self.tint_slider_layout)
         scroll_layout.addLayout(self.exposure_slider_layout)
@@ -748,6 +758,72 @@ class SlidersPanel(QWidget):
         row.addWidget(self.color_profile_combo, alignment=Qt.AlignVCenter)
         return row
 
+    def _create_awb_row(self):
+        """Build the 'Auto WB' label + checkbox row (sits right above
+        Temperature). Laid out like a slider row so the label lines up."""
+        from core import awb as _awb
+        label = QLabel("Auto WB")
+        label.setFixedWidth(theme.LABEL_COL_W)
+        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        label.setFixedHeight(theme.CONTROL_H)
+        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.awb_checkbox = QCheckBox()
+        self.awb_checkbox.setFixedHeight(theme.CONTROL_H)
+        reason = _awb.availability_reason()
+        # Remembered so set_sliders_enabled never re-enables an unavailable box.
+        self._awb_available = not reason
+        if reason:
+            # Unavailable (onnxruntime / model missing): keep it disabled and
+            # explain why, rather than silently doing nothing when ticked.
+            self.awb_checkbox.setEnabled(False)
+            self.awb_checkbox.setToolTip(reason)
+        else:
+            self.awb_checkbox.setToolTip(
+                "Automatically remove the colour cast. Runs before the manual "
+                "sliders and does not change their positions.")
+        self.awb_checkbox.toggled.connect(self.on_awb_toggled)
+
+        row = QHBoxLayout()
+        row.setSpacing(theme.GAP_TIGHT)
+        row.addWidget(label, alignment=Qt.AlignVCenter)
+        row.addWidget(self.awb_checkbox, alignment=Qt.AlignVCenter)
+        row.addStretch(1)
+        return row
+
+    def _sync_awb_checkbox(self, idx):
+        """Reflect the image's stored AWB enable flag in the checkbox without
+        firing the toggle handler."""
+        img = ccr_backend.get_image_by_index(idx) if idx is not None else None
+        enabled = bool(getattr(img, "awb_enabled", False)) if img is not None else False
+        self.awb_checkbox.blockSignals(True)
+        self.awb_checkbox.setChecked(enabled)
+        self.awb_checkbox.blockSignals(False)
+
+    def on_awb_toggled(self, checked: bool):
+        """Enable/disable Auto White Balance for the current image. A single
+        undoable action; reprocesses the preview/thumbnail. Does NOT touch any
+        slider value — AWB is a separate gain applied before the sliders."""
+        if self.current_idx is None:
+            return
+        img = ccr_backend.get_image_by_index(self.current_idx)
+        if img is None or bool(getattr(img, "awb_enabled", False)) == bool(checked):
+            return
+        # Discrete action — don't merge into an in-progress slider undo burst.
+        self.end_undo_burst()
+        img.push_undo_state()
+        img.awb_enabled = bool(checked)
+        # Force a fresh estimate on next render (cheap; cached afterwards).
+        img.awb_gains = None
+        img._awb_src_id = None
+        img.update_thumbnail_and_preview()
+        mw = self.parent().parent()
+        try:
+            mw.thumbnail_list.update_thumbnail(self.current_idx)
+        except AttributeError:
+            pass
+        mw.image_preview.update_preview(self.current_idx)
+
     def _sync_color_profile_combo(self, idx):
         """Reflect the image's stored color profile in the dropdown without
         firing the change handler."""
@@ -797,6 +873,9 @@ class SlidersPanel(QWidget):
         self.wb_picker_btn.setEnabled(enabled)
         self.crop_btn.setEnabled(enabled)
         self.color_profile_combo.setEnabled(enabled)
+        # AWB follows the same conversion gating, but stays disabled when the
+        # model/runtime isn't available regardless.
+        self.awb_checkbox.setEnabled(enabled and getattr(self, "_awb_available", False))
         self.curve_editor.setEnabled(enabled)
         # Area editing presupposes a converted positive — gate the Layers list
         # with the same flag as the sliders.
@@ -871,6 +950,8 @@ class SlidersPanel(QWidget):
         # Reflect this image's color profile (independent of the slider dict,
         # so it must be synced on both the empty and populated paths below).
         self._sync_color_profile_combo(idx)
+        # AWB enable is likewise a per-image flag outside the slider dict.
+        self._sync_awb_checkbox(idx)
         # Rebuild the Layers list only when its structure actually changed
         # (image switch, area added/removed/toggled/selected) — set_current_idx
         # is re-entered on every preview refresh (incl. each slider tick), and
@@ -1192,6 +1273,15 @@ class SlidersPanel(QWidget):
                                                or getattr(img, "crop_angle", 0.0)):
                 img.crop_rect = None
                 img.crop_angle = 0.0
+            # Reset also turns AWB off (whole-image property), folded into the
+            # same undo snapshot. The checkbox is re-synced below.
+            if img.active_area_id is None:
+                img.awb_enabled = False
+                img.awb_gains = None
+                img._awb_src_id = None
+                self.awb_checkbox.blockSignals(True)
+                self.awb_checkbox.setChecked(False)
+                self.awb_checkbox.blockSignals(False)
         # Reset every slider to its default (0 for most, 10 for band_feather).
         for i, slider in enumerate(self.sliders):
             key = self.adjustment_keys[i] if i < len(self.adjustment_keys) else None
@@ -1296,6 +1386,7 @@ class SlidersPanel(QWidget):
                 if selection.get(gid) for k in group_keys]
         sync_crop = bool(selection.get("crop"))
         sync_profile = bool(selection.get("profile"))
+        sync_awb = bool(selection.get("awb"))
         sync_curves = bool(selection.get("curves"))
         # Sync always copies the SOURCE image's GLOBAL (whole-image) layer, not
         # the live sliders — those may currently reflect an active area, and
@@ -1307,6 +1398,7 @@ class SlidersPanel(QWidget):
         crop_rect = src.crop_rect if src is not None else None
         crop_angle = getattr(src, "crop_angle", 0.0) if src is not None else 0.0
         src_profile = getattr(src, "color_profile", "color") if src is not None else "color"
+        src_awb = bool(getattr(src, "awb_enabled", False)) if src is not None else False
         print(f"Syncing groups {sorted(g for g, on in selection.items() if on)} to all images")
 
         for img in ccr_backend.images:
@@ -1316,8 +1408,10 @@ class SlidersPanel(QWidget):
             crop_changes = sync_crop and (img.crop_rect != crop_rect
                                           or getattr(img, "crop_angle", 0.0) != crop_angle)
             profile_changes = sync_profile and getattr(img, "color_profile", "color") != src_profile
+            awb_changes = sync_awb and bool(getattr(img, "awb_enabled", False)) != src_awb
             curves_changes = sync_curves and img.adjustment_settings.get("curves") != src_curves
-            if not adj_changes and not crop_changes and not profile_changes and not curves_changes:
+            if (not adj_changes and not crop_changes and not profile_changes
+                    and not awb_changes and not curves_changes):
                 continue  # nothing to change — and no dead undo snapshot
             img.push_undo_state()
             if adj_changes:
@@ -1345,9 +1439,13 @@ class SlidersPanel(QWidget):
                 img.crop_angle = crop_angle
             if profile_changes:
                 img.color_profile = src_profile
-            if adj_changes or profile_changes or curves_changes or crop_changes:
-                # Adjustments, curves, and the color profile all change pixels;
-                # a crop change moves the region the histogram is computed over
+            if awb_changes:
+                img.awb_enabled = src_awb
+                img.awb_gains = None       # recompute per-image on next render
+                img._awb_src_id = None
+            if adj_changes or profile_changes or awb_changes or curves_changes or crop_changes:
+                # Adjustments, curves, the color profile, and AWB all change
+                # pixels; a crop change moves the region the histogram covers
                 # (it samples only the cropped area). Any of these needs a
                 # reprocess so the cached preview/histogram stays in step.
                 try:
