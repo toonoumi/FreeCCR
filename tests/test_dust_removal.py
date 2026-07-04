@@ -251,11 +251,29 @@ class TestAutoMaskShrink:
         yy, xx = np.mgrid[0:100, 0:100]
         assert not out[np.hypot(yy - 50, xx - 50) > 7].any()
 
-    def test_dark_speck_variant(self):
+    def test_dark_speck_falls_back_to_whole_stroke(self):
+        # Film dust is WHITE (blocks light on the negative -> inverts bright);
+        # a dark blob under a dab is image content, not dust, so there is no
+        # bright outlier and the whole-stroke heal takes over (which still
+        # removes it — deliberate dark-removal keeps working via fallback).
         img = _flat_with_speck(base=40000, speck=2000, cx=50, cy=50, r=4)
+        mask = self._dab_mask(r=15)
+        out = _automask_shrink(img, mask)
+        assert np.array_equal(out, mask)
+
+    def test_halo_joins_the_mask(self):
+        # Hysteresis: a speck's soft Gaussian halo sits below the seed
+        # threshold but must join the mask (grown through the weak threshold)
+        # so the heal leaves no bright ring remnant.
+        img = np.full((100, 100, 3), 30000, np.uint16)
+        yy, xx = np.mgrid[0:100, 0:100]
+        halo = np.exp(-((yy - 50.0) ** 2 + (xx - 50.0) ** 2) / (2 * 3.0 ** 2))
+        img = np.clip(img + (halo[..., None] * 30000), 0, 65535).astype(np.uint16)
         out = _automask_shrink(img, self._dab_mask(r=15))
+        # The visible halo (still ~2600 above base at r=6.4) is masked.
         assert out[50, 50] == 255
-        assert out[50, 60] == 0
+        assert out[50, 56] == 255
+        assert out[50, 62] == 0     # flat field well past the halo: released
 
     def test_tight_trace_keeps_whole_stroke(self):
         # Brush ≈ defect width: nearly everything under the stroke is defect,
@@ -289,8 +307,10 @@ class TestAutoMaskShrink:
         out = _automask_shrink(img, mask)
         assert out[50, 60] == 255                    # speck masked
         assert not out[:, :49].any()                 # dark side fully released
+        # Local to the speck (r=3 + hysteresis fringe over grain + buffer);
+        # the rest of the bright side of the dab is released.
         yy, xx = np.mgrid[0:100, 0:100]
-        assert not out[np.hypot(yy - 50, xx - 60) > 6].any()
+        assert not out[np.hypot(yy - 50, xx - 60) > 10].any()
 
 class TestHealMethodChoice:
     """The Settings heal-method choice: apply_dust_removal(method=...) selects
@@ -399,13 +419,84 @@ class TestAutoMaskPipeline:
         img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
                       65535).astype(np.uint16)
         cv2.circle(img, (43, 50), 2, (62000, 62000, 62000), -1)
-        cv2.circle(img, (57, 50), 2, (1000, 1000, 1000), -1)
+        cv2.circle(img, (57, 50), 2, (58000, 58000, 58000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
         out = apply_dust_removal(img, [spot])
         assert abs(int(out[50, 43, 0]) - 30000) < 9000
         assert abs(int(out[50, 57, 0]) - 30000) < 9000
         # The strip between the two specks is original.
         assert np.array_equal(out[48:53, 47:53], img[48:53, 47:53])
+
+    def test_dark_content_under_dab_is_preserved(self):
+        # White-dust prior: when a dab contains a bright speck AND dark image
+        # detail, only the speck is healed — the dark detail (a shadow, a dark
+        # feature) is not dust and survives bit-for-bit.
+        rng = np.random.default_rng(15)
+        img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (43, 50), 2, (62000, 62000, 62000), -1)   # dust
+        cv2.circle(img, (57, 50), 2, (1500, 1500, 1500), -1)      # dark detail
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
+        out = apply_dust_removal(img, [spot])
+        assert abs(int(out[50, 43, 0]) - 30000) < 9000            # speck healed
+        assert np.array_equal(out[47:54, 54:61], img[47:54, 54:61])  # kept
+
+    def test_dark_only_dab_still_heals_whole_stroke(self):
+        # A dab over ONLY dark content finds no bright outlier -> whole-stroke
+        # fallback: deliberately painting over something dark still removes it.
+        rng = np.random.default_rng(16)
+        img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (50, 50), 3, (1500, 1500, 1500), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.12}
+        out = apply_dust_removal(img, [spot])
+        assert abs(int(out[50, 50, 0]) - 30000) < 9000
+
+    def test_auto_spot_halo_heals_without_ring(self):
+        # AI circles hug the speck; its soft halo extends past them. Under
+        # automask an AUTO spot's mask grows over the connected halo (auto
+        # spots skip the stroke clip and the clean-fraction gate), so no
+        # bright ring survives — the healed area reads as plain grain. The
+        # whole-circle engines leave the halo ring (the "auto detect doesn't
+        # work" report).
+        rng = np.random.default_rng(21)
+        img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
+                      65535).astype(np.uint16)
+        yy, xx = np.mgrid[0:200, 0:200]
+        halo = np.exp(-((yy - 100.0) ** 2 + (xx - 100.0) ** 2)
+                      / (2 * 5.0 ** 2)) * 32000
+        img = np.clip(img.astype(np.float32) + halo[..., None],
+                      0, 65535).astype(np.uint16)
+        spot = {"kind": "auto", "pts": [[0.5, 0.5]], "r": 6.0 / 200}
+        out = apply_dust_removal(img, [spot])
+        win = out[85:116, 85:116].astype(np.float32)
+        assert float(np.percentile(win, 99.5)) - 30000 < 8000  # grain-level
+        # The legacy whole-circle engine demonstrably leaves the halo ring.
+        ring_out = apply_dust_removal(img, [spot], method="clone")
+        ring_win = ring_out[85:116, 85:116].astype(np.float32)
+        assert float(np.percentile(ring_win, 99.5)) - 30000 > 10000
+
+    def test_feather_softens_stroke_border_effect(self):
+        # User feather semantics: the feather softens the STROKE's apply area
+        # — a defect at the stroke border gets less effect than one at the
+        # center. With feather 0 both heal fully.
+        base = np.full((200, 200, 3), 30000, np.uint16)
+
+        def scene():
+            img = base.copy()
+            cv2.circle(img, (100, 100), 2, (62000, 62000, 62000), -1)  # center
+            cv2.circle(img, (113, 100), 2, (62000, 62000, 62000), -1)  # border
+            return img
+
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # dab r=16
+        img = scene()
+        soft = apply_dust_removal(img, [spot], feather=0.05)      # 10 px ramp
+        hard = apply_dust_removal(img, [spot], feather=0.0)
+        res_center = int(soft[100, 100, 0]) - 30000
+        res_border = int(soft[100, 113, 0]) - 30000
+        assert res_center < 3000                     # center: full heal
+        assert res_border > res_center + 5000        # border: reduced effect
+        assert int(hard[100, 113, 0]) - 30000 < 3000  # feather 0: full heal
 
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -

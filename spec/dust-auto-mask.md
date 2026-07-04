@@ -160,32 +160,64 @@ window, as `_heal_patch` does: `half_th` from the distance transform;
    `d(px) = min(mean|px - m_lo|, mean|px - m_hi|)` (mean over channels).
 3. **Noise scale** `sigma = median(d(ring))` — the ring's own scatter about
    its anchors (a MAD analogue that stays honest for bimodal rings).
-4. **Outliers**: `like = d(hole_px) > max(_AUTOMASK_K * sigma, _AUTOMASK_ABS)`.
-   `_AUTOMASK_K = 5.0` (grain lives well under 5 sigma; dust/hairs far over);
-   `_AUTOMASK_ABS = 900` (16-bit units, ≈1.4% full scale) is a floor for
-   near-noiseless synthetic/flat content where `5*sigma` degenerates to ~0.
-5. **Gates** — shrink `C` only if BOTH hold, else keep `C` whole:
-   - `like.any()` — something to target;
-   - clean fraction `1 - mean(like) >= _AUTOMASK_CLEAN_MIN` (`0.4`): a tight
-     trace is mostly defect and must keep whole-stroke behavior; also
-     guarantees the local source search has in-selection clean area.
+4. **Bright outlier seeds** (white-dust prior — film dust blocks light on
+   the negative, so it inverts to WHITE specks and strings):
+   `seed = (d > max(K*sigma, ABS)) AND luma > luma(nearest anchor)`.
+   The brightness test is against the NEARER anchor, so dust on the dark
+   side of an edge counts even when it is darker than the far (bright) side.
+   Dark outliers are image detail (a shadow, a dark feature) and are never
+   flagged — a dab that contains only dark outliers falls back to the
+   whole-stroke heal, which still removes deliberately painted dark content.
+   `_AUTOMASK_K = 5.0` (grain lives well under 5 sigma; dust far over);
+   `_AUTOMASK_ABS = 900` (16-bit, ≈1.4%) floors near-noiseless content.
+5. **Hysteresis growth**: seeds grow through connected pixels above
+   `_AUTOMASK_GROW = 0.35` of the seed threshold (bright side only) — the
+   speck's soft halo joins the mask so no bright ring survives the heal;
+   weak pixels not connected to a seed (stray grain) are dropped.
+   **Brush vs auto**: brush growth is clipped to the stroke (the user's
+   boundary is authoritative); an AUTO (AI) spot's circle is a machine
+   guess, so its growth may follow the connected halo PAST the circle
+   (bounded by the analysis window). Auto components also use a wider ring
+   guard (2x thickness vs 0.5x): the circle hugs the speck, so its halo
+   leaks into a near ring and would otherwise read as a background mode
+   (stalling the growth and poisoning the heal's tone anchor).
+6. **Gates** — shrink `C` only if:
+   - a seed exists (brush AND auto); else keep `C` whole;
+   - brush only: clean fraction `1 - grown_in_stroke/hole >=
+     _AUTOMASK_CLEAN_MIN` (`0.4`) — a tight trace is mostly defect and must
+     keep whole-stroke behavior (also guarantees in-stroke source area).
+     Auto circles are mostly defect BY DESIGN, so this gate must not apply
+     to them: gated whole-circle heals tone-anchor on the halo just outside
+     the circle and leave a bright ring (the "auto detect doesn't work"
+     report).
    (No second confidence threshold beyond `K*sigma` — resolved, §9.)
-6. **Buffer**: dilate `like` by a disk of radius `buf = max(1, round(w/1080))`
-   px — "+1px" at preview scale, proportionally larger at export so the
-   healed fraction of the frame matches (the defect's soft edge also spans
-   proportionally more pixels there). The dilation is NOT clipped to `C`: a
-   defect touching the stroke edge gets its ≤`buf`-px halo healed too.
-7. Replace `C`'s pixels in the output mask with the buffered outlier mask.
+7. **Buffer**: dilate the grown mask by a disk of radius
+   `buf = max(1, round(w/1080))` px — "+1px" at preview scale, proportional
+   at export — then CLIP to `C`: the heal never reaches outside what the
+   user painted (consistent with the stroke-feather semantics, §5.3).
+8. Replace `C`'s pixels in the output mask with the buffered outlier mask.
    Several defects under one dab become several small components; the
    existing pipeline heals each independently.
 
 ### 5.3 Interaction with existing machinery
 
-- **Feather**: unchanged code. On a shrunken hole the ramp is capped by the
-  (small) hole depth, so small heals stay near-hard — same rule as today's
-  small dabs. The `dlike` force-fill keeps working (a shrunken hole is
-  defect-like almost everywhere, so wide feathers still cannot blend the
-  defect back).
+- **Feather = the stroke's soft edge** (user-corrected semantics): under
+  automask the feather softens the STROKE's apply area — alpha ramps inward
+  from the ORIGINAL brushed boundary, so the border of the stroke gets less
+  effect than its center (capped per stroke by its depth so the center
+  always reaches full effect). A defect hugging the stroke edge heals
+  partially by design; brush fully over the dust for full removal. Two
+  exceptions keep their full-strength fill: **auto (AI) spots** (tight
+  circles that are mostly defect — stroke falloff there would leave halo
+  rings; they keep the per-hole ramp + `dlike` force-fill) and **strokes
+  that kept their whole-stroke heal** (tight traces — preserving the
+  wide-feather-never-blends-the-defect-back guarantee).
+- **Clone sources prefer the stroke**: `_heal_patch` scores candidates as
+  before, but any candidate whose CLONED subregion lies fully inside the
+  original selection wins over out-of-stroke candidates — the fill texture
+  is sampled "from the non-masked part of the selection" whenever such a
+  window exists (the matching ring may still look outside). Falls back to
+  the unrestricted search, then Telea, as before.
 - **Long strokes**: a traced hair that fails the clean-fraction gate flows
   through segmentation exactly as today. One that passes (loose wide trace)
   shrinks to the hair-shaped outlier mask — segmentation then works on the
@@ -198,11 +230,11 @@ window, as `_heal_patch` does: `half_th` from the distance transform;
   edge pixels between preview and export — same class of approximation as
   `_heal_patch`'s per-resolution source choice (spec/dust-removal.md §5.4).
 
-### 5.4 Contract change (documented)
+### 5.4 Contract (unchanged)
 
-Today: only pixels under the rasterized stroke can change. With auto-mask:
-pixels within `buf` px outside the stroke can also change (buffer of a defect
-touching the stroke edge). Bounded, intentional, and listed in §2 Goals.
+Only pixels under the rasterized selection can change — the shrunken mask's
+buffer is clipped to the stroke (an earlier draft let it spill `buf` px past
+the stroke; dropped when the feather became the stroke's soft edge, §5.3).
 
 ## 6. Integration points
 
@@ -295,6 +327,27 @@ Pipeline-level (`apply_dust_removal`):
   faint-but-clear defects; K alone is the sensitivity dial.
 - **Ring exclusion uses the ORIGINAL mask** during the pre-pass so results
   don't depend on component iteration order.
+
+- **User-feedback round (2026-07-04)** — three corrections from field use:
+  (1) *"feathering is to feather the apply area of the stroke — the border
+  gets less effect than the center"* → feather became the stroke's soft
+  edge under automask (§5.3), replacing the shrunken hole's own rim ramp,
+  and the buffer is clipped to the stroke (§5.4). (2) *"sample from within
+  the stroke to cover the outlier"* → in-stroke clone-source preference in
+  `_heal_patch` (§5.3). (3) *"all dust are white spots/strings"* → the
+  outlier test is bright-only (§5.2 step 4); dark content under a dab is
+  preserved, dark-only dabs fall back to whole-stroke; plus hysteresis halo
+  growth (§5.2 step 5) so auto-detected specks heal without ring remnants.
+  Investigating (3) with the real ONNX model on synthetic film positives
+  showed detection itself works at all brightness levels; the failures were
+  heal-side — auto circles healed whole with halo-poisoned tone anchors
+  (clean gate mis-applied to them) and halos outside the circle surviving.
+  With auto growth + gate exemption the worst residual at detected spots
+  dropped from ~2x grain to the pure-grain baseline (7705 vs 7692 in the
+  probe). The in-stroke source preference needed a quality tolerance
+  (`_HEAL_IN_STROKE_TOL`): an edge-straddling stroke's only in-stroke
+  candidates can sit on the wrong side of the edge, and unconditional
+  preference picked them over far better out-of-stroke sources.
 
 ### Open items (non-blocking)
 - If grain speckle ever produces distracting micro-heals, add a minimum

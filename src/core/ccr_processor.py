@@ -3224,6 +3224,10 @@ _HEAL_RING = 3            # min ring width of clean context (matching + tone)
 _HEAL_GUARD = 2           # min gap (px) between the hole and its context ring
 _HEAL_ANGLES = 16         # candidate source directions searched around a spot
 _HEAL_MIN_RING_PX = 8     # need at least this much clean ring to heal
+_HEAL_IN_STROKE_TOL = 4.0  # prefer an in-stroke clone source unless its ring
+                           # match is worse than this factor of the best
+                           # anywhere (an edge-straddling stroke's in-stroke
+                           # candidates can sit on the wrong side of the edge)
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
 DUST_FEATHER_DEFAULT = 0.003  # feather ramp width, fraction of image width
@@ -3240,11 +3244,19 @@ DUST_METHODS = (
 )
 
 # Auto-mask tuning (spec/dust-auto-mask.md): shrink a generous selection to
-# the outlier (defect) pixels inside it, so the heal replaces only the dust
-# and the clean remainder of the stroke is preserved (and becomes valid,
-# same-side-of-any-edge source area for the clone search).
-_AUTOMASK_K = 5.0          # outlier threshold, multiples of the ring's scatter
-_AUTOMASK_ABS = 900        # absolute threshold floor, 16-bit units (~1.4%)
+# the defect pixels inside it, so the heal replaces only the dust and the
+# clean remainder of the stroke is preserved (and doubles as the PREFERRED,
+# same-side-of-any-edge source area for the clone search). Film dust is
+# WHITE — it blocks light on the negative, so it inverts to bright specks
+# and strings — hence only BRIGHT outliers are defects; dark content under a
+# generous dab is image detail and is preserved (a dab with no bright
+# outlier at all falls back to the whole-stroke heal, which still lets a
+# user deliberately remove something dark).
+_AUTOMASK_K = 5.0          # seed threshold, multiples of the ring's scatter
+_AUTOMASK_GROW = 0.35      # hysteresis: seeds grow through pixels above this
+                           # fraction of the seed threshold, so a speck's soft
+                           # halo joins the mask and no bright ring survives
+_AUTOMASK_ABS = 900        # absolute seed floor, 16-bit units (~1.4%)
 _AUTOMASK_CLEAN_MIN = 0.4  # min clean fraction of the selection to shrink
 
 
@@ -3270,17 +3282,31 @@ def _ring_anchors(ring_px: np.ndarray) -> tuple:
     return m_lo, m_hi
 
 
-def _automask_shrink(img16: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Shrink each brushed component to its outlier (defect) pixels plus a
-    resolution-scaled buffer; components with no confident outlier subset —
-    tight traces (mostly defect), dabs over clean or indistinct content —
-    keep their full stroke, i.e. the whole-stroke heal. Returns a new mask
-    (or `mask` unchanged). See spec/dust-auto-mask.md."""
+def _automask_shrink(img16: np.ndarray, mask: np.ndarray,
+                     exclude_mask: np.ndarray = None,
+                     clip_to_stroke: bool = True) -> np.ndarray:
+    """Shrink each selection component to its BRIGHT outlier (dust) pixels —
+    hysteresis-grown to cover the soft halo — plus a resolution-scaled buffer.
+    Components with no confident bright-outlier subset (tight traces that are
+    mostly defect, dabs over clean/indistinct or only dark content) keep
+    their full stroke, i.e. the whole-stroke heal.
+
+    `clip_to_stroke=True` (brush strokes): the result never leaves the
+    painted selection — the user's boundary is authoritative. False (auto/AI
+    spots): the detected circle is a machine guess, so the hysteresis growth
+    may follow the connected bright halo PAST the circle (bounded by the
+    analysis window) — otherwise a speck's wide halo survives the heal as a
+    bright ring around the healed core.
+
+    `exclude_mask` (default: `mask`) is the union of ALL spots, excluded from
+    the context ring. Returns a new mask (or `mask` unchanged).
+    See spec/dust-auto-mask.md."""
     h, w = mask.shape[:2]
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if n <= 1:
         return mask
-    mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    mask_pad = cv2.dilate(mask if exclude_mask is None else exclude_mask,
+                          np.ones((3, 3), np.uint8))
     buf = max(1, int(round(w / 1080.0)))  # "+1 px" at preview scale
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                        (2 * buf + 1, 2 * buf + 1))
@@ -3295,18 +3321,24 @@ def _automask_shrink(img16: np.ndarray, mask: np.ndarray) -> np.ndarray:
         comp0 = np.zeros((ch + 2, cw + 2), np.uint8)
         comp0[1:-1, 1:-1] = labels[y0:y0 + ch, x0:x0 + cw] == i
         half_th = float(cv2.distanceTransform(comp0, cv2.DIST_L2, 3).max())
-        guard = max(_HEAL_GUARD, int(round(0.5 * half_th)))
+        # Auto circles hug the speck, so its soft halo leaks well past the
+        # circle into a near ring — the two-anchor model would adopt the halo
+        # as a "background mode" and the hysteresis growth would stop inside
+        # it. Start the ring farther out (2x thickness vs 0.5x) so it sees
+        # the real surround. Brush dabs are generous by construction, so the
+        # near ring is fine (and keeps their context tight).
+        guard_scale = 0.5 if clip_to_stroke else 2.0
+        guard = max(_HEAL_GUARD, int(round(guard_scale * half_th)))
         ring_w = max(_HEAL_RING, guard + 3)
         pad = guard + ring_w
-        wpad = pad + buf  # room for the buffer dilation at the window edge
-        wx0 = max(0, x0 - wpad)
-        wy0 = max(0, y0 - wpad)
-        wx1 = min(w, x0 + cw + wpad)
-        wy1 = min(h, y0 + ch + wpad)
+        wx0 = max(0, x0 - pad)
+        wy0 = max(0, y0 - pad)
+        wx1 = min(w, x0 + cw + pad)
+        wy1 = min(h, y0 + ch + pad)
         hole = labels[wy0:wy1, wx0:wx1] == i
         away = cv2.distanceTransform((~hole).astype(np.uint8), cv2.DIST_L2, 3)
-        # Ring excludes the ORIGINAL padded mask (all spots, none shrunk yet)
-        # so the result is independent of component order.
+        # Ring excludes ALL spots (padded, none shrunk yet) so the result is
+        # independent of component order.
         ring = ((away > guard) & (away <= pad)
                 & (mask_pad[wy0:wy1, wx0:wx1] == 0))
         if int(ring.sum()) < _HEAL_MIN_RING_PX:
@@ -3317,21 +3349,46 @@ def _automask_shrink(img16: np.ndarray, mask: np.ndarray) -> np.ndarray:
         d_ring = np.minimum(np.abs(ring_px - m_lo).mean(axis=1),
                             np.abs(ring_px - m_hi).mean(axis=1))
         thr = max(_AUTOMASK_K * float(np.median(d_ring)), float(_AUTOMASK_ABS))
-        hole_px = win[hole]
-        d_hole = np.minimum(np.abs(hole_px - m_lo).mean(axis=1),
-                            np.abs(hole_px - m_hi).mean(axis=1))
-        like = d_hole > thr
-        # Gates: something confidently defect-like to target, and enough
-        # clean selection to justify shrinking (a tight trace is mostly
-        # defect and must keep the whole-stroke heal).
-        if not like.any() or 1.0 - float(like.mean()) < _AUTOMASK_CLEAN_MIN:
+        win_luma = win.mean(axis=2)
+        d_lo = np.abs(win - m_lo).mean(axis=2)
+        d_hi = np.abs(win - m_hi).mean(axis=2)
+        d_win = np.minimum(d_lo, d_hi)
+        # Bright-outlier test against the NEARER anchor's luma: dust on the
+        # dark side of an edge is brighter than ITS side even when darker
+        # than the far side.
+        near_luma = np.where(d_lo <= d_hi, float(np.mean(m_lo)),
+                             float(np.mean(m_hi)))
+        bright = win_luma > near_luma
+        seed = (d_win > thr) & bright & hole
+        if not seed.any():
+            continue  # no bright outlier — dark/clean/indistinct: keep whole
+        # Hysteresis: grow seeds through the weak (halo) threshold so the
+        # speck's soft edge joins the mask; weak pixels not connected to any
+        # seed (stray grain) are dropped. Auto spots may grow past the
+        # detected circle (see docstring); brush strokes never leave it.
+        weak = (d_win > _AUTOMASK_GROW * thr) & bright
+        if clip_to_stroke:
+            weak &= hole
+        weak |= seed
+        n_w, lab_w = cv2.connectedComponents(weak.astype(np.uint8),
+                                             connectivity=8)
+        keep_ids = np.unique(lab_w[seed])
+        grown = np.isin(lab_w, keep_ids) & weak
+        # Clean-fraction gate (brush only): a tight trace is mostly defect
+        # and must keep the whole-stroke heal (also guarantees in-stroke
+        # source area). Auto circles are mostly defect BY DESIGN (a tight
+        # circle around a speck) — gating them would keep the whole circle,
+        # whose heal then tone-anchors on the halo just outside it; for them
+        # the seed gate above is the only requirement.
+        if clip_to_stroke and \
+                1.0 - float((grown & hole).sum()) / max(1, int(hole.sum())) \
+                < _AUTOMASK_CLEAN_MIN:
             continue
-        shrunk = np.zeros(hole.shape, np.uint8)
-        hy, hx = np.nonzero(hole)
-        shrunk[hy[like], hx[like]] = 255
-        # The buffer is NOT clipped to the stroke: a defect touching the
-        # stroke edge gets its ≤buf px halo healed too (spec §5.4).
-        shrunk = cv2.dilate(shrunk, kernel)
+        shrunk = cv2.dilate(grown.astype(np.uint8) * 255, kernel)
+        if clip_to_stroke:
+            # The heal never reaches outside what the user painted (matching
+            # the stroke-feather semantics, §5.3).
+            shrunk[~hole] = 0
         out_win = out[wy0:wy1, wx0:wx1]
         out_win[hole] = 0
         out_win[shrunk > 0] = 255
@@ -3357,7 +3414,7 @@ def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
 def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather_px: int,
-                dlike: np.ndarray) -> bool:
+                dlike: np.ndarray, stroke_out_integ: np.ndarray = None) -> bool:
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3449,6 +3506,7 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     d_base = 2.0 * half_th + pad + 2.0
     d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
     best_score, best_src = None, None
+    best_in_score, best_in_src = None, None
     for fi, d in enumerate((d_base, 2.0 * d_base, 4.0 * d_base, d0)):
         for k in range(_HEAL_ANGLES):
             ang = 2.0 * np.pi * (k + 0.35 * fi) / _HEAL_ANGLES
@@ -3464,7 +3522,22 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
             score = float(np.mean(diff * diff))
             if best_score is None or score < best_score:
                 best_score, best_src = score, src
+            # Prefer sources whose CLONED subregion (this patch's hole bbox,
+            # shifted) lies inside the original stroke: that is the texture
+            # the user selected, on the correct side of any edge — the
+            # auto-mask "sample from within the stroke" contract
+            # (spec/dust-auto-mask.md §5.2). Only the copied pixels must be
+            # in-stroke; the matching ring may look outside.
+            if stroke_out_integ is not None:
+                hy0, hx0 = by0 + dy, bx0 + dx
+                hy1, hx1 = by1 + dy, bx1 + dx
+                if (_box_sum(stroke_out_integ, hy0, hx0, hy1, hx1) == 0
+                        and (best_in_score is None or score < best_in_score)):
+                    best_in_score, best_in_src = score, src
 
+    if (best_in_src is not None
+            and best_in_score <= _HEAL_IN_STROKE_TOL * max(best_score, 1.0)):
+        best_src = best_in_src
     if best_src is None:
         return False
 
@@ -3509,9 +3582,13 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
 
     `feather` is the edge fade width as a fraction of image width (the user's
     per-image Feather setting): 0 = essentially hard edges, larger values
-    cross-fade the fill into the surrounding original over a wider ramp.
-    Defect-like pixels are always fully filled regardless of the feather, so
-    a wide fade cannot blend the defect back in.
+    cross-fade the fill into the original over a wider ramp. Under automask
+    the feather softens the STROKE's apply area — alpha ramps inward from the
+    brushed boundary, so the stroke border gets less effect than its center
+    (capped per stroke by its depth, so the center always reaches full
+    effect). Auto (AI) spots and strokes that kept their whole-stroke heal
+    (tight traces) keep the defect-like force-fill instead, so a wide fade
+    cannot blend those defects back in.
 
     Each mask component is filled by CLONING the best-matching clean patch
     from its neighborhood (see _heal_patch) — real texture and grain,
@@ -3527,15 +3604,15 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     masked pixels change, the rest of the frame is bit-for-bit untouched.
 
     `method` selects the heal engine (DUST_METHODS, user-set in Settings):
-      - "automask" (default): each brushed component is first auto-shrunk to
-        the outlier (defect) pixels inside it plus a small buffer
-        (_automask_shrink, spec/dust-auto-mask.md) — a generous circle around
-        a speck heals only the speck, the clean remainder of the stroke is
-        preserved bit-for-bit and doubles as nearby source area, which keeps
-        heals on the correct side of high-contrast edges. Strokes with no
-        confident outlier subset (tight traces, dabs over clean areas) heal
-        whole; the shrunken mask's buffer may extend ~1 preview px past the
-        stroke.
+      - "automask" (default): each selection component is first auto-shrunk
+        to the BRIGHT outlier (dust) pixels inside it — film dust is white —
+        hysteresis-grown over the soft halo, plus a small buffer clipped to
+        the stroke (_automask_shrink, spec/dust-auto-mask.md). A generous
+        circle around a speck heals only the speck; the clean remainder of
+        the stroke is preserved and is the PREFERRED clone-source area, which
+        keeps heals on the correct side of high-contrast edges. Components
+        with no confident bright outlier (tight traces, dabs over clean/dark
+        content) heal whole.
       - "clone": clone-heal the entire stroke (the v1.1 behavior).
       - "inpaint": diffusion-fill the entire stroke via cv2.inpaint (the
         pre-v1.1 behavior; 8-bit, grainless — kept as a user-selectable
@@ -3549,11 +3626,31 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     if method not in dict(DUST_METHODS):
         method = DUST_METHOD_DEFAULT
     h, w = img16.shape[:2]
-    mask = rasterize_dust_mask(spots, h, w)
-    if not mask.any():
+    # Brush strokes and auto (AI) spots follow different feather semantics
+    # under automask (stroke falloff vs full removal), so rasterize per kind.
+    brush_spots = [s for s in spots if s.get("kind") == "brush"]
+    auto_spots = [s for s in spots if s.get("kind") != "brush"]
+    mask_brush0 = rasterize_dust_mask(brush_spots, h, w)
+    mask_auto0 = rasterize_dust_mask(auto_spots, h, w)
+    mask0 = cv2.bitwise_or(mask_brush0, mask_auto0)
+    if not mask0.any():
         return img16
+    stroke_out_integ = None
+    shrunk_a = mask_auto0
     if method == "automask":
-        mask = _automask_shrink(img16, mask)
+        shrunk_b = _automask_shrink(img16, mask_brush0, exclude_mask=mask0)
+        # Auto (AI) circles are machine guesses — growth may follow a speck's
+        # halo past the circle so no bright ring survives the heal.
+        shrunk_a = _automask_shrink(img16, mask_auto0, exclude_mask=mask0,
+                                    clip_to_stroke=False)
+        mask = cv2.bitwise_or(shrunk_b, shrunk_a)
+        if not mask.any():
+            return img16
+        # Integral of "outside every original stroke" — the source search
+        # prefers clone sources within the user's selection (§5.2).
+        stroke_out_integ = cv2.integral((mask0 == 0).astype(np.uint8))
+    else:
+        mask = mask0
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
@@ -3597,7 +3694,8 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                 bbox = (tx + int(xs.min()), ty + int(ys.min()),
                         tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
                 if not _heal_patch(img16, labels, i, bbox, half_th, mask_pad,
-                                   integ, filled, fmap, feather_px, dlike):
+                                   integ, filled, fmap, feather_px, dlike,
+                                   stroke_out_integ=stroke_out_integ):
                     fallback[ty:ty + sub.shape[0],
                              tx:tx + sub.shape[1]][sub] = 255
                     # No defect estimate on this path — cap the fade by the
@@ -3614,23 +3712,60 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         fb = fallback > 0
         filled[fb] = telea16[fb]
 
-    # Feathered composite: alpha rises 0 -> 1 from each hole's boundary inward
-    # over its feather ramp (resolution-scaled, capped by the hole's
-    # defect-free rim), so the fill cross-fades into the original instead of
-    # cutting hard at the mask edge. OUTSIDE the mask alpha is exactly 0 —
-    # those pixels are kept bit-for-bit. The float blend only runs inside the
-    # mask's bounding box (padded 1 px so the cropped distance transform still
-    # sees the zeros surrounding boundary pixels).
-    bx, by, bwd, bhd = cv2.boundingRect(mask)
+    # Feathered composite. OUTSIDE the heal masks alpha is exactly 0 — those
+    # pixels are kept bit-for-bit. The float blend only runs inside the
+    # selection's bounding box (padded 1 px so the cropped distance transform
+    # still sees the zeros surrounding boundary pixels; the union with `mask`
+    # covers auto spots grown past their circle). Blending where `filled` was
+    # never written is a mathematically exact no-op, so alpha maps may safely
+    # span un-healed selection pixels.
+    bx, by, bwd, bhd = cv2.boundingRect(cv2.bitwise_or(mask0, mask))
     ys = slice(max(0, by - 1), min(h, by + bhd + 1))
     xs = slice(max(0, bx - 1), min(w, bx + bwd + 1))
-    a = _feather_alpha(mask[ys, xs], fmap[ys, xs])
-    # Defect-like pixels get the fill at full strength whatever the feather;
-    # the max with a light blur adds a soft lip around the forced region
-    # without weakening its interior.
-    dl = dlike[ys, xs]
-    forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
-    a = np.maximum(a, forced)[..., None]
+    if method == "automask":
+        # BRUSH strokes: the feather softens the stroke's APPLY AREA — alpha
+        # ramps inward from the ORIGINAL stroke boundary (border gets less
+        # effect than the center), capped per stroke by its depth so the
+        # center always reaches full effect. dlike forcing applies only on
+        # strokes that KEPT their whole-stroke heal (tight traces — the
+        # no-blend-back guarantee); shrunken strokes get the pure falloff.
+        fmap0 = np.ones((h, w), np.uint8)
+        keep_force = np.zeros((h, w), np.uint8)
+        nb, lab_b, st_b, _ = cv2.connectedComponentsWithStats(
+            mask_brush0, connectivity=8)
+        for i in range(1, nb):
+            x0b = int(st_b[i, cv2.CC_STAT_LEFT])
+            y0b = int(st_b[i, cv2.CC_STAT_TOP])
+            cwb = int(st_b[i, cv2.CC_STAT_WIDTH])
+            chb = int(st_b[i, cv2.CC_STAT_HEIGHT])
+            comp = lab_b[y0b:y0b + chb, x0b:x0b + cwb] == i
+            pad_c = np.zeros((chb + 2, cwb + 2), np.uint8)
+            pad_c[1:-1, 1:-1] = comp
+            depth = float(cv2.distanceTransform(pad_c, cv2.DIST_L2, 3).max())
+            fmap0[y0b:y0b + chb, x0b:x0b + cwb][comp] = \
+                max(1, min(feather_px, int(round(depth))))
+            heal_win = shrunk_b[y0b:y0b + chb, x0b:x0b + cwb]
+            if int((heal_win[comp] > 0).sum()) == int(comp.sum()):
+                keep_force[y0b:y0b + chb, x0b:x0b + cwb][comp] = 255
+        a_stroke = _feather_alpha(mask_brush0[ys, xs], fmap0[ys, xs])
+        # AUTO (AI) spots: machine-flagged dust is removed at full strength —
+        # the small hole's own ramp plus the dlike force-fill (stroke falloff
+        # on a tight auto circle would leave a bright halo ring).
+        a_auto = _feather_alpha(shrunk_a[ys, xs], fmap[ys, xs])
+        dl = np.where((shrunk_a[ys, xs] > 0) | (keep_force[ys, xs] > 0),
+                      dlike[ys, xs], 0).astype(np.uint8)
+        forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
+        a = np.maximum(a_stroke, np.maximum(a_auto, forced))[..., None]
+    else:
+        # Whole-stroke engines: alpha rises 0 -> 1 from each hole's boundary
+        # inward over its feather ramp (capped by the hole's defect-free
+        # rim). Defect-like pixels get the fill at full strength whatever the
+        # feather; the max with a light blur adds a soft lip around the
+        # forced region without weakening its interior.
+        a = _feather_alpha(mask[ys, xs], fmap[ys, xs])
+        dl = dlike[ys, xs]
+        forced = np.maximum(dl, cv2.blur(dl, (3, 3))).astype(np.float32) / 255.0
+        a = np.maximum(a, forced)[..., None]
     out = img16.copy()
     blend = (img16[ys, xs].astype(np.float32) * (1.0 - a)
              + filled[ys, xs].astype(np.float32) * a)
