@@ -3229,6 +3229,108 @@ _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
 DUST_FEATHER_DEFAULT = 0.003  # feather ramp width, fraction of image width
                               # (user-adjustable per image via the dust panel)
 
+# Auto-mask tuning (spec/dust-auto-mask.md): shrink a generous selection to
+# the outlier (defect) pixels inside it, so the heal replaces only the dust
+# and the clean remainder of the stroke is preserved (and becomes valid,
+# same-side-of-any-edge source area for the clone search).
+_AUTOMASK_K = 5.0          # outlier threshold, multiples of the ring's scatter
+_AUTOMASK_ABS = 900        # absolute threshold floor, 16-bit units (~1.4%)
+_AUTOMASK_CLEAN_MIN = 0.4  # min clean fraction of the selection to shrink
+
+
+def _ring_anchors(ring_px: np.ndarray) -> tuple:
+    """Two-anchor model of a hole's surround: 2-means over the ring pixels
+    (per-channel mean-abs distance), anchors initialized at the per-channel
+    medians of the ring's bottom/top luma deciles, two assignment rounds.
+    A unimodal surround converges to near-coincident anchors (≈ one anchor);
+    a bimodal one (selection straddling a bright/dark edge) lands on the two
+    modes even when the split is unbalanced — a plain median-luma split
+    mis-models a 90/10 ring and flags the minority side's CLEAN pixels as
+    outliers. See spec/dust-auto-mask.md §5.2."""
+    luma = ring_px.mean(axis=1)
+    m_lo = np.median(ring_px[luma <= np.percentile(luma, 10.0)], axis=0)
+    m_hi = np.median(ring_px[luma >= np.percentile(luma, 90.0)], axis=0)
+    for _ in range(2):
+        near_lo = (np.abs(ring_px - m_lo).mean(axis=1)
+                   <= np.abs(ring_px - m_hi).mean(axis=1))
+        if near_lo.all() or not near_lo.any():
+            break
+        m_lo = np.median(ring_px[near_lo], axis=0)
+        m_hi = np.median(ring_px[~near_lo], axis=0)
+    return m_lo, m_hi
+
+
+def _automask_shrink(img16: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Shrink each brushed component to its outlier (defect) pixels plus a
+    resolution-scaled buffer; components with no confident outlier subset —
+    tight traces (mostly defect), dabs over clean or indistinct content —
+    keep their full stroke, i.e. today's whole-stroke heal. Returns a new
+    mask (or `mask` unchanged). Disabled via FREECCR_DUST_AUTOMASK=0.
+    See spec/dust-auto-mask.md."""
+    if os.environ.get("FREECCR_DUST_AUTOMASK", "1").lower() in ("0", "false",
+                                                                "off"):
+        return mask
+    h, w = mask.shape[:2]
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n <= 1:
+        return mask
+    mask_pad = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    buf = max(1, int(round(w / 1080.0)))  # "+1 px" at preview scale
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (2 * buf + 1, 2 * buf + 1))
+    out = mask.copy()
+    for i in range(1, n):  # 0 is background
+        x0 = int(stats[i, cv2.CC_STAT_LEFT])
+        y0 = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        # Context window sized like _heal_patch's (1px zero border so a
+        # component touching its bbox edge still measures correctly).
+        comp0 = np.zeros((ch + 2, cw + 2), np.uint8)
+        comp0[1:-1, 1:-1] = labels[y0:y0 + ch, x0:x0 + cw] == i
+        half_th = float(cv2.distanceTransform(comp0, cv2.DIST_L2, 3).max())
+        guard = max(_HEAL_GUARD, int(round(0.5 * half_th)))
+        ring_w = max(_HEAL_RING, guard + 3)
+        pad = guard + ring_w
+        wpad = pad + buf  # room for the buffer dilation at the window edge
+        wx0 = max(0, x0 - wpad)
+        wy0 = max(0, y0 - wpad)
+        wx1 = min(w, x0 + cw + wpad)
+        wy1 = min(h, y0 + ch + wpad)
+        hole = labels[wy0:wy1, wx0:wx1] == i
+        away = cv2.distanceTransform((~hole).astype(np.uint8), cv2.DIST_L2, 3)
+        # Ring excludes the ORIGINAL padded mask (all spots, none shrunk yet)
+        # so the result is independent of component order.
+        ring = ((away > guard) & (away <= pad)
+                & (mask_pad[wy0:wy1, wx0:wx1] == 0))
+        if int(ring.sum()) < _HEAL_MIN_RING_PX:
+            continue  # no context to judge outliers against — keep whole
+        win = img16[wy0:wy1, wx0:wx1].astype(np.float32)
+        ring_px = win[ring]
+        m_lo, m_hi = _ring_anchors(ring_px)
+        d_ring = np.minimum(np.abs(ring_px - m_lo).mean(axis=1),
+                            np.abs(ring_px - m_hi).mean(axis=1))
+        thr = max(_AUTOMASK_K * float(np.median(d_ring)), float(_AUTOMASK_ABS))
+        hole_px = win[hole]
+        d_hole = np.minimum(np.abs(hole_px - m_lo).mean(axis=1),
+                            np.abs(hole_px - m_hi).mean(axis=1))
+        like = d_hole > thr
+        # Gates: something confidently defect-like to target, and enough
+        # clean selection to justify shrinking (a tight trace is mostly
+        # defect and must keep the whole-stroke heal).
+        if not like.any() or 1.0 - float(like.mean()) < _AUTOMASK_CLEAN_MIN:
+            continue
+        shrunk = np.zeros(hole.shape, np.uint8)
+        hy, hx = np.nonzero(hole)
+        shrunk[hy[like], hx[like]] = 255
+        # The buffer is NOT clipped to the stroke: a defect touching the
+        # stroke edge gets its ≤buf px halo healed too (spec §5.4).
+        shrunk = cv2.dilate(shrunk, kernel)
+        out_win = out[wy0:wy1, wx0:wx1]
+        out_win[hole] = 0
+        out_win[shrunk > 0] = 255
+    return out
+
 
 def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
     """Sum of a uint8 map over [y0:y1, x0:x1] via its cv2.integral image."""
@@ -3416,6 +3518,16 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     composited through a feathered alpha that ramps inward from each hole's
     boundary (resolution-scaled, capped by the hole's defect-free rim); ONLY
     masked pixels change, the rest of the frame is bit-for-bit untouched.
+
+    Before healing, each brushed component is auto-shrunk to the outlier
+    (defect) pixels inside it plus a small buffer (_automask_shrink,
+    spec/dust-auto-mask.md): a generous circle around a speck heals only the
+    speck, the clean remainder of the stroke is preserved bit-for-bit and
+    doubles as nearby source area — which keeps heals on the correct side of
+    high-contrast edges. Strokes with no confident outlier subset (tight
+    traces, dabs over clean areas) heal whole, as before; the shrunken
+    mask's buffer may extend up to ~1 preview px past the stroke.
+
     Returns a NEW uint16 array; img16 is never mutated. No-op (returns img16
     unchanged) when there are no spots or the rasterized mask is empty.
     """
@@ -3425,6 +3537,7 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     mask = rasterize_dust_mask(spots, h, w)
     if not mask.any():
         return img16
+    mask = _automask_shrink(img16, mask)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).

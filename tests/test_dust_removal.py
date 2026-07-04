@@ -176,10 +176,14 @@ class TestApplyDustRemoval:
         hard = _feather_alpha(mask, np.ones((60, 60), np.uint8))
         assert hard[30, 49] > 0.9                  # 1px feather ~ hard fill
 
-    def test_feather_param_softens_rim(self):
+    def test_feather_param_softens_rim(self, monkeypatch):
         # The user Feather setting widens the fill's cross-fade: with a wide
         # feather the hole's clean rim stays close to the ORIGINAL pixels
         # (low alpha), with feather 0 the rim is the clone (hard edge).
+        # Auto-mask is pinned off: it would (correctly) shrink this generous
+        # dab to the speck, and the dab rim this test measures would no longer
+        # be part of the hole (spec/dust-auto-mask.md §7).
+        monkeypatch.setenv("FREECCR_DUST_AUTOMASK", "0")
         rng = np.random.default_rng(5)
         img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
                       65535).astype(np.uint16)
@@ -219,6 +223,133 @@ class TestApplyDustRemoval:
         out = apply_dust_removal(img, [spot])
         center = out[49:52, 49:52].astype(np.float32).reshape(-1, 3).mean(axis=0)
         assert float(np.abs(center - sky).max()) < 6000
+
+
+# --- auto-mask (shrink a generous selection to its outliers) -----------------
+# spec/dust-auto-mask.md: a dab loosely circling a defect heals only the
+# defect (+ a small buffer); the clean remainder of the selection is
+# preserved bit-for-bit and doubles as local source area, which keeps heals
+# on the correct side of high-contrast edges.
+from core.ccr_processor import _automask_shrink  # noqa: E402
+
+
+class TestAutoMaskShrink:
+    """_automask_shrink directly: what shrinks, what stays whole."""
+
+    @staticmethod
+    def _dab_mask(h=100, w=100, cx=50, cy=50, r=15):
+        mask = np.zeros((h, w), np.uint8)
+        cv2.circle(mask, (cx, cy), r, 255, -1)
+        return mask
+
+    def test_shrink_targets_outliers_only(self):
+        img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=4)
+        mask = self._dab_mask(r=15)
+        out = _automask_shrink(img, mask)
+        assert out[50, 50] == 255                    # speck stays masked
+        assert out[50, 60] == 0                      # clean dab pixel released
+        # Shrunken mask stays within speck + buffer (r=4 + ~2px slack).
+        yy, xx = np.mgrid[0:100, 0:100]
+        assert not out[np.hypot(yy - 50, xx - 50) > 7].any()
+
+    def test_dark_speck_variant(self):
+        img = _flat_with_speck(base=40000, speck=2000, cx=50, cy=50, r=4)
+        out = _automask_shrink(img, self._dab_mask(r=15))
+        assert out[50, 50] == 255
+        assert out[50, 60] == 0
+
+    def test_tight_trace_keeps_whole_stroke(self):
+        # Brush ≈ defect width: nearly everything under the stroke is defect,
+        # so the clean-fraction gate must keep the whole stroke.
+        sky = np.array([20000, 25000, 40000], np.uint16)
+        img = np.broadcast_to(sky, (200, 200, 3)).copy()
+        cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
+        mask = np.zeros((200, 200), np.uint8)
+        cv2.line(mask, (40, 100), (160, 100), 255, 9)  # inside the hair
+        out = _automask_shrink(img, mask)
+        assert np.array_equal(out, mask)
+
+    def test_clean_dab_stays_whole(self):
+        rng = np.random.default_rng(11)
+        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        mask = self._dab_mask(r=15)
+        out = _automask_shrink(img, mask)
+        assert np.array_equal(out, mask)  # no confident outlier -> unchanged
+
+    def test_edge_straddling_dab_flags_only_the_speck(self):
+        # Bimodal surround (the bright-face/dark-background case): both sides
+        # of the edge are legit ring modes; only the speck is an outlier.
+        rng = np.random.default_rng(3)
+        img = np.clip(rng.normal(8000, 500, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:, 50:] = np.clip(rng.normal(50000, 500, (100, 100 - 50, 3)),
+                              0, 65535).astype(np.uint16)
+        cv2.circle(img, (60, 50), 3, (65000, 65000, 65000), -1)  # bright side
+        mask = self._dab_mask(cx=52, cy=50, r=16)   # straddles the edge
+        out = _automask_shrink(img, mask)
+        assert out[50, 60] == 255                    # speck masked
+        assert not out[:, :49].any()                 # dark side fully released
+        yy, xx = np.mgrid[0:100, 0:100]
+        assert not out[np.hypot(yy - 50, xx - 60) > 6].any()
+
+    def test_env_knob_disables(self, monkeypatch):
+        monkeypatch.setenv("FREECCR_DUST_AUTOMASK", "0")
+        img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=4)
+        mask = self._dab_mask(r=15)
+        assert np.array_equal(_automask_shrink(img, mask), mask)
+
+
+class TestAutoMaskPipeline:
+    """apply_dust_removal end-to-end with the shrink pass."""
+
+    def test_generous_dab_preserves_clean_selection_pixels(self):
+        rng = np.random.default_rng(9)
+        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}  # dab r=15
+        out = apply_dust_removal(img, [spot])
+        # Speck healed to the surround.
+        assert abs(int(out[50, 50, 0]) - 30000) < 10000
+        # Clean selection pixels (inside the dab, away from the speck) are
+        # bit-for-bit original — the whole point of the auto-mask.
+        yy, xx = np.mgrid[0:100, 0:100]
+        keep = (np.hypot(yy - 50, xx - 50) < 15) & \
+               (np.hypot(yy - 50, xx - 50) > 8)
+        assert np.array_equal(out[keep], img[keep])
+
+    def test_edge_straddling_dab_heals_on_the_right_side(self):
+        # Speck on the bright side of a hard edge, dab straddling the edge:
+        # the fill must land at bright-side statistics (not pulled dark) and
+        # the dark side of the selection must stay bit-for-bit.
+        rng = np.random.default_rng(4)
+        img = np.clip(rng.normal(8000, 500, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:, 50:] = np.clip(rng.normal(50000, 500, (100, 50, 3)),
+                              0, 65535).astype(np.uint16)
+        cv2.circle(img, (60, 50), 3, (65000, 65000, 65000), -1)
+        spot = {"kind": "brush", "pts": [[0.52, 0.5]], "r": 0.16}
+        out = apply_dust_removal(img, [spot])
+        healed = out[48:53, 58:63].astype(np.float32)
+        assert abs(float(healed.mean()) - 50000) < 4000   # bright-side fill
+        # Dark side under the dab: untouched.
+        yy, xx = np.mgrid[0:100, 0:100]
+        dark = (np.hypot(yy - 50, xx - 52) < 16) & (xx < 49)
+        assert np.array_equal(out[dark], img[dark])
+
+    def test_two_specks_one_dab(self):
+        rng = np.random.default_rng(6)
+        img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (43, 50), 2, (62000, 62000, 62000), -1)
+        cv2.circle(img, (57, 50), 2, (1000, 1000, 1000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
+        out = apply_dust_removal(img, [spot])
+        assert abs(int(out[50, 43, 0]) - 30000) < 9000
+        assert abs(int(out[50, 57, 0]) - 30000) < 9000
+        # The strip between the two specks is original.
+        assert np.array_equal(out[48:53, 47:53], img[48:53, 47:53])
 
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -

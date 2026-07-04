@@ -289,6 +289,11 @@ display-only `_auto_brightness_for_preview` (ccr_image.py:548) — acceptable: t
 normalized spots replay correctly at export regardless of preview auto-brightness.
 
 ### 5.2 Mask rasterization + clone-heal fill (`ccr_processor.py`)
+
+> Extension: before healing, each brushed component is auto-shrunk to the
+> outlier (defect) pixels inside it, so a generous circle around a speck heals
+> only the speck — see `spec/dust-auto-mask.md` (`_automask_shrink`).
+
 Functions:
 
 ```python
