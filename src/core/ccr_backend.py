@@ -77,6 +77,12 @@ class CCRBackend:
         # spec/auto-white-balance.md.
         self.auto_awb: bool = True
         self.awb_algorithm: str = "gray_world"
+        # Dust heal engine: "automask" (outliers in the stroke + clone heal,
+        # default), "clone" (whole stroke, v1.1) or "inpaint" (diffusion,
+        # pre-v1.1). Read live in CCRImage._apply_dust_removal — never baked,
+        # so switching replays every stored spot through the chosen engine.
+        # Global, persisted by MainWindow. See spec/dust-auto-mask.md §3.
+        self.dust_method: str = "automask"
         self.white_point_bgr = None  # (B, G, R) of dense/exposed area
         self.black_point_bgr = None  # (B, G, R) of transparent/clear area
         # Selected film-stock preset for the black-point-only conversion:

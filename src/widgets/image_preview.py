@@ -1715,9 +1715,10 @@ class ImagePreview(QWidget):
                 getattr(img, "color_profile", "color"),
                 # Global display modes read live inside apply_adjustments — a
                 # toggle must invalidate the baked hi-res tile (spec/auto-gain.md,
-                # spec/gamma-luminance-mode.md).
+                # spec/gamma-luminance-mode.md, spec/dust-auto-mask.md).
                 bool(getattr(ccr_backend, "gamma_luminance", False)),
                 bool(getattr(ccr_backend, "auto_gain", True)),
+                str(getattr(ccr_backend, "dust_method", "automask")),
                 areas_sig, dust_sig)
 
     HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)

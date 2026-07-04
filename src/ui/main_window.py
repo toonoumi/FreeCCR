@@ -219,6 +219,14 @@ class MainWindow(QMainWindow):
         ccr_backend.awb_algorithm = (
             stored_algo if any(a == stored_algo for a, _ in AWB_ALGORITHMS)
             else AWB_DEFAULT)
+        # Restore the dust heal engine (default "automask"). Read live inside
+        # the render, like Auto Gain. See spec/dust-auto-mask.md §3.
+        from core.ccr_processor import DUST_METHODS, DUST_METHOD_DEFAULT
+        stored_dust = self._settings.value("adjust/dust_method",
+                                           DUST_METHOD_DEFAULT)
+        ccr_backend.dust_method = (
+            stored_dust if any(m == stored_dust for m, _ in DUST_METHODS)
+            else DUST_METHOD_DEFAULT)
         # Reflect the restored mode in the toolbar/slider gating right away
         # (no images yet, but the negative-only actions should already grey out).
         self.image_preview._update_unconvert_action_state()
@@ -757,6 +765,20 @@ class MainWindow(QMainWindow):
         self._rerender_all_for_global_mode(
             "Gamma: hue-preserving (luminance) mode." if checked else
             "Gamma: per-channel mode (standard).")
+
+    def on_dust_method_changed(self, method: str):
+        """Switch the global dust heal engine, persist it, and re-render all
+        loaded images — spots are stored normalized and healed at render time,
+        so every existing spot replays through the new engine (nothing is
+        baked). Mirrors on_auto_gain_toggled. See spec/dust-auto-mask.md §3."""
+        from core.ccr_processor import DUST_METHODS, DUST_METHOD_DEFAULT
+        labels = dict(DUST_METHODS)
+        if method not in labels:
+            method = DUST_METHOD_DEFAULT
+        ccr_backend.dust_method = str(method)
+        self._settings.setValue("adjust/dust_method", str(method))
+        self._rerender_all_for_global_mode(
+            f"Dust heal: {labels[method]}.")
 
     def show_about_dialog(self):
         QMessageBox.about(

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from core import color_management
 from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
 from core.ccr_backend import ccr_backend
+from core.ccr_processor import DUST_METHODS, DUST_METHOD_DEFAULT
 from ui import theme
 
 
@@ -146,6 +147,27 @@ class SettingsDialog(QDialog):
             "bright areas more than Gray World. Gray Edge balances on edge "
             "colors — robust when large areas share one color."))
         lay.addWidget(grp_wb)
+
+        grp_dust = QGroupBox("Dust removal")
+        gd = QVBoxLayout(grp_dust)
+        gd.setSpacing(theme.GAP_ROW)
+        method_row = QHBoxLayout()
+        method_row.setSpacing(theme.GAP_ROW)
+        method_row.addWidget(QLabel("Heal method"))
+        self._combo_dust_method = QComboBox()
+        for method_id, label in DUST_METHODS:
+            self._combo_dust_method.addItem(label, method_id)
+        method_row.addWidget(self._combo_dust_method, 1)
+        gd.addLayout(method_row)
+        gd.addWidget(self._muted(
+            "Auto-mask (default) detects the dust inside each brush stroke and "
+            "replaces only that, sampling replacement texture from right next "
+            "to it — the rest of the stroke is untouched, which keeps heals "
+            "clean near bright/dark edges. Whole stroke clone-heals everything "
+            "under the brush. Inpaint is the legacy diffusion fill (smooth, "
+            "grainless). Spots are re-healed live, so switching updates every "
+            "image."))
+        lay.addWidget(grp_dust)
 
         lay.addStretch(1)
         return page
@@ -311,6 +333,13 @@ class SettingsDialog(QDialog):
         self._combo_awb_algo.setCurrentIndex(
             idx if idx >= 0 else self._combo_awb_algo.findData(AWB_DEFAULT))
         self._combo_awb_algo.blockSignals(False)
+        self._combo_dust_method.blockSignals(True)
+        idx = self._combo_dust_method.findData(
+            getattr(ccr_backend, "dust_method", DUST_METHOD_DEFAULT))
+        self._combo_dust_method.setCurrentIndex(
+            idx if idx >= 0
+            else self._combo_dust_method.findData(DUST_METHOD_DEFAULT))
+        self._combo_dust_method.blockSignals(False)
 
     def _apply_pending(self):
         """Apply only the toggles whose checkbox differs from the live backend
@@ -335,6 +364,10 @@ class SettingsDialog(QDialog):
             self._mw.on_awb_algorithm_changed(staged_algo)
         if bool(self._cb_gamma_lum.isChecked()) != bool(ccr_backend.gamma_luminance):
             self._mw.on_gamma_mode_toggled(bool(self._cb_gamma_lum.isChecked()))
+        staged_dust = self._combo_dust_method.currentData()
+        if staged_dust != getattr(ccr_backend, "dust_method",
+                                  DUST_METHOD_DEFAULT):
+            self._mw.on_dust_method_changed(staged_dust)
 
     def accept(self):
         """Done: commit the staged toggles, then close. (Escape/close → reject,

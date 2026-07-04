@@ -176,21 +176,20 @@ class TestApplyDustRemoval:
         hard = _feather_alpha(mask, np.ones((60, 60), np.uint8))
         assert hard[30, 49] > 0.9                  # 1px feather ~ hard fill
 
-    def test_feather_param_softens_rim(self, monkeypatch):
+    def test_feather_param_softens_rim(self):
         # The user Feather setting widens the fill's cross-fade: with a wide
         # feather the hole's clean rim stays close to the ORIGINAL pixels
         # (low alpha), with feather 0 the rim is the clone (hard edge).
-        # Auto-mask is pinned off: it would (correctly) shrink this generous
+        # method="clone": auto-mask would (correctly) shrink this generous
         # dab to the speck, and the dab rim this test measures would no longer
         # be part of the hole (spec/dust-auto-mask.md §7).
-        monkeypatch.setenv("FREECCR_DUST_AUTOMASK", "0")
         rng = np.random.default_rng(5)
         img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
                       65535).astype(np.uint16)
         cv2.circle(img, (100, 100), 6, (60000, 60000, 60000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # mask r=16
-        hard = apply_dust_removal(img, [spot], feather=0.0)
-        soft = apply_dust_removal(img, [spot], feather=0.08)
+        hard = apply_dust_removal(img, [spot], feather=0.0, method="clone")
+        soft = apply_dust_removal(img, [spot], feather=0.08, method="clone")
         yy, xx = np.mgrid[0:200, 0:200]
         rim = (np.hypot(yy - 100, xx - 100) > 13.5) & \
               (np.hypot(yy - 100, xx - 100) < 15.5)
@@ -293,11 +292,68 @@ class TestAutoMaskShrink:
         yy, xx = np.mgrid[0:100, 0:100]
         assert not out[np.hypot(yy - 50, xx - 60) > 6].any()
 
-    def test_env_knob_disables(self, monkeypatch):
-        monkeypatch.setenv("FREECCR_DUST_AUTOMASK", "0")
+class TestHealMethodChoice:
+    """The Settings heal-method choice: apply_dust_removal(method=...) selects
+    the engine; ccr_backend.dust_method drives it through apply_adjustments."""
+
+    def test_clone_replaces_whole_stroke(self):
+        rng = np.random.default_rng(12)
+        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
+        out = apply_dust_removal(img, [spot], method="clone")
+        assert abs(int(out[50, 50, 0]) - 30000) < 10000  # speck healed
+        # Whole-stroke engine: clean dab pixels are ALSO replaced (unlike
+        # automask, which preserves them bit-for-bit).
+        yy, xx = np.mgrid[0:100, 0:100]
+        keep = (np.hypot(yy - 50, xx - 50) < 13) & \
+               (np.hypot(yy - 50, xx - 50) > 8)
+        assert not np.array_equal(out[keep], img[keep])
+
+    def test_inpaint_uses_diffusion(self):
+        # The legacy engine fills through the 8-bit Telea path: on a flat
+        # 30000 field the fill quantizes to multiples of 257 (30069), the
+        # exact signature test_fill_is_16bit_native_on_flat_field excludes
+        # for the clone engines.
         img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=4)
-        mask = self._dab_mask(r=15)
-        assert np.array_equal(_automask_shrink(img, mask), mask)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}
+        out = apply_dust_removal(img, [spot], method="inpaint")
+        core = out[49:52, 49:52].astype(np.int32)
+        assert int(np.abs(core - 30069).max()) <= 257 * 2
+        assert (core % 257 == 0).all()
+
+    def test_unknown_method_behaves_as_automask(self):
+        rng = np.random.default_rng(13)
+        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
+        out = apply_dust_removal(img, [spot], method="not-a-method")
+        yy, xx = np.mgrid[0:100, 0:100]
+        keep = (np.hypot(yy - 50, xx - 50) < 13) & \
+               (np.hypot(yy - 50, xx - 50) > 8)
+        assert np.array_equal(out[keep], img[keep])  # automask preservation
+
+    def test_backend_setting_drives_apply_adjustments(self, tmp_path):
+        from core.ccr_backend import ccr_backend
+        path = str(tmp_path / "m.png")
+        cv2.imwrite(path, np.zeros((10, 10, 3), np.uint8))
+        img = CCRImage(path)
+        img.adjustment_settings = {}
+        img.contrast_base = img.temperature_base = img.brightness_base = 0
+        img.color_profile = "color"
+        img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}]
+        src = _flat_with_speck()
+        prev = getattr(ccr_backend, "dust_method", "automask")
+        try:
+            ccr_backend.dust_method = "inpaint"
+            out = img.apply_adjustments(src)
+        finally:
+            ccr_backend.dust_method = prev
+        # The 257-quantized fill proves the backend choice reached the heal.
+        core = out[49:52, 49:52].astype(np.int32)
+        assert (core % 257 == 0).all()
 
 
 class TestAutoMaskPipeline:

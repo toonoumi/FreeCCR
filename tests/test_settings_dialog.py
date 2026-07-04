@@ -50,6 +50,7 @@ def _reset_profile_state():
         ccr_backend.positive_mode = False
         ccr_backend.density_bwpoint = False        # product default: opt-in
         ccr_backend.gamma_luminance = False        # product default: per-channel
+        ccr_backend.dust_method = "automask"       # product default
         ccr_backend.active_profile_path = None
         ccr_backend.images = []
     _reset()
@@ -288,10 +289,23 @@ class _StubMW(QWidget):
         self.calls.append(("gamma_lum", bool(c)))
         ccr_backend.gamma_luminance = bool(c)
 
+    def on_dust_method_changed(self, m):
+        self.calls.append(("dust_method", str(m)))
+        ccr_backend.dust_method = str(m)
+
+
+# Keep every created dialog (and its stub parent) alive for the whole run:
+# letting them become garbage mid-run destroys their C++ widgets at an
+# arbitrary later moment, which intermittently access-violates inside
+# unrelated native calls (same mitigation as test_crop_hires._HOSTS).
+_DIALOGS = []
+
 
 def _dialog():
     from widgets.settings_dialog import SettingsDialog
-    return SettingsDialog(_StubMW())
+    d = SettingsDialog(_StubMW())
+    _DIALOGS.append(d)
+    return d
 
 
 class TestSettingsDialog:
@@ -357,6 +371,22 @@ class TestSettingsDialog:
         d = _dialog()                                  # all at backend defaults
         d.accept()
         assert d._mw.calls == []
+
+    def test_dust_method_staged_and_applied(self):
+        # The heal-method combo follows the same staged contract as the
+        # toggles, and carries the three engines (spec/dust-auto-mask.md §3).
+        d = _dialog()
+        ids = [d._combo_dust_method.itemData(i)
+               for i in range(d._combo_dust_method.count())]
+        assert ids == ["automask", "clone", "inpaint"]
+        assert d._combo_dust_method.currentData() == "automask"  # seeded
+        d._combo_dust_method.setCurrentIndex(
+            d._combo_dust_method.findData("inpaint"))
+        assert d._mw.calls == []                       # staged, not applied
+        assert ccr_backend.dust_method == "automask"
+        d.accept()                                     # Done
+        assert ("dust_method", "inpaint") in d._mw.calls
+        assert ccr_backend.dust_method == "inpaint"
 
     def test_close_without_done_discards_toggles(self):
         ccr_backend.positive_mode = False

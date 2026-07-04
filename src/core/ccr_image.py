@@ -15,6 +15,7 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_gamma_curve, apply_cineon_to_rec709,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal, DUST_FEATHER_DEFAULT,
+                                DUST_METHOD_DEFAULT,
                                 _apply_working_space_recovery,
                                 compute_auto_gain_offset)
 from core import color_management
@@ -917,14 +918,18 @@ class CCRImage:
     def _apply_dust_removal(self, image: np.ndarray) -> np.ndarray:
         """Inpaint stored dust spots out of the working image (no-op when there
         are none). Spots are normalized, so this scales to whatever resolution
-        is being processed — preview, hi-res zoom, or full-res export. See
-        spec/dust-removal.md."""
+        is being processed — preview, hi-res zoom, or full-res export. The heal
+        engine is the global Settings choice, read live like Auto Gain (never
+        baked per image, so switching replays every stored spot). See
+        spec/dust-removal.md and spec/dust-auto-mask.md."""
         spots = getattr(self, "dust_spots", None)
         if not spots:
             return image
+        from core.ccr_backend import ccr_backend  # deferred — backend imports us
         return apply_dust_removal(
             image, spots,
-            feather=getattr(self, "dust_feather", DUST_FEATHER_DEFAULT))
+            feather=getattr(self, "dust_feather", DUST_FEATHER_DEFAULT),
+            method=getattr(ccr_backend, "dust_method", DUST_METHOD_DEFAULT))
 
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,

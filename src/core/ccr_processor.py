@@ -3229,6 +3229,16 @@ _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
 DUST_FEATHER_DEFAULT = 0.003  # feather ramp width, fraction of image width
                               # (user-adjustable per image via the dust panel)
 
+# Dust heal method (Settings → General → Dust removal; spec/dust-auto-mask.md
+# §3). Global render setting, applied live like Auto Gain — not baked per
+# image, so switching replays every stored spot through the chosen engine.
+DUST_METHOD_DEFAULT = "automask"
+DUST_METHODS = (
+    ("automask", "Auto-mask (default)"),   # outliers in the stroke + clone heal
+    ("clone", "Whole stroke"),             # clone-heal the entire stroke (v1.1)
+    ("inpaint", "Inpaint (legacy)"),       # cv2.inpaint diffusion (pre-v1.1)
+)
+
 # Auto-mask tuning (spec/dust-auto-mask.md): shrink a generous selection to
 # the outlier (defect) pixels inside it, so the heal replaces only the dust
 # and the clean remainder of the stroke is preserved (and becomes valid,
@@ -3264,12 +3274,8 @@ def _automask_shrink(img16: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Shrink each brushed component to its outlier (defect) pixels plus a
     resolution-scaled buffer; components with no confident outlier subset —
     tight traces (mostly defect), dabs over clean or indistinct content —
-    keep their full stroke, i.e. today's whole-stroke heal. Returns a new
-    mask (or `mask` unchanged). Disabled via FREECCR_DUST_AUTOMASK=0.
-    See spec/dust-auto-mask.md."""
-    if os.environ.get("FREECCR_DUST_AUTOMASK", "1").lower() in ("0", "false",
-                                                                "off"):
-        return mask
+    keep their full stroke, i.e. the whole-stroke heal. Returns a new mask
+    (or `mask` unchanged). See spec/dust-auto-mask.md."""
     h, w = mask.shape[:2]
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if n <= 1:
@@ -3497,7 +3503,8 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
 
 
 def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
-                       feather: float = DUST_FEATHER_DEFAULT) -> np.ndarray:
+                       feather: float = DUST_FEATHER_DEFAULT,
+                       method: str = DUST_METHOD_DEFAULT) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
     `feather` is the edge fade width as a fraction of image width (the user's
@@ -3519,25 +3526,34 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     boundary (resolution-scaled, capped by the hole's defect-free rim); ONLY
     masked pixels change, the rest of the frame is bit-for-bit untouched.
 
-    Before healing, each brushed component is auto-shrunk to the outlier
-    (defect) pixels inside it plus a small buffer (_automask_shrink,
-    spec/dust-auto-mask.md): a generous circle around a speck heals only the
-    speck, the clean remainder of the stroke is preserved bit-for-bit and
-    doubles as nearby source area — which keeps heals on the correct side of
-    high-contrast edges. Strokes with no confident outlier subset (tight
-    traces, dabs over clean areas) heal whole, as before; the shrunken
-    mask's buffer may extend up to ~1 preview px past the stroke.
+    `method` selects the heal engine (DUST_METHODS, user-set in Settings):
+      - "automask" (default): each brushed component is first auto-shrunk to
+        the outlier (defect) pixels inside it plus a small buffer
+        (_automask_shrink, spec/dust-auto-mask.md) — a generous circle around
+        a speck heals only the speck, the clean remainder of the stroke is
+        preserved bit-for-bit and doubles as nearby source area, which keeps
+        heals on the correct side of high-contrast edges. Strokes with no
+        confident outlier subset (tight traces, dabs over clean areas) heal
+        whole; the shrunken mask's buffer may extend ~1 preview px past the
+        stroke.
+      - "clone": clone-heal the entire stroke (the v1.1 behavior).
+      - "inpaint": diffusion-fill the entire stroke via cv2.inpaint (the
+        pre-v1.1 behavior; 8-bit, grainless — kept as a user-selectable
+        legacy option).
 
     Returns a NEW uint16 array; img16 is never mutated. No-op (returns img16
     unchanged) when there are no spots or the rasterized mask is empty.
     """
     if not spots:
         return img16
+    if method not in dict(DUST_METHODS):
+        method = DUST_METHOD_DEFAULT
     h, w = img16.shape[:2]
     mask = rasterize_dust_mask(spots, h, w)
     if not mask.any():
         return img16
-    mask = _automask_shrink(img16, mask)
+    if method == "automask":
+        mask = _automask_shrink(img16, mask)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     # "Clean" excludes every spot plus 1 px (buries antialiased speck edges).
@@ -3563,6 +3579,14 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
         hole0[1:-1, 1:-1] = comp_win
         half_th = float(cv2.distanceTransform(hole0, cv2.DIST_L2, 3).max())
+        if method == "inpaint":
+            # Legacy engine: the whole component goes through the diffusion
+            # fallback below, with the same thickness-capped feather the
+            # no-clean-source path uses.
+            fallback[y0:y0 + ch, x0:x0 + cw][comp_win] = 255
+            fmap[y0:y0 + ch, x0:x0 + cw][comp_win] = \
+                max(1, min(feather_px, int(round(0.5 * half_th))))
+            continue
         seg = max(_HEAL_SEG_MIN, int(round(_HEAL_SEG_THICKNESS * half_th)))
         for ty in range(y0, y0 + ch, seg):
             for tx in range(x0, x0 + cw, seg):

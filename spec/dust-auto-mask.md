@@ -40,8 +40,10 @@ whole-stroke heal.
   the bright side is sourced from the bright side.
 - Applies identically to manual strokes and AI-detected ("auto") spots — it is
   keyed on mask content, not spot kind.
-- Fully automatic: no new UI. Predictable fallback to current behavior when
-  the outlier picture is not clear.
+- Fully automatic by default, with a predictable fallback to whole-stroke
+  behavior when the outlier picture is not clear — plus a global **Settings
+  choice** of heal engine (Auto-mask / Whole stroke / Inpaint legacy) so
+  users can compare and opt out per taste.
 - Preserves every existing guarantee of `apply_dust_removal`: non-destructive,
   16-bit native, resolution-independent contract, only-masked-pixels-change
   (the buffer may extend ≤ buffer-radius px past the stroke, see §5.4),
@@ -49,50 +51,76 @@ whole-stroke heal.
 
 ### Non-goals
 - No change to spot storage (`dust_spots` stays `{kind, pts, r}` normalized),
-  persistence, undo, or render-cache signatures — the shrink is a pure
-  render-time function of (image pixels, rasterized mask).
-- No new panel controls or overlay changes. The red stroke overlay continues
-  to show the brushed area; with this feature its meaning is "heal what's
-  dusty in here", which is what users already expect of a healing brush.
+  persistence, or undo — the shrink is a pure render-time function of
+  (image pixels, rasterized mask, global method setting).
+- No dust-panel controls or overlay changes (the method picker lives in the
+  Settings dialog). The red stroke overlay continues to show the brushed
+  area; under auto-mask its meaning is "heal what's dusty in here", which is
+  what users already expect of a healing brush.
+- No per-image method: the engine choice is global, like Auto Gain.
 - No change to AI detection itself (`dust_detect.py`).
 - Not a general blemish/content-aware eraser: detection is local-outlier
   based; large-area retouching stays out of scope.
 
 ## 3. UX / Interaction
 
-Unchanged surfaces: panel, brush, feather slider, Ctrl+Z, AI detect flow.
+Unchanged surfaces: dust panel, brush, feather slider, Ctrl+Z, AI detect flow.
 
-Behavioral contract the user sees:
+**Settings → General → "Dust removal" → "Heal method"** (`QComboBox`, staged
+and applied on Done like every other Settings toggle):
+
+| Choice | id | Engine |
+| --- | --- | --- |
+| Auto-mask (default) | `automask` | outlier shrink + clone heal (this spec) |
+| Whole stroke | `clone` | clone-heal the entire stroke (v1.1 behavior) |
+| Inpaint (legacy) | `inpaint` | cv2.inpaint diffusion on the whole stroke (pre-v1.1) |
+
+The setting is **global and live** (mirrors Auto Gain / Gamma mode): spots are
+stored normalized and healed at render time, so applying a change re-renders
+every loaded image with all existing spots replayed through the new engine —
+users can flip between the three on the same spots to compare. Persisted in
+QSettings (`adjust/dust_method`); unknown stored values fall back to
+`automask`.
+
+Behavioral contract under Auto-mask (the default):
 - Circle loosely around a speck/hair → only the defect disappears; grain and
   detail inside the circle survive. Feather applies to the (small) healed
   patch's rim.
-- Trace a hair tightly (brush ≈ hair width) → identical to today: the whole
-  stroke heals (the shrink pass declines: nearly everything under the stroke
-  is defect).
-- Dab over clean area (nothing to remove) → identical to today: the dab is
-  replaced with a matched clone (harmless no-op visually). The shrink pass
-  declines rather than silently doing nothing, so a user who paints over a
-  *subtle* defect below the outlier threshold still gets it replaced.
-- Escape hatch for A/B comparison and support: env `FREECCR_DUST_AUTOMASK=0`
-  disables the shrink pass entirely (repo convention, cf. `FREECCR_DENSITY_*`).
+- Trace a hair tightly (brush ≈ hair width) → identical to Whole stroke: the
+  shrink pass declines (nearly everything under the stroke is defect).
+- Dab over clean area (nothing to remove) → identical to Whole stroke: the
+  dab is replaced with a matched clone (harmless no-op visually). The shrink
+  pass declines rather than silently doing nothing, so a user who paints over
+  a *subtle* defect below the outlier threshold still gets it replaced.
 
 ## 4. Data model
 
-None. No stored state changes. `dust_spots`, catalog persistence, undo
-snapshots, and the hi-res `dust_sig` cache signature are untouched — the
-shrink is deterministic per (pixels, mask), so cached renders remain valid
-under the existing signatures.
+Per-image: none. `dust_spots`, catalog persistence, and undo snapshots are
+untouched — the shrink is deterministic per (pixels, mask, method), so no new
+per-image state exists.
+
+Global: `ccr_backend.dust_method: str` (default `"automask"`), loaded at
+startup from QSettings `adjust/dust_method` (validated against
+`DUST_METHODS`), written by `MainWindow.on_dust_method_changed`. The method
+string joins `_current_adj_sig` (next to the `auto_gain` / `gamma_luminance`
+booleans) so a change invalidates cached hi-res renders.
 
 ## 5. Processing / math
 
 ### 5.1 Placement — one new pass in the single funnel
 
-`apply_dust_removal(img16, spots, ...)` gains one line after rasterization:
+`apply_dust_removal(img16, spots, ..., method=DUST_METHOD_DEFAULT)` routes on
+the engine right after rasterization (`CCRImage._apply_dust_removal` passes
+the live `ccr_backend.dust_method`, the funnel every render path shares):
 
 ```
 mask = rasterize_dust_mask(spots, h, w)
-mask = _automask_shrink(img16, mask)      # NEW — may return mask unchanged
-... existing component/segment clone-heal pipeline, unchanged ...
+if method == "automask":
+    mask = _automask_shrink(img16, mask)  # NEW — may return mask unchanged
+... existing component/segment clone-heal pipeline ...
+    # method == "inpaint": each component is routed whole into the existing
+    # Telea fallback (same thickness-capped feather the no-clean-source
+    # path uses) — the pre-v1.1 engine, kept as a selectable legacy option.
 ```
 
 Everything downstream (components, `mask_pad`, the integral cleanliness image,
@@ -180,11 +208,16 @@ touching the stroke edge). Bounded, intentional, and listed in §2 Goals.
 
 | File | Change |
 | --- | --- |
-| `src/core/ccr_processor.py` | New `_automask_shrink(img16, mask)` + constants (`_AUTOMASK_K`, `_AUTOMASK_ABS`, `_AUTOMASK_CLEAN_MIN`); one call added in `apply_dust_removal` after rasterization; docstring update. |
+| `src/core/ccr_processor.py` | New `_automask_shrink(img16, mask)` + constants (`_AUTOMASK_K`, `_AUTOMASK_ABS`, `_AUTOMASK_CLEAN_MIN`); `DUST_METHODS` / `DUST_METHOD_DEFAULT`; `method=` parameter on `apply_dust_removal` (automask shrink / whole-stroke clone / whole-stroke Telea). |
+| `src/core/ccr_image.py` | `_apply_dust_removal` passes the live `ccr_backend.dust_method`. |
+| `src/core/ccr_backend.py` | `dust_method` attribute (default `"automask"`). |
+| `src/ui/main_window.py` | Startup restore from QSettings (validated); `on_dust_method_changed` → persist + `_rerender_all_for_global_mode`. |
+| `src/widgets/settings_dialog.py` | "Dust removal / Heal method" combo on the General page; staged like the other toggles (`_init_toggles` / `_apply_pending`). |
+| `src/widgets/image_preview.py` | `dust_method` joins `_current_adj_sig` (hi-res cache invalidation). |
 | `spec/dust-removal.md` | One-line cross-reference from §5.2 to this spec. |
-| `tests/test_dust_removal.py` | New `TestAutoMask` class (see §7); existing tests must pass unchanged. |
+| `tests/test_dust_removal.py` | `TestAutoMaskShrink`, `TestAutoMaskPipeline`, `TestHealMethodChoice` (see §7). |
 
-No UI, backend, catalog, or cache-signature changes.
+No catalog or per-image changes.
 
 ## 7. Test plan
 
@@ -200,7 +233,6 @@ seeded grain like the existing tests):
 5. Edge-straddling dab (bimodal surround), speck on the bright side → only
    the speck flagged; both clean sides of the edge unmasked (two-anchor
    model regression).
-6. `FREECCR_DUST_AUTOMASK=0` → unchanged even with a clear speck.
 
 Pipeline-level (`apply_dust_removal`):
 
@@ -209,19 +241,27 @@ Pipeline-level (`apply_dust_removal`):
 8. Edge case from §1: dark-side pixels inside the dab bit-exact; healed speck
    lands at bright-side statistics, not pulled toward the dark side.
 9. Two specks under one dab → both healed, pixels between them untouched.
-10. Full existing `test_dust_removal.py` suite passes (grain preservation,
+10. Method choice (`TestHealMethodChoice`): `method="clone"` replaces the
+    whole dab (clean dab pixels change) and skips the shrink;
+    `method="inpaint"` fills through the 8-bit Telea path (fill values are
+    multiples of 257 on a flat field — the signature the 16-bit-native test
+    uses in reverse); an unknown method string behaves as `automask`;
+    `apply_adjustments` honors `ccr_backend.dust_method` end-to-end.
+11. Full existing `test_dust_removal.py` suite passes (grain preservation,
     gradient continuation, hair ghost, feather guarantees, fallback,
     persistence, undo, panel wiring). One exception by construction:
     `test_feather_param_softens_rim` asserts the feather's cross-fade at the
     DAB rim of a generous dab — with auto-mask that rim is no longer part of
-    the hole (the very point of the feature), so the test pins
-    `FREECCR_DUST_AUTOMASK=0` to keep exercising the whole-stroke feather
-    mechanics it was written for.
+    the hole (the very point of the feature), so it passes
+    `method="clone"` to keep exercising the whole-stroke feather mechanics
+    it was written for.
 
 ## 8. Rollout / debugging
 
-- `FREECCR_DUST_AUTOMASK=0` env knob (checked per call, so support can A/B a
-  user's scan without rebuilding).
+- The Settings "Heal method" picker doubles as the support/A-B path: all
+  three engines replay the same stored spots live, so a user can flip
+  between them on their own scan and report which looks right. (An earlier
+  draft used a `FREECCR_DUST_AUTOMASK` env knob; superseded by the picker.)
 - No release-notes entry until the next release's "What's New" is written.
 
 ## 9. Refinement notes — resolved decisions
@@ -240,9 +280,13 @@ Pipeline-level (`apply_dust_removal`):
   mode inside one half; its clean pixels then read as outliers and a clean
   sliver of the dab gets pointlessly healed). Decile-initialized 2-means
   separates any split the ring can meaningfully witness (minority ≥ ~10%).
-- **Automatic with fallback, no toggle.** Matches the panel's "it just works"
-  design; the fallback keeps every current workflow (tight traces, subtle
-  defects) byte-identical. Env knob covers support/A-B needs.
+- **Automatic with fallback + a global Settings picker** (maintainer call,
+  superseding the first draft's "no toggle, env knob only"): the default
+  stays fully automatic, but Settings → General exposes the heal engine
+  (Auto-mask / Whole stroke / Inpaint legacy) following the Auto Gain
+  pattern — global, live, persisted, re-renders on change. The env knob was
+  dropped: one control surface, and the picker is strictly more useful (it
+  also restores the pre-v1.1 diffusion engine for users who preferred it).
 - **Buffer scales with width** (`round(w/1080)`), not fixed 1px: a fixed 1px
   at 6000px export is proportionally 5× thinner than at preview, and defect
   soft edges scale with resolution.
