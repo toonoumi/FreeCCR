@@ -1828,8 +1828,15 @@ class ImagePreview(QWidget):
             return None
         crop = getattr(img, "crop_rect", None)
         angle = getattr(img, "crop_angle", 0.0) or 0.0
+        # Dust and area modes display the FULL un-cropped frame and normalize
+        # their stored coordinates against it, so the hi-res layer must not
+        # swap cropped pixels in under them (same mode exclusions as
+        # update_preview's crop-display branch) — otherwise strokes painted
+        # after the hi-res lands map to crop-relative positions and heal the
+        # wrong pixels.
         crop_active = (crop is not None and not self.crop_mode
                        and not self.slice_mode
+                       and not self.dust_mode and not self.area_mode
                        and (img.converted or ccr_backend.positive_mode))
         crop_sig = (crop, angle) if crop_active else None
         if cache.get("display_pm") is not None and cache.get("crop_sig") == crop_sig:
@@ -2357,9 +2364,10 @@ class ImagePreview(QWidget):
         return t if t.isInvertible() else None
 
     # --- Dust removal mode -------------------------------------------------
-    # Paint over dust to inpaint it (cv2.inpaint), or AI-detect it. Edits are
-    # stored as normalized spots on the image and replayed in the render
-    # pipeline at every resolution. See spec/dust-removal.md.
+    # Paint over dust to heal it (clone fill, see apply_dust_removal), or
+    # AI-detect it. Edits are stored as normalized spots on the image and
+    # replayed in the render pipeline at every resolution. See
+    # spec/dust-removal.md.
     def enter_dust_mode(self) -> bool:
         """Show the full un-cropped image (coarse rotation/flip only, no fine
         rotation) so canvas pixels map 1:1 to resized_raw, ready for painting."""

@@ -127,6 +127,48 @@ class TestCropWantsHires:
         assert ip._crop_wants_hires() is False
 
 
+class TestHiresDisplayModeGuards:
+    """_hires_display_pixmap must NOT apply the display crop in dust/area
+    modes: both show the full un-cropped frame and normalize coordinates
+    against it, so cropped hi-res pixels under them would make strokes heal
+    the wrong place (the 'dust coordinates off after cropping' bug)."""
+
+    @staticmethod
+    def _inject_hires(ip, img, w=1080, h=720):
+        full_pm = QPixmap(w, h)
+        full_pm.fill(QColor(64, 64, 64))
+        ip._hires = {"img": img, "sig": ip._hires_signature(img),
+                     "adj_sig": None, "base": None, "full_pm": full_pm,
+                     "display_pm": None, "crop_sig": None}
+        return full_pm
+
+    def test_dust_mode_gets_full_frame(self):
+        ip = _make_preview()
+        _setup(ip, _ImgStub((0.25, 0.25, 0.75, 0.75)))
+        self._inject_hires(ip, ccr_backend.images[0])
+        ip.dust_mode = True                 # full image shown; hires must match
+        pm = ip._hires_display_pixmap()
+        assert pm is not None
+        assert (pm.width(), pm.height()) == (1080, 720)
+
+    def test_area_mode_gets_full_frame(self):
+        ip = _make_preview()
+        _setup(ip, _ImgStub((0.25, 0.25, 0.75, 0.75)), zoom=2.0)
+        self._inject_hires(ip, ccr_backend.images[0])
+        ip.area_mode = True                 # full image shown; hires must match
+        pm = ip._hires_display_pixmap()
+        assert pm is not None
+        assert (pm.width(), pm.height()) == (1080, 720)
+
+    def test_normal_display_still_gets_cropped(self):
+        ip = _make_preview()
+        _setup(ip, _ImgStub((0.25, 0.25, 0.75, 0.75)))
+        self._inject_hires(ip, ccr_backend.images[0])
+        pm = ip._hires_display_pixmap()     # no mode active -> crop applies
+        assert pm is not None
+        assert (pm.width(), pm.height()) == (540, 360)
+
+
 class TestZoomedInEnoughWithCrop:
     def test_heavy_crop_at_fit_is_enough(self):
         ip = _make_preview()
