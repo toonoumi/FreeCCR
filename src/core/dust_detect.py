@@ -30,15 +30,27 @@ DETECT_SHORT = 512      # short side the detector runs at
 DETECT_MULTIPLE = 16    # both dims rounded to a multiple of this (U-Net req.)
 MAX_BLOB = 400          # connected-component pixel cap at ~2k px (resolution-normalized);
                         # drops large detections (film border / real image content)
-MAX_ASPECT = 3.0        # drop elongated detections (thin LINES are usually real
+MAX_ASPECT = 3.0        # drop THICK elongated detections (usually real
                         # structure — a bike frame, the horizon — not dust)
 SPOT_PAD = 1.5          # px added to each detected spot's radius (inpaint margin)
-# Film dust inverts to BRIGHT/white specks, so a real dust blob is brighter than
-# its surroundings. Require at least this luma lift (0..1) over the surrounding
-# ring; this rejects normal-toned content the detector wrongly fires on (a face,
-# a dark feature) — those are not bright specks.
-BRIGHT_MARGIN = 0.06
+# Film dust inverts to BRIGHT/white specks and strings, so a real dust blob is
+# brighter than its surroundings. The required luma lift is ADAPTIVE: at least
+# BRIGHT_K x the surround's own scatter (MAD-scaled), with an absolute floor —
+# a fixed 6% margin rejected the faint wisps users actually see on smooth sky
+# (a diluted blob mean measures 2-5%), while noisy grain automatically demands
+# more. Still rejects normal-toned content the detector wrongly fires on (a
+# face, a dark feature).
+BRIGHT_ABS_MIN = 0.015  # absolute floor for the required luma lift (0..1)
+BRIGHT_K = 2.0          # required lift, multiples of the surround's scatter
 BRIGHT_RING = 3         # px ring around a blob used as the "surround" reference
+# Dust STRINGS (hairs/fibers): thin, bright, elongated — real dust in the film
+# workflow ("all dust are white spots/strings"). A thin+bright elongated
+# component becomes a POLYLINE spot tracing the string (exempt from the area
+# cap — long-but-thin is not a border/content blob); only THICK elongated
+# detections are treated as structure and dropped. Frame-touching strings are
+# dropped (film borders are bright thin lines too).
+STRING_MAX_TH = 3.5     # px (detect res): max minAreaRect short side of a string
+STRING_STEP = 8         # px between polyline waypoints along a string
 
 _session = None          # cached ort.InferenceSession
 _session_path = None     # model path the cached session was built from
@@ -194,14 +206,18 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
 
     Pure / model-free (operates on numpy arrays), so it is unit-testable without
     ONNX. `luma` is the detection-resolution grayscale (0..1) used for the
-    bright-speck gate. Threshold follows openenlarge: thr = 0.85 - 0.60*(s/100),
+    bright gate. Threshold follows openenlarge: thr = 0.85 - 0.60*(s/100),
     so higher sensitivity removes more. A surviving component must be:
-      - small enough (not film border / real content),
-      - compact (elongated lines are structure/scratches → manual brush),
-      - BRIGHTER than its surroundings (film dust inverts to white specks; this
-        rejects normal-toned content the detector wrongly fires on — e.g. a
-        face). See spec/dust-removal.md §5.3.
-    Each survivor becomes one circular spot (centroid + area-equivalent radius).
+      - BRIGHTER than its surroundings by an ADAPTIVE margin (film dust —
+        specks AND strings — inverts to white; this rejects normal-toned
+        content the detector wrongly fires on, e.g. a face), and either
+      - compact and small enough (a speck -> one circular spot,
+        centroid + area-equivalent radius), or
+      - thin and elongated away from the frame edge (a dust string/hair ->
+        one POLYLINE spot tracing it; exempt from the area cap). Thick
+        elongated detections are structure (a bike frame, the horizon) and
+        big compact blobs are borders/content — both dropped.
+    See spec/dust-removal.md §5.3.
     """
     h, w = prob.shape[:2]
     s = max(0.0, min(100.0, float(sensitivity)))
@@ -215,21 +231,15 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
     spots = []
     for i in range(1, n):  # 0 is background
         area = int(stats[i, cv2.CC_STAT_AREA])
-        if area > max_blob:
-            continue  # too big — film border / real image content, not dust
         left = int(stats[i, cv2.CC_STAT_LEFT])
         top = int(stats[i, cv2.CC_STAT_TOP])
         cw = int(stats[i, cv2.CC_STAT_WIDTH])
         ch = int(stats[i, cv2.CC_STAT_HEIGHT])
-        # Drop elongated detections. Real dust is compact; the scratch detector
-        # also fires on legitimate thin LINES (a bike frame, the horizon, a path
-        # edge), and circle-inpainting those smears real detail. Leave linear
-        # defects to the manual brush (a stroke). See spec/dust-removal.md §5.4.
-        if max(cw, ch) / max(1, min(cw, ch)) > MAX_ASPECT:
-            continue
-        # Bright-speck gate: compare the blob's luma to a surrounding ring. Film
-        # dust is brighter (white) than its surroundings after inversion; a face
-        # or other real feature is not, so it is rejected.
+        # Bright gate first: compare the blob's luma to its surround. Film
+        # dust is brighter (white) than its surroundings after inversion; a
+        # face or other real feature is not, so it is rejected. The required
+        # lift adapts to the surround's own scatter (robust median/MAD), so
+        # faint wisps on smooth sky pass while grainy content demands more.
         x0 = max(0, left - BRIGHT_RING)
         y0 = max(0, top - BRIGHT_RING)
         x1 = min(w, left + cw + BRIGHT_RING)
@@ -238,9 +248,39 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
         win_luma = luma[y0:y1, x0:x1]
         comp_luma = float(win_luma[win_comp].mean())
         surround = win_luma[~win_comp]
-        surround_luma = float(surround.mean()) if surround.size else comp_luma
-        if comp_luma - surround_luma < BRIGHT_MARGIN:
-            continue  # not a bright speck → not film dust
+        if surround.size:
+            surround_med = float(np.median(surround))
+            scatter = 1.4826 * float(np.median(np.abs(surround - surround_med)))
+        else:
+            surround_med, scatter = comp_luma, 0.0
+        if comp_luma - surround_med < max(BRIGHT_ABS_MIN, BRIGHT_K * scatter):
+            continue  # not bright against its surround → not film dust
+        # Shape: true elongation/thickness from the rotated min-area rect
+        # (bbox aspect misreads diagonal strings as compact).
+        ys_c, xs_c = np.nonzero(labels[top:top + ch, left:left + cw] == i)
+        rect_pts = np.column_stack([xs_c + left, ys_c + top]).astype(np.float32)
+        rw, rh = cv2.minAreaRect(rect_pts)[1]
+        long_side, short_side = max(rw, rh) + 1.0, min(rw, rh) + 1.0
+        is_string = (long_side / short_side > MAX_ASPECT
+                     and short_side <= STRING_MAX_TH + 1.0)
+        if long_side / short_side > MAX_ASPECT and not is_string:
+            continue  # thick elongated = structure, not a dust string
+        if area > max_blob and not is_string:
+            continue  # big compact blob — film border / real content
+        if is_string:
+            # Film borders are bright thin lines too — a string touching the
+            # frame edge is not dust.
+            if (left <= 1 or top <= 1
+                    or left + cw >= w - 1 or top + ch >= h - 1):
+                continue
+            pts = _string_waypoints(rect_pts)
+            r_px = short_side / 2.0 + SPOT_PAD
+            spots.append({
+                "kind": kind,
+                "pts": [[float(px) / w, float(py) / h] for px, py in pts],
+                "r": float(r_px / w),
+            })
+            continue
         cx, cy = centroids[i]
         # Area-EQUIVALENT radius (+ small margin), NOT the bounding-box extent:
         # a tight circle matches the speck so the inpaint stays invisible
@@ -252,3 +292,28 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
             "r": float(r_px / w),
         })
     return spots
+
+
+def _string_waypoints(pts_xy: np.ndarray) -> list:
+    """Trace a thin elongated component with waypoints: order its pixels by
+    projection on the principal axis and take each ~STRING_STEP-px slab's
+    centroid. Follows moderate curvature (each slab's centroid sits on the
+    string); rasterize_dust_mask joins consecutive points with thick lines."""
+    center = pts_xy.mean(axis=0)
+    d = pts_xy - center
+    cov = d.T @ d / max(1, len(pts_xy) - 1)
+    _, vecs = np.linalg.eigh(cov)
+    axis = vecs[:, -1]  # principal direction
+    t = d @ axis
+    order = np.argsort(t)
+    t_sorted = t[order]
+    span = float(t_sorted[-1] - t_sorted[0])
+    n_bins = max(2, int(round(span / float(STRING_STEP))) + 1)
+    edges = np.linspace(t_sorted[0], t_sorted[-1], n_bins + 1)
+    pts = []
+    for b in range(n_bins):
+        sel = (t >= edges[b]) & (t <= edges[b + 1])
+        if sel.any():
+            m = pts_xy[sel].mean(axis=0)
+            pts.append((float(m[0]), float(m[1])))
+    return pts if len(pts) >= 2 else [tuple(center)]

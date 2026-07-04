@@ -91,13 +91,20 @@ in the catalog, and undoable.
      specks get fine steps (0.05% ≈ 3 px radius on a 6000 px scan) while big
      scratch-covering sizes stay reachable; the label shows the size as a % of
      image width. The canvas Ctrl+wheel resize clamps to the same range.
-   - **Feather** slider (0–1.0% of image width, default 0.30%): the edge fade
-     width of every heal on the image — manual and AI spots alike. A
-     per-image render parameter stored as `CCRImage.dust_feather`; changes
-     re-heal live (debounced ~200 ms), persist in the catalog, and are NOT
-     part of undo snapshots (like brush size). Defect-like pixels are always
-     fully filled regardless of the feather (§5.2 step 6), so a wide fade
-     cannot blend the defect back in.
+   - **Feather** slider (0–100% of the STROKE's edge-to-center distance,
+     default 35% — re-semanticized 2026-07-04, was 0–1% of image width):
+     the edge fade of every heal on the image — manual and AI spots alike.
+     Relative to the stroke, so a big dab feathers proportionally wide (no
+     more hard-edged discs) while a tight trace stays near-hard, and the
+     ramp is resolution-independent by construction. A per-image render
+     parameter stored as `CCRImage.dust_feather` (0..1); changes re-heal
+     live (debounced ~200 ms), persist in the catalog (`dust_feather_rel`;
+     the legacy `dust_feather` width-fraction key migrates proportionally on
+     load), and are NOT part of undo snapshots (like brush size). Under
+     auto-mask the feather softens the stroke's APPLY AREA
+     (spec/dust-auto-mask.md §5.3); auto spots and unshrunk tight traces
+     keep the defect force-fill, so a wide fade cannot blend those defects
+     back in.
    - Hint: "Click or drag over dust to remove it."
    - **Undo last spot** button and **Clear all** button.
 3. Separator.
@@ -201,12 +208,13 @@ a polyline):
   from the component's extent.
 - Empty list = "no dust removal"; the render fast-path leaves the image
   untouched (§5.2).
-- Alongside the spots, `CCRImage.dust_feather` (float, fraction of image
-  width, default 0.003) holds the image's heal edge-fade width — one value
-  for all spots, set by the panel's Feather slider, serialized in the catalog
-  (`dust_feather`, missing key → default), excluded from undo snapshots, and
-  part of the hi-res `dust_sig` so a feather change invalidates cached
-  renders.
+- Alongside the spots, `CCRImage.dust_feather` (float 0..1, fraction of each
+  stroke's half-thickness, default 0.35) holds the image's heal edge-fade —
+  one value for all spots, set by the panel's Feather slider, serialized in
+  the catalog (`dust_feather_rel`; the legacy width-fraction `dust_feather`
+  key migrates proportionally, missing both → default), excluded from undo
+  snapshots, and part of the hi-res `dust_sig` so a feather change
+  invalidates cached renders.
 
 Rationale: mirrors openenlarge's normalized `DustStroke` model, serializes
 cleanly to JSON, deep-copies cleanly for undo, and is fully resolution
@@ -353,15 +361,16 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
   6. **Feathered composite**: alpha rises 0 → 1 from each hole's boundary
      inward over a smoothstep ramp (`_feather_alpha`), `out = img16*(1-a) +
      filled*a` computed inside the mask's bbox only. The ramp width is the
-     image's **Feather** setting (`dust_feather`, a fraction of image width —
-     default 0.3%, so it covers the same image fraction at preview and
-     export), capped per hole by its depth so the core still reaches full
-     fill. **Defect-like hole pixels** (colored like the estimated defect)
-     are force-filled at alpha 1 regardless of the ramp (`dlike`, with a
-     light blurred lip), so a wide feather can never blend the defect back
-     in — the soft fade only happens across clean rim pixels. Outside the
-     mask alpha is exactly 0 — away from any spot `out == img16`
-     bit-for-bit.
+     image's **Feather** setting (`dust_feather`) times the local hole/stroke
+     half-thickness — the fade scales with the stroke and reproduces at
+     preview and export (was a fraction of image width, re-semanticized
+     2026-07-04). **Defect-like hole pixels** (colored like the estimated
+     defect) are force-filled at alpha 1 regardless of the ramp (`dlike`,
+     with a light blurred lip), so a wide feather can never blend the defect
+     back in — the soft fade only happens across clean rim pixels. Under
+     auto-mask the BRUSH alpha instead ramps from the ORIGINAL stroke
+     boundary (spec/dust-auto-mask.md §5.3). Outside the mask alpha is
+     exactly 0 — away from any spot `out == img16` bit-for-bit.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
   - The chosen source patch may differ between preview and export resolution
@@ -392,25 +401,37 @@ panel that imports it) load even when `onnxruntime` is absent.
 - **`prob_to_spots(prob, prob_h, prob_w, sensitivity, max_dim) -> list[spot]`**:
   - `thr = 0.85 - 0.60 * (sensitivity/100)` (0 → very selective … 100 →
     aggressive), matching openenlarge.
-  - Binarize at `thr`; via `cv2.connectedComponentsWithStats`:
-    - drop components whose pixel area exceeds a resolution-normalized
-      `max_blob` (film border / real image content, not dust);
-    - **drop elongated components** (aspect ratio > `MAX_ASPECT`): the detector
-      also fires on legitimate thin LINES (a bike frame, the horizon, a path
-      edge); circle-inpainting those smears real detail, so linear defects are
-      left to the manual brush (§5.4).
-    - **bright-speck gate**: film dust inverts to **white** specks, so a real
-      dust blob is brighter than its surroundings. Require the blob's mean luma
-      to exceed a surrounding ring by `BRIGHT_MARGIN`; this rejects normal-toned
-      content the detector wrongly fires on (a face, a dark feature — which is
-      how the AI once removed a person's head). `detect` therefore returns
-      `(prob, luma)` so `prob_to_spots` has the detection-resolution grayscale.
-      This and the aspect filter are the main guards against AI false positives.
-  - Each surviving (compact) component → one `auto` spot: centroid
-    `(cx/prob_w, cy/prob_h)`; **area-equivalent** radius
-    `r = (sqrt(area/π) + pad) / prob_w` — a tight circle matching the speck, so
-    the inpaint stays invisible rather than leaving a smudge (the old
-    bounding-extent radius over-covered and was the artifact source).
+  - Binarize at `thr`; via `cv2.connectedComponentsWithStats`
+    (2026-07-04 recalibration — the original gates were so strict that real
+    faint dust yielded "no dust found"; film dust is white **specks and
+    strings**):
+    - **adaptive bright gate** (first): film dust inverts to **white**, so a
+      real dust blob is brighter than its surroundings. Required lift =
+      `max(BRIGHT_ABS_MIN, BRIGHT_K x surround MAD-scatter)` over the
+      surround's median — faint wisps on smooth sky pass (a diluted blob
+      mean measures only 2–5%; the old fixed `BRIGHT_MARGIN=0.06` rejected
+      them all), while grainy surrounds automatically demand more. Still
+      rejects normal-toned content the detector wrongly fires on (a face —
+      which is how the AI once removed a person's head). `detect` returns
+      `(prob, luma)` so `prob_to_spots` has the detection-res grayscale.
+    - **shape** via `cv2.minAreaRect` (bbox aspect misreads diagonal strings
+      as compact): thin+elongated (short side ≤ `STRING_MAX_TH`, aspect >
+      `MAX_ASPECT`) = a **dust string** → kept, exempt from the area cap
+      (long-but-thin is not a border blob), UNLESS it touches the frame edge
+      (film borders are bright thin lines too). THICK elongated = structure
+      (a bike frame, the horizon) → dropped. Big compact blobs → dropped by
+      the resolution-normalized `max_blob` cap (film border / content).
+  - Compact survivor → one `auto` spot: centroid `(cx/prob_w, cy/prob_h)`;
+    **area-equivalent** radius `r = (sqrt(area/π) + pad) / prob_w` — a tight
+    circle matching the speck, so the inpaint stays invisible rather than
+    leaving a smudge (the old bounding-extent radius over-covered and was
+    the artifact source).
+  - String survivor → one `auto` POLYLINE spot (`_string_waypoints`):
+    pixels ordered by projection on the principal axis, one waypoint per
+    ~`STRING_STEP`-px slab (slab centroids follow moderate curvature);
+    `r = short_side/2 + pad`. `rasterize_dust_mask` joins waypoints with
+    thick lines, and the auto-mask heal then tightens onto the actual bright
+    pixels (spec/dust-auto-mask.md).
   - `prob_to_spots` is **pure / model-free** (operates on a numpy prob map) so it
     is unit-testable without ONNX.
 - All ONNX use is guarded; any import/inference error surfaces as

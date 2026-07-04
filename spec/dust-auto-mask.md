@@ -348,6 +348,18 @@ Pipeline-level (`apply_dust_removal`):
   (`_HEAL_IN_STROKE_TOL`): an edge-straddling stroke's only in-stroke
   candidates can sit on the wrong side of the edge, and unconditional
   preference picked them over far better out-of-stroke sources.
+- **Screenshot round (2026-07-04)** — a user screenshot of a hard-edged
+  healed disc on sky: the feather was a fraction of IMAGE WIDTH (default
+  0.3% ≈ 3 px at preview), constant regardless of brush size, so a big dab
+  read as a sharp-edged patch. The Feather became a fraction of the
+  STROKE's half-thickness (slider 0–100%, default 35%; catalog key
+  `dust_feather_rel`, legacy values migrate proportionally) — big dabs
+  feather proportionally wide, tight traces stay near-hard, and the ramp is
+  resolution-independent by construction. Same round: "AI says no dust
+  found" — the net fires on faint dust (0.999 prob on 3% strings) but the
+  post-gates rejected it; recalibrated in dust_detect.py (adaptive bright
+  margin, dust-string branch with polyline spots) — see
+  spec/dust-removal.md §5.3.
 
 ### Open items (non-blocking)
 - If grain speckle ever produces distracting micro-heals, add a minimum

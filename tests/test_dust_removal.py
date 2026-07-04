@@ -189,7 +189,7 @@ class TestApplyDustRemoval:
         cv2.circle(img, (100, 100), 6, (60000, 60000, 60000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # mask r=16
         hard = apply_dust_removal(img, [spot], feather=0.0, method="clone")
-        soft = apply_dust_removal(img, [spot], feather=0.08, method="clone")
+        soft = apply_dust_removal(img, [spot], feather=0.9, method="clone")
         yy, xx = np.mgrid[0:200, 0:200]
         rim = (np.hypot(yy - 100, xx - 100) > 13.5) & \
               (np.hypot(yy - 100, xx - 100) < 15.5)
@@ -208,7 +208,7 @@ class TestApplyDustRemoval:
         cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
         spot = {"kind": "brush",
                 "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
-        out = apply_dust_removal(img, [spot], feather=0.02)
+        out = apply_dust_removal(img, [spot], feather=1.0)
         core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
 
@@ -490,7 +490,7 @@ class TestAutoMaskPipeline:
 
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # dab r=16
         img = scene()
-        soft = apply_dust_removal(img, [spot], feather=0.05)      # 10 px ramp
+        soft = apply_dust_removal(img, [spot], feather=0.6)  # 60% of r16 ~10px
         hard = apply_dust_removal(img, [spot], feather=0.0)
         res_center = int(soft[100, 100, 0]) - 30000
         res_border = int(soft[100, 113, 0]) - 30000
@@ -567,17 +567,47 @@ class TestProbToSpots:
         z = np.zeros((40, 40), np.float32)
         assert dust_detect.prob_to_spots(z, z, 100) == []
 
-    def test_drops_elongated_keeps_compact(self):
-        # A thin line is real image structure (bike frame / horizon), not dust:
-        # the aspect filter drops it while keeping a compact speck. Guards the
-        # AI-artifact fix (see spec/dust-removal.md §5.3/§5.4).
+    def test_strings_kept_thick_elongated_dropped(self):
+        # Film dust is white specks AND strings: a thin bright line is a dust
+        # string and becomes a POLYLINE spot tracing it (also exempt from the
+        # area cap — max_blob is 20 px here and the string is 30). Only THICK
+        # elongated detections are structure (bike frame / horizon) and drop.
         prob = np.zeros((100, 100), np.float32)
-        prob[50, 10:22] = 0.9       # 1x12 thin line (area 12, aspect 12) -> dropped
-        prob[80:83, 80:83] = 0.9    # 3x3 compact speck (area 9)          -> kept
+        prob[50, 10:40] = 0.9       # 1x30 thin line -> dust string, kept
+        prob[10:17, 40:90] = 0.9    # 7x50 thick elongated -> structure, dropped
+        prob[80:83, 80:83] = 0.9    # 3x3 compact speck -> kept
         spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 60)
+        assert len(spots) == 2
+        strings = [s for s in spots if len(s["pts"]) > 1]
+        assert len(strings) == 1
+        xs = [p[0] for p in strings[0]["pts"]]
+        ys = [p[1] for p in strings[0]["pts"]]
+        assert min(xs) < 0.16 and max(xs) > 0.33   # waypoints span the string
+        assert all(abs(y - 0.5) < 0.03 for y in ys)
+        assert strings[0]["r"] * 100 < 4           # thin heal, not a smudge
+
+    def test_string_touching_frame_edge_is_dropped(self):
+        # Film borders are bright thin lines too — frame-touching strings are
+        # not dust.
+        prob = np.zeros((100, 100), np.float32)
+        prob[50, 0:30] = 0.9
+        assert dust_detect.prob_to_spots(prob, _bright_luma(prob), 60) == []
+
+    def test_faint_blob_passes_adaptive_margin(self):
+        # The old fixed 6% bright margin rejected faint wisps on smooth sky
+        # ("AI says no dust found"). The margin now adapts to the surround's
+        # scatter with a 1.5% floor: a 3% lift on quiet sky is detected.
+        rng = np.random.default_rng(8)
+        prob = np.zeros((100, 100), np.float32)
+        prob[40:44, 40:44] = 0.9
+        luma = (0.55 + rng.normal(0.0, 0.004, (100, 100))).astype(np.float32)
+        luma[40:44, 40:44] += 0.03
+        spots = dust_detect.prob_to_spots(prob, luma, 60)
         assert len(spots) == 1
-        x, y = spots[0]["pts"][0]
-        assert x > 0.5 and y > 0.5  # the compact speck, not the line
+        # ... while the same lift buried in heavy grain still gets rejected.
+        noisy = (0.55 + rng.normal(0.0, 0.05, (100, 100))).astype(np.float32)
+        noisy[40:44, 40:44] += 0.03
+        assert dust_detect.prob_to_spots(prob, noisy, 60) == []
 
     def test_radius_is_area_equivalent_not_extent(self):
         # A 6x6 compact blob -> radius ~ sqrt(36/pi) ~ 3.4 px (+pad), NOT the
@@ -661,15 +691,22 @@ class TestPersistence:
         path = _scan_png(tmp_path)
         img = CCRImage(path)
         img.dust_spots = [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.01}]
-        img.dust_feather = 0.007
+        img.dust_feather = 0.7
         catalog.update_for_images([img], path=cat)
         restored = catalog.create_images_for_path(path, path=cat)
-        assert abs(restored[0].dust_feather - 0.007) < 1e-9
-        # Pre-feature catalog entries restore to the default.
+        assert abs(restored[0].dust_feather - 0.7) < 1e-9
+        # Legacy catalogs stored a fraction of IMAGE WIDTH under
+        # "dust_feather" (slider 0..0.01) — migrated proportionally onto the
+        # stroke-relative 0..1 range (0.006 -> 0.6).
         state = catalog.serialize_image(img)
-        del state["dust_feather"]
+        del state["dust_feather_rel"]
+        state["dust_feather"] = 0.006
         old = catalog._restore_image(path, state)
-        assert abs(old.dust_feather - 0.003) < 1e-9
+        assert abs(old.dust_feather - 0.6) < 1e-9
+        # Pre-feather catalog entries (neither key) restore near the default.
+        del state["dust_feather"]
+        ancient = catalog._restore_image(path, state)
+        assert abs(ancient.dust_feather - 0.35) < 1e-6
 
 
 # --- Undo -------------------------------------------------------------------
@@ -775,7 +812,7 @@ class TestPanelWiring:
         from core.ccr_backend import ccr_backend
 
         class _Img:
-            dust_feather = 0.003
+            dust_feather = 0.35
             dust_spots = []
 
         img = _Img()
@@ -786,9 +823,9 @@ class TestPanelWiring:
             prev.current_idx = 0
             panel = DustRemovalPanel(_StubMain(), prev)
             panel.feather_slider.setValue(60)  # emits valueChanged
-            assert panel.feather_value.text() == "0.60%"
+            assert panel.feather_value.text() == "60%"
             panel._apply_feather()             # bypass the debounce timer
-            assert abs(img.dust_feather - 0.006) < 1e-9
+            assert abs(img.dust_feather - 0.6) < 1e-9
         finally:
             ccr_backend.images = saved
 

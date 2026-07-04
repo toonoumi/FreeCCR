@@ -3230,8 +3230,14 @@ _HEAL_IN_STROKE_TOL = 4.0  # prefer an in-stroke clone source unless its ring
                            # candidates can sit on the wrong side of the edge)
 _HEAL_SEG_MIN = 32        # min heal-segment size (px) for long strokes
 _HEAL_SEG_THICKNESS = 6.0  # segment size as a multiple of hole thickness
-DUST_FEATHER_DEFAULT = 0.003  # feather ramp width, fraction of image width
-                              # (user-adjustable per image via the dust panel)
+DUST_FEATHER_DEFAULT = 0.35   # feather ramp width as a FRACTION OF THE
+                              # STROKE'S HALF-THICKNESS (edge-to-center), so a
+                              # big dab feathers proportionally wide while a
+                              # tight trace stays near-hard; resolution-
+                              # independent by construction (user-adjustable
+                              # per image via the dust panel, 0..1). Earlier
+                              # releases stored a fraction of IMAGE WIDTH
+                              # (0..0.01) — the catalog loader migrates.
 
 # Dust heal method (Settings → General → Dust removal; spec/dust-auto-mask.md
 # §3). Global render setting, applied live like Auto Gain — not baked per
@@ -3413,7 +3419,7 @@ def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
 
 def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
-                filled: np.ndarray, fmap: np.ndarray, feather_px: int,
+                filled: np.ndarray, fmap: np.ndarray, feather: float,
                 dlike: np.ndarray, stroke_out_integ: np.ndarray = None) -> bool:
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
@@ -3560,14 +3566,15 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     filled[wy0:wy1, wx0:wx1][hole] = np.clip(
         np.rint(heal[hole]), 0, 65535).astype(np.uint16)
 
-    # Feather: the user-set ramp width, capped by the hole depth so the core
-    # still reaches full fill. Defect-like hole pixels (colored like the
-    # estimated defect) are force-filled via `dlike` regardless of the ramp,
-    # so a wide feather can never blend the defect back in — the soft fade
-    # only happens across clean rim pixels.
+    # Feather: the user-set fraction of this hole's depth, so the fade scales
+    # with the stroke. Defect-like hole pixels (colored like the estimated
+    # defect) are force-filled via `dlike` regardless of the ramp, so a wide
+    # feather can never blend the defect back in — the soft fade only
+    # happens across clean rim pixels.
     inside = cv2.distanceTransform(hole.astype(np.uint8), cv2.DIST_L2, 3)
     depth = max(1.0, float(inside.max()))
-    fmap[wy0:wy1, wx0:wx1][hole] = int(max(1.0, min(float(feather_px), depth)))
+    fmap[wy0:wy1, wx0:wx1][hole] = \
+        int(max(1.0, min(250.0, round(feather * depth))))
     like = np.abs(hole_px - defect).mean(axis=1) < thr
     if like.any():
         hy, hx = np.nonzero(hole)
@@ -3580,15 +3587,16 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                        method: str = DUST_METHOD_DEFAULT) -> np.ndarray:
     """Heal the dust spots out of a 16-bit RGB image, non-destructively.
 
-    `feather` is the edge fade width as a fraction of image width (the user's
-    per-image Feather setting): 0 = essentially hard edges, larger values
-    cross-fade the fill into the original over a wider ramp. Under automask
-    the feather softens the STROKE's apply area — alpha ramps inward from the
-    brushed boundary, so the stroke border gets less effect than its center
-    (capped per stroke by its depth, so the center always reaches full
-    effect). Auto (AI) spots and strokes that kept their whole-stroke heal
-    (tight traces) keep the defect-like force-fill instead, so a wide fade
-    cannot blend those defects back in.
+    `feather` is the edge fade width as a FRACTION OF THE STROKE/HOLE
+    HALF-THICKNESS (the user's per-image Feather setting, 0..1): 0 =
+    essentially hard edges, 1 = the ramp spans edge to center. Relative to
+    the stroke, a big dab feathers proportionally wide while a tight trace
+    stays near-hard — and the ramp is resolution-independent for free. Under
+    automask the feather softens the STROKE's apply area — alpha ramps
+    inward from the brushed boundary, so the stroke border gets less effect
+    than its center. Auto (AI) spots and strokes that kept their
+    whole-stroke heal (tight traces) keep the defect-like force-fill
+    instead, so a wide fade cannot blend those defects back in.
 
     Each mask component is filled by CLONING the best-matching clean patch
     from its neighborhood (see _heal_patch) — real texture and grain,
@@ -3658,11 +3666,11 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     integ = cv2.integral((mask_pad > 0).astype(np.uint8))
     filled = img16.copy()
     fallback = np.zeros_like(mask)
-    # Per-pixel feather ramp width (px). Normalized like the spots, so the
-    # fade covers the same image fraction at preview and export; each patch
-    # caps its own value by its hole depth (see _heal_patch). `dlike` marks
-    # defect-like hole pixels that must be fully filled regardless of feather.
-    feather_px = max(1, int(round(float(feather) * w)))
+    # Per-pixel feather ramp width (px) = feather fraction x local hole/stroke
+    # half-thickness, so the fade scales with the stroke and reproduces at
+    # preview and export. `dlike` marks defect-like hole pixels that must be
+    # fully filled regardless of feather. (fmap is uint8 -> ramps cap at 250.)
+    feather = max(0.0, min(1.0, float(feather)))
     fmap = np.ones((h, w), np.uint8)
     dlike = np.zeros((h, w), np.uint8)
     for i in range(1, n):  # 0 is background
@@ -3678,11 +3686,11 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         half_th = float(cv2.distanceTransform(hole0, cv2.DIST_L2, 3).max())
         if method == "inpaint":
             # Legacy engine: the whole component goes through the diffusion
-            # fallback below, with the same thickness-capped feather the
+            # fallback below, with the same thickness-scaled feather the
             # no-clean-source path uses.
             fallback[y0:y0 + ch, x0:x0 + cw][comp_win] = 255
             fmap[y0:y0 + ch, x0:x0 + cw][comp_win] = \
-                max(1, min(feather_px, int(round(0.5 * half_th))))
+                max(1, min(250, int(round(feather * half_th))))
             continue
         seg = max(_HEAL_SEG_MIN, int(round(_HEAL_SEG_THICKNESS * half_th)))
         for ty in range(y0, y0 + ch, seg):
@@ -3694,14 +3702,14 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                 bbox = (tx + int(xs.min()), ty + int(ys.min()),
                         tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
                 if not _heal_patch(img16, labels, i, bbox, half_th, mask_pad,
-                                   integ, filled, fmap, feather_px, dlike,
+                                   integ, filled, fmap, feather, dlike,
                                    stroke_out_integ=stroke_out_integ):
                     fallback[ty:ty + sub.shape[0],
                              tx:tx + sub.shape[1]][sub] = 255
-                    # No defect estimate on this path — cap the fade by the
-                    # hole thickness so thin strokes stay near-hard.
+                    # Thickness-scaled fade, like everywhere else — thin
+                    # strokes stay near-hard automatically.
                     fmap[ty:ty + sub.shape[0], tx:tx + sub.shape[1]][sub] = \
-                        max(1, min(feather_px, int(round(0.5 * half_th))))
+                        max(1, min(250, int(round(feather * half_th))))
 
     if fallback.any():
         # Diffusion fallback (cv2.inpaint supports 8-bit only).
@@ -3743,7 +3751,7 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
             pad_c[1:-1, 1:-1] = comp
             depth = float(cv2.distanceTransform(pad_c, cv2.DIST_L2, 3).max())
             fmap0[y0b:y0b + chb, x0b:x0b + cwb][comp] = \
-                max(1, min(feather_px, int(round(depth))))
+                max(1, min(250, int(round(feather * depth))))
             heal_win = shrunk_b[y0b:y0b + chb, x0b:x0b + cwb]
             if int((heal_win[comp] > 0).sum()) == int(comp.sum()):
                 keep_force[y0b:y0b + chb, x0b:x0b + cwb][comp] = 255

@@ -160,7 +160,10 @@ def serialize_image(img) -> dict:
         "adjustment_settings": dict(img.adjustment_settings),
         "areas": _areas_to_json(getattr(img, "area_layers", None)),
         "dust_spots": copy.deepcopy(getattr(img, "dust_spots", None) or []),
-        "dust_feather": float(getattr(img, "dust_feather", 0.003)),
+        # Fraction of stroke half-thickness (0..1). The old "dust_feather"
+        # key held a fraction of IMAGE WIDTH (0..0.01) — new key so old
+        # catalogs migrate on load instead of silently changing meaning.
+        "dust_feather_rel": float(getattr(img, "dust_feather", 0.35)),
         "color_profile": getattr(img, "color_profile", "color"),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
@@ -381,7 +384,14 @@ def _restore_image(file_path: str, state: dict):
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])
-    img.dust_feather = float(state.get("dust_feather", 0.003))
+    if "dust_feather_rel" in state:
+        img.dust_feather = float(state["dust_feather_rel"])
+    else:
+        # Legacy key: fraction of image width, slider range 0..0.01. Map the
+        # slider position proportionally onto the new 0..1 stroke-relative
+        # range (old default 0.003 -> 0.30, near the new 0.35 default).
+        img.dust_feather = max(0.0, min(1.0, float(
+            state.get("dust_feather", 0.0035)) / 0.01))
     img.color_profile = state.get("color_profile", "color")
     ref = state.get("reference_frame")
     img.reference_frame = tuple(ref) if ref else None

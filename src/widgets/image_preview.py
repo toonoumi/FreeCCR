@@ -9,7 +9,7 @@ from PySide6.QtGui import (QPixmap, QIcon, QTransform, QPen, QColor, QAction, QP
                            QImage)
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QRectF, QPointF, QThread, QTimer, QUrl
 from core.ccr_backend import ccr_backend
-from core.ccr_processor import apply_dust_removal
+from core.ccr_processor import apply_dust_removal, DUST_FEATHER_DEFAULT
 from core import crop_aspect
 from widgets.dust_panel import DUST_BRUSH_R_MIN, DUST_BRUSH_R_MAX
 from widgets.export_dialog import ExportSettingsDialog
@@ -1708,7 +1708,8 @@ class ImagePreview(QWidget):
                    for p in (s.get("pts") or [])),
              round(float(s.get("r", 0)) * 10000))
             for s in getattr(img, "dust_spots", [])),
-            round(float(getattr(img, "dust_feather", 0.003)) * 10000))
+            round(float(getattr(img, "dust_feather", DUST_FEATHER_DEFAULT))
+                  * 10000))
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
@@ -2508,7 +2509,8 @@ class ImagePreview(QWidget):
             return None
         brush = [s for s in getattr(img, "dust_spots", []) if s.get("kind") == "brush"]
         return apply_dust_removal(
-            raw, brush, feather=getattr(img, "dust_feather", 0.003))
+            raw, brush, feather=getattr(img, "dust_feather",
+                                        DUST_FEATHER_DEFAULT))
 
     def dust_detect_source(self):
         """Detection source for the current image (see dust_detect_source_for)."""
