@@ -4,366 +4,239 @@ Extends `spec/dust-removal.md` §5.2. Prompted by user feedback: their previous
 tool "checked and masked for outliers right in the selection and only replaced
 the masked area plus 1px buffer. The sample was taken from the non-masked part
 of the selection. That is especially useful when removing dust close to a
-border (e.g. bright face to dark background)."
+border (e.g. bright face to dark background)." Revised twice from field
+testing (§9); the contracts below are the authoritative semantics.
 
-## 1. Summary
+## 1. The contracts
 
-Today the entire brushed selection is the heal hole: the clone fill replaces
-every pixel under the stroke. When the brush is a generous circle around a
-small speck — the natural gesture, and what every AI-detected spot looks like —
-that replaces far more of the image than necessary, and when the circle
-straddles a high-contrast edge the ring-matched source search must reproduce
-BOTH sides of the edge from a single distant window, which often fails
-visibly.
+Maintainer-set rules this feature must never violate:
 
-This feature adds a render-time **mask shrink** pass: per brushed component,
-detect the defect pixels *inside* the selection as statistical outliers
-against the local surround, shrink the heal hole to just those pixels plus a
-small buffer, and let the existing clone heal fill them. Because the clean
-part of the selection is no longer masked, it automatically becomes valid
-source area for the (thickness-scaled, therefore now very local) source
-search — the fill is sampled from right next to the defect, on the correct
-side of any edge. Pixels of the selection that are not defect-like stay
-bit-for-bit untouched.
-
-When the selection does not contain a confident outlier subset (tight traces
-over hairs, dabs over clean areas, indistinct low-contrast defects), the pass
-leaves the component's mask unchanged and the behavior is exactly today's
-whole-stroke heal.
+1. **Film dust is WHITE** — it blocks light on the negative, so every real
+   defect inverts to a bright speck or string. Dark content under a
+   selection is image detail and is preserved.
+2. **A dab heals its outliers or does NOTHING.** No confident bright outlier
+   under a dab → the dab is a no-op (matching the reporter's original tool).
+   Never replace a whole dab "just in case" — that is how a sky dab near the
+   film rebate became a black disc.
+3. **Auto-mask samples from WITHIN the stroke.** The replacement texture for
+   a dab's outliers comes from the clean, non-masked part of the same
+   selection whenever a clone window fits there — an in-stroke candidate
+   beats ANY out-of-stroke one, with no quality tolerance. When the dab's
+   clean margin is geometrically too thin to host a window, the nearest
+   TONE-COMPATIBLE content is used (every candidate must first pass the
+   tone gate against the stroke's own clean interior — alien content like
+   the black rebate can never win), else diffusion from the hole's in-stroke
+   rim.
+4. **The feather softens the stroke's apply area** — the ramp is a fraction
+   of the stroke's own half-thickness (border gets less effect than the
+   center), so big dabs feather proportionally wide and tight traces stay
+   near-hard.
+5. **Spots heal independently, in order.** Each spot is healed on the
+   already-healed result of the spots before it (sequential replay). Adding
+   or removing a later spot never changes an earlier heal — clicking
+   adjacent dust must not affect its neighbors.
+6. **Deliberate whole-area replacement is an explicit choice**: a TRACE
+   gesture (path much longer than the brush radius — the user outlined the
+   defect itself) heals the whole stroke, and the Settings "Whole stroke" /
+   "Inpaint" engines always do. Tonally alien sources (the black rebate next
+   to sky) are rejected everywhere.
 
 ## 2. Goals / Non-goals
 
 ### Goals
-- A generous dab/circle around a defect heals only the defect (+ buffer);
-  the rest of the selection is preserved bit-for-bit.
-- Heals near high-contrast borders stop smearing: the fill for a defect on
-  the bright side is sourced from the bright side.
-- Applies identically to manual strokes and AI-detected ("auto") spots — it is
-  keyed on mask content, not spot kind.
-- Fully automatic by default, with a predictable fallback to whole-stroke
-  behavior when the outlier picture is not clear — plus a global **Settings
-  choice** of heal engine (Auto-mask / Whole stroke / Inpaint legacy) so
-  users can compare and opt out per taste.
-- Preserves every existing guarantee of `apply_dust_removal`: non-destructive,
-  16-bit native, resolution-independent contract, only-masked-pixels-change
-  (the buffer may extend ≤ buffer-radius px past the stroke, see §5.4),
-  feather semantics, Telea fallback.
+- A dab loosely circling white dust heals exactly the dust (+ small
+  buffer); the rest of the selection is bit-for-bit untouched.
+- Heals near high-contrast borders stay on the correct side: fill texture
+  comes from within the selection.
+- Auto (AI) spots heal their speck AND its soft halo with no bright ring
+  remnant.
+- Stable editing: heals never shift as more spots are added.
+- Fully automatic; no new panel controls. Settings → General exposes the
+  engine choice (Auto-mask / Whole stroke / Inpaint legacy).
 
 ### Non-goals
-- No change to spot storage (`dust_spots` stays `{kind, pts, r}` normalized),
-  persistence, or undo — the shrink is a pure render-time function of
-  (image pixels, rasterized mask, global method setting).
-- No dust-panel controls or overlay changes (the method picker lives in the
-  Settings dialog). The red stroke overlay continues to show the brushed
-  area; under auto-mask its meaning is "heal what's dusty in here", which is
-  what users already expect of a healing brush.
-- No per-image method: the engine choice is global, like Auto Gain.
-- No change to AI detection itself (`dust_detect.py`).
-- Not a general blemish/content-aware eraser: detection is local-outlier
-  based; large-area retouching stays out of scope.
+- No change to spot storage (`dust_spots` = `{kind, pts, r}` normalized),
+  undo, or AI detection interfaces. (Detection gate recalibration lives in
+  spec/dust-removal.md §5.3.)
+- No per-image engine choice; global, like Auto Gain.
+- Not a content-aware eraser for arbitrary content: removing something that
+  is not a bright outlier is the trace gesture's or the Whole-stroke
+  engine's job.
 
 ## 3. UX / Interaction
 
-Unchanged surfaces: dust panel, brush, feather slider, Ctrl+Z, AI detect flow.
+Unchanged surfaces: dust panel, brush, Ctrl+Z, AI detect flow.
 
-**Settings → General → "Dust removal" → "Heal method"** (`QComboBox`, staged
-and applied on Done like every other Settings toggle):
+**Settings → General → "Dust removal" → "Heal method"** (staged combo,
+applied on Done; QSettings `adjust/dust_method`; re-renders all images on
+change since spots replay live through the chosen engine):
 
 | Choice | id | Engine |
 | --- | --- | --- |
-| Auto-mask (default) | `automask` | outlier shrink + clone heal (this spec) |
-| Whole stroke | `clone` | clone-heal the entire stroke (v1.1 behavior) |
-| Inpaint (legacy) | `inpaint` | cv2.inpaint diffusion on the whole stroke (pre-v1.1) |
+| Auto-mask (default) | `automask` | contracts §1 |
+| Whole stroke | `clone` | clone-heal the entire stroke (v1.1) |
+| Inpaint (legacy) | `inpaint` | cv2.inpaint diffusion (pre-v1.1) |
 
-The setting is **global and live** (mirrors Auto Gain / Gamma mode): spots are
-stored normalized and healed at render time, so applying a change re-renders
-every loaded image with all existing spots replayed through the new engine —
-users can flip between the three on the same spots to compare. Persisted in
-QSettings (`adjust/dust_method`); unknown stored values fall back to
-`automask`.
-
-Behavioral contract under Auto-mask (the default):
-- Circle loosely around a speck/hair → only the defect disappears; grain and
-  detail inside the circle survive. Feather applies to the (small) healed
-  patch's rim.
-- Trace a hair tightly (brush ≈ hair width) → identical to Whole stroke: the
-  shrink pass declines (nearly everything under the stroke is defect).
-- Dab over clean area (nothing to remove) → identical to Whole stroke: the
-  dab is replaced with a matched clone (harmless no-op visually). The shrink
-  pass declines rather than silently doing nothing, so a user who paints over
-  a *subtle* defect below the outlier threshold still gets it replaced.
+Behavior under Auto-mask:
+- **Dab** (click or short drag) around dust → only the dust disappears.
+  Dab over clean area → nothing happens.
+- **Trace** (drag along a hair, path length > ~2.5x brush radius) → the
+  whole stroke heals, as in v1.1 (that gesture means "replace exactly
+  this").
+- **Feather slider** (0–100% of stroke half-thickness, default 35%):
+  softens the stroke's apply area (dab border heals less than its center).
+  Auto spots and traces keep full-strength defect fill regardless.
 
 ## 4. Data model
 
-Per-image: none. `dust_spots`, catalog persistence, and undo snapshots are
-untouched — the shrink is deterministic per (pixels, mask, method), so no new
-per-image state exists.
-
-Global: `ccr_backend.dust_method: str` (default `"automask"`), loaded at
-startup from QSettings `adjust/dust_method` (validated against
-`DUST_METHODS`), written by `MainWindow.on_dust_method_changed`. The method
-string joins `_current_adj_sig` (next to the `auto_gain` / `gamma_luminance`
-booleans) so a change invalidates cached hi-res renders.
+Per-image: none beyond `dust_feather` (0..1, fraction of stroke
+half-thickness; catalog key `dust_feather_rel`, legacy width-fraction
+`dust_feather` migrates proportionally on load).
+Global: `ccr_backend.dust_method` (validated against `DUST_METHODS`,
+persisted by MainWindow, in `_current_adj_sig` for hi-res invalidation).
 
 ## 5. Processing / math
 
-### 5.1 Placement — one new pass in the single funnel
+### 5.1 Sequential replay (contract 5)
 
-`apply_dust_removal(img16, spots, ..., method=DUST_METHOD_DEFAULT)` routes on
-the engine right after rasterization (`CCRImage._apply_dust_removal` passes
-the live `ccr_backend.dust_method`, the funnel every render path shares):
+`apply_dust_removal(img16, spots, ...)` folds spots one at a time, in stored
+order, into a working copy: `work = heal_one_spot(work, spot)`. A spot's
+result depends only on itself and PRIOR spots — never on later ones — so
+render-time replay reproduces exactly what the user saw when they placed
+each spot, and new spots cannot reshuffle old heals. Source-cleanliness
+exclusion is each spot's OWN mask only: earlier dust is already healed in
+`work`; later spots did not exist when this one was placed.
 
-```
-mask = rasterize_dust_mask(spots, h, w)
-if method == "automask":
-    mask = _automask_shrink(img16, mask)  # NEW — may return mask unchanged
-... existing component/segment clone-heal pipeline ...
-    # method == "inpaint": each component is routed whole into the existing
-    # Telea fallback (same thickness-capped feather the no-clean-source
-    # path uses) — the pre-v1.1 engine, kept as a selectable legacy option.
-```
+### 5.2 Per-spot analysis (automask engine)
 
-Everything downstream (components, `mask_pad`, the integral cleanliness image,
-`_heal_patch`, feather, Telea fallback, composite) operates on the shrunken
-mask with **no changes**. Two properties fall out for free:
+For each brush-spot component (window/ring construction as `_heal_patch`:
+thickness-scaled guard + ring, 1px-padded distance transforms):
 
-- The clean part of the selection is unmasked, so the integral-image "source
-  window touches dust" check passes there: `_heal_patch`'s source search — at
-  distances scaled to the (now small) defect thickness — samples from
-  immediately beside the defect, i.e. the reporter's "sample from the
-  non-masked part of the selection".
-- A shrunken hole is mostly defect, which is exactly the "tight stroke" case
-  `_heal_patch`'s internal defect-color defenses are designed for.
+1. **Two-anchor surround model** — 2-means over ring pixels, anchors
+   initialized at the bottom/top luma-decile medians, 2 rounds. Unimodal
+   ring → anchors coincide; bimodal (dab straddling an edge) → the two
+   modes, even for unbalanced splits a median split mis-models.
+2. **Bright outlier seeds** (contract 1):
+   `seed = d > max(K*sigma, ABS)` AND brighter than the NEARER anchor
+   (dust on the dark side of an edge counts even when darker than the far
+   side). `_AUTOMASK_K=5`, `_AUTOMASK_ABS=900/65535`, sigma = ring median
+   distance to nearest anchor.
+3. **Hysteresis growth**: seeds grow through connected bright pixels above
+   `_AUTOMASK_GROW=0.35` of the seed threshold (covers the soft halo; stray
+   grain not connected to a seed is dropped). Brush growth is clipped to
+   the stroke; an AUTO spot's circle is a machine guess, so its growth may
+   follow the halo past the circle (bounded by the analysis window), and
+   auto components use a 2x-thickness ring guard so their own halo doesn't
+   read as a background mode.
+4. **Buffer**: dilate by `max(1, round(w/1080))` px, clipped to the stroke
+   for brush spots.
+5. **No seeds** → brush dab: NO-OP (contract 2); auto spot: no-op as well
+   (the detector's own gates should prevent this arising).
 
-### 5.2 Outlier detection (per connected component)
+### 5.3 Gesture: dab vs trace (contract 6)
 
-For each connected component `C` of the rasterized mask (each with its own
-window, as `_heal_patch` does: `half_th` from the distance transform;
-`guard = max(_HEAL_GUARD, 0.5*half_th)`; `ring_w = max(_HEAL_RING, guard+3)`;
-`pad = guard + ring_w`; window = bbox(C) padded by `pad`, clipped to frame):
+From the SPOT DATA, not pixels: `path_len = Σ|pts[k+1]-pts[k]|` (normalized
+units). `path_len > _TRACE_LEN_R x r` (2.5) → TRACE → the whole stroke
+heals through the v1.1 clone path (with `dlike` force-fill so wide feathers
+cannot blend the traced defect back). Otherwise DAB → §5.2 outliers-or-no-op.
+Intent-faithful and image-independent — a tight trace over a hair whose
+leak contaminates the local ring (making the hair read as "background")
+still heals, because the user's gesture said so.
 
-1. **Ring** = pixels with `guard < dist(C) <= pad`, excluding the 1-px-padded
-   ORIGINAL mask (all spots — neighbors have not shrunk yet, order-free).
-   Fewer than `_HEAL_MIN_RING_PX` ring pixels → keep `C` unshrunk (no
-   context to judge outliers against).
-2. **Two-anchor surround model.** 2-means over ring pixels (distance =
-   per-channel mean absolute difference), anchors initialized at the
-   per-channel medians of the ring's bottom and top luma DECILES, two
-   assignment/update iterations. For a unimodal surround the anchors converge
-   near-coincident and the model degrades to a single anchor. For a bimodal
-   surround (the bright-face/dark-background case) they land on the two modes
-   even when the split is unbalanced (a 90/10 ring defeats a plain
-   median-luma split — the minority mode ends up inside one half and its
-   clean pixels get flagged). This is what makes edge-straddling selections
-   work: a single ring-median would flag the whole minority side of the edge
-   as "outlier".
-   `d(px) = min(mean|px - m_lo|, mean|px - m_hi|)` (mean over channels).
-3. **Noise scale** `sigma = median(d(ring))` — the ring's own scatter about
-   its anchors (a MAD analogue that stays honest for bimodal rings).
-4. **Bright outlier seeds** (white-dust prior — film dust blocks light on
-   the negative, so it inverts to WHITE specks and strings):
-   `seed = (d > max(K*sigma, ABS)) AND luma > luma(nearest anchor)`.
-   The brightness test is against the NEARER anchor, so dust on the dark
-   side of an edge counts even when it is darker than the far (bright) side.
-   Dark outliers are image detail (a shadow, a dark feature) and are never
-   flagged — a dab that contains only dark outliers falls back to the
-   whole-stroke heal, which still removes deliberately painted dark content.
-   `_AUTOMASK_K = 5.0` (grain lives well under 5 sigma; dust far over);
-   `_AUTOMASK_ABS = 900` (16-bit, ≈1.4%) floors near-noiseless content.
-5. **Hysteresis growth**: seeds grow through connected pixels above
-   `_AUTOMASK_GROW = 0.35` of the seed threshold (bright side only) — the
-   speck's soft halo joins the mask so no bright ring survives the heal;
-   weak pixels not connected to a seed (stray grain) are dropped.
-   **Brush vs auto**: brush growth is clipped to the stroke (the user's
-   boundary is authoritative); an AUTO (AI) spot's circle is a machine
-   guess, so its growth may follow the connected halo PAST the circle
-   (bounded by the analysis window). Auto components also use a wider ring
-   guard (2x thickness vs 0.5x): the circle hugs the speck, so its halo
-   leaks into a near ring and would otherwise read as a background mode
-   (stalling the growth and poisoning the heal's tone anchor).
-6. **Gates** — shrink `C` only if:
-   - a seed exists (brush AND auto); else keep `C` whole;
-   - brush only: clean fraction `1 - grown_in_stroke/hole >=
-     _AUTOMASK_CLEAN_MIN` (`0.4`) — a tight trace is mostly defect and must
-     keep whole-stroke behavior (also guarantees in-stroke source area).
-     Auto circles are mostly defect BY DESIGN, so this gate must not apply
-     to them: gated whole-circle heals tone-anchor on the halo just outside
-     the circle and leave a bright ring (the "auto detect doesn't work"
-     report).
-   (No second confidence threshold beyond `K*sigma` — resolved, §9.)
-7. **Buffer**: dilate the grown mask by a disk of radius
-   `buf = max(1, round(w/1080))` px — "+1px" at preview scale, proportional
-   at export — then CLIP to `C`: the heal never reaches outside what the
-   user painted (consistent with the stroke-feather semantics, §5.3).
-8. Replace `C`'s pixels in the output mask with the buffered outlier mask.
-   Several defects under one dab become several small components; the
-   existing pipeline heals each independently.
+### 5.4 Sampling (contract 3)
 
-### 5.3 Interaction with existing machinery
+- All candidates pass the TONE GATE below before anything else; then a dab
+  prefers candidates whose CLONED subregion lies fully inside the original
+  stroke — an in-stroke candidate beats any out-of-stroke one (no quality
+  tolerance; the tone gate already vetted both). A dab too small to host an
+  in-stroke window uses the nearest tone-compatible content (preserving
+  grain — a Telea-only rule here failed the 16-bit/grain quality bars);
+  no candidate at all → Telea diffusion from the hole's in-stroke rim.
+- Auto spots: sources come from the defect's neighborhood (no stroke to
+  constrain to) with the tone gate below.
+- Traces + Whole-stroke/Inpaint engines: neighborhood sources as v1.1.
+- **Tone gate (all clone paths)**: reject any candidate whose cloned
+  content's median deviates from the TONE REFERENCE by more than
+  `max(_HEAL_TONE_ABS=8000, _HEAL_TONE_K=12 x scatter)`. Reference = the
+  hole's own clean interior (dabs; the ring can be majority-alien exactly
+  when it matters — a dab beside the black rebate) or the trimmed ring
+  (traces/auto spots, whose holes are all defect). This is what makes
+  cloning the rebate (or its frame-number digits) into sky impossible.
 
-- **Feather = the stroke's soft edge** (user-corrected semantics): under
-  automask the feather softens the STROKE's apply area — alpha ramps inward
-  from the ORIGINAL brushed boundary, so the border of the stroke gets less
-  effect than its center (capped per stroke by its depth so the center
-  always reaches full effect). A defect hugging the stroke edge heals
-  partially by design; brush fully over the dust for full removal. Two
-  exceptions keep their full-strength fill: **auto (AI) spots** (tight
-  circles that are mostly defect — stroke falloff there would leave halo
-  rings; they keep the per-hole ramp + `dlike` force-fill) and **strokes
-  that kept their whole-stroke heal** (tight traces — preserving the
-  wide-feather-never-blends-the-defect-back guarantee).
-- **Clone sources prefer the stroke**: `_heal_patch` scores candidates as
-  before, but any candidate whose CLONED subregion lies fully inside the
-  original selection wins over out-of-stroke candidates — the fill texture
-  is sampled "from the non-masked part of the selection" whenever such a
-  window exists (the matching ring may still look outside). Falls back to
-  the unrestricted search, then Telea, as before.
-- **Long strokes**: a traced hair that fails the clean-fraction gate flows
-  through segmentation exactly as today. One that passes (loose wide trace)
-  shrinks to the hair-shaped outlier mask — segmentation then works on the
-  hair's own thickness, which is the geometry the segment heal was built for.
-- **Telea fallback**: unchanged; shrunken components near borders/dense dust
-  can still fall back per-patch.
-- **Resolution independence**: the shrink re-runs per render resolution from
-  the same normalized spots, like every other stage. Detection is driven by
-  ring statistics that are stable across scales; the healed set may differ by
-  edge pixels between preview and export — same class of approximation as
-  `_heal_patch`'s per-resolution source choice (spec/dust-removal.md §5.4).
+### 5.5 Feather & composite (contract 4)
 
-### 5.4 Contract (unchanged)
-
-Only pixels under the rasterized selection can change — the shrunken mask's
-buffer is clipped to the stroke (an earlier draft let it spill `buf` px past
-the stroke; dropped when the feather became the stroke's soft edge, §5.3).
+Per spot: alpha for a brush stroke ramps inward from the ORIGINAL stroke
+boundary over `feather x stroke_depth` px (smoothstep; uint8 fmap capped at
+250). Auto spots use the shrunken hole's own ramp, and defect force-fill
+(`dlike`) applies to auto spots and traces only. Blend runs inside the
+spot's bounding box; alpha is exactly 0 outside the spot's masks, so
+untouched pixels are bit-for-bit identical (float32 round-trip of uint16 is
+exact).
 
 ## 6. Integration points
 
 | File | Change |
 | --- | --- |
-| `src/core/ccr_processor.py` | New `_automask_shrink(img16, mask)` + constants (`_AUTOMASK_K`, `_AUTOMASK_ABS`, `_AUTOMASK_CLEAN_MIN`); `DUST_METHODS` / `DUST_METHOD_DEFAULT`; `method=` parameter on `apply_dust_removal` (automask shrink / whole-stroke clone / whole-stroke Telea). |
-| `src/core/ccr_image.py` | `_apply_dust_removal` passes the live `ccr_backend.dust_method`. |
-| `src/core/ccr_backend.py` | `dust_method` attribute (default `"automask"`). |
-| `src/ui/main_window.py` | Startup restore from QSettings (validated); `on_dust_method_changed` → persist + `_rerender_all_for_global_mode`. |
-| `src/widgets/settings_dialog.py` | "Dust removal / Heal method" combo on the General page; staged like the other toggles (`_init_toggles` / `_apply_pending`). |
-| `src/widgets/image_preview.py` | `dust_method` joins `_current_adj_sig` (hi-res cache invalidation). |
-| `spec/dust-removal.md` | One-line cross-reference from §5.2 to this spec. |
-| `tests/test_dust_removal.py` | `TestAutoMaskShrink`, `TestAutoMaskPipeline`, `TestHealMethodChoice` (see §7). |
+| `src/core/ccr_processor.py` | Dust section refactor: sequential `apply_dust_removal` driver + `_heal_one_spot`; `_automask_outliers` (analysis), `_heal_patch` (clone core with in-stroke constraint + tone gate), Telea fallback, per-spot composite. Constants: `_AUTOMASK_*`, `_TRACE_LEN_R`, `_HEAL_TONE_*`, `DUST_METHODS`, `DUST_FEATHER_DEFAULT`. |
+| `src/core/ccr_image.py` | `_apply_dust_removal` passes live `ccr_backend.dust_method`. |
+| `src/core/ccr_backend.py`, `src/ui/main_window.py`, `src/widgets/settings_dialog.py` | Engine setting (attr, restore/persist/re-render, staged combo). |
+| `src/widgets/image_preview.py` | `dust_method` in `_current_adj_sig`. |
+| `src/widgets/dust_panel.py` | Feather slider 0–100% of stroke. |
+| `src/core/dust_detect.py` | Gate recalibration + string polylines (spec/dust-removal.md §5.3). |
+| `src/core/catalog.py` | `dust_feather_rel` + legacy migration. |
+| `tests/test_dust_removal.py` | Rebuilt suite mirroring the contracts (§7). |
 
-No catalog or per-image changes.
+## 7. Test plan (mirrors the contracts)
 
-## 7. Test plan
-
-Helper-level (`_automask_shrink` directly, synthetic 16-bit fields with
-seeded grain like the existing tests):
-
-1. Generous dab around a bright speck → shrunken mask covers speck+buffer,
-   excludes the rest of the dab (and nothing outside dab+buffer).
-2. Dark speck variant (sign-agnostic detection).
-3. Tight trace over a hair (stroke ≈ hair width) → mask returned unchanged
-   (clean-fraction gate).
-4. Dab over clean noise (no outlier) → unchanged (K·sigma gate).
-5. Edge-straddling dab (bimodal surround), speck on the bright side → only
-   the speck flagged; both clean sides of the edge unmasked (two-anchor
-   model regression).
-
-Pipeline-level (`apply_dust_removal`):
-
-7. Generous dab: clean selection pixels bit-exact untouched; speck healed to
-   surround level (tone within existing tests' tolerances).
-8. Edge case from §1: dark-side pixels inside the dab bit-exact; healed speck
-   lands at bright-side statistics, not pulled toward the dark side.
-9. Two specks under one dab → both healed, pixels between them untouched.
-10. Method choice (`TestHealMethodChoice`): `method="clone"` replaces the
-    whole dab (clean dab pixels change) and skips the shrink;
-    `method="inpaint"` fills through the 8-bit Telea path (fill values are
-    multiples of 257 on a flat field — the signature the 16-bit-native test
-    uses in reverse); an unknown method string behaves as `automask`;
-    `apply_adjustments` honors `ccr_backend.dust_method` end-to-end.
-11. Full existing `test_dust_removal.py` suite passes (grain preservation,
-    gradient continuation, hair ghost, feather guarantees, fallback,
-    persistence, undo, panel wiring). One exception by construction:
-    `test_feather_param_softens_rim` asserts the feather's cross-fade at the
-    DAB rim of a generous dab — with auto-mask that rim is no longer part of
-    the hole (the very point of the feature), so it passes
-    `method="clone"` to keep exercising the whole-stroke feather mechanics
-    it was written for.
+1. Contract 1: dab over bright speck heals it; dark blob under the same dab
+   preserved bit-exact; dark-only dab is a NO-OP under automask (Whole
+   stroke engine still removes it).
+2. Contract 2: dab over clean grain is a bit-exact no-op.
+3. Contract 3: dab beside a black band whose only out-of-stroke candidates
+   are the band → heal stays sky-toned (never black); edge-straddling dab
+   heals its speck at the correct side's statistics.
+4. Contract 4: feather widens with the stroke; border defect heals less
+   than center defect at high feather; feather 0 heals both fully.
+5. Contract 5: healing [A] then adding B leaves A's healed pixels
+   bit-identical; order determinism.
+6. Contract 6: a trace over a hair heals the whole stroke (hair gone, no
+   ghost, wide feather cannot blend it back).
+7. Auto spots: speck+halo → no bright ring remnant; two-anchor bimodal
+   surround; halo growth past the circle.
+8. Engines: whole-stroke replaces clean dab pixels; inpaint fills with the
+   8-bit Telea signature; unknown method → automask; backend setting drives
+   `apply_adjustments`; tone gate applies to whole-stroke too.
+9. Detection gates (model-free `prob_to_spots`): adaptive margin passes
+   faint blobs on quiet sky and rejects them in heavy grain; thin bright
+   strings kept as polyline spots (area-cap exempt, frame-edge guard);
+   thick elongated dropped; dark blobs dropped.
+10. Persistence: spots + `dust_feather_rel` round-trip; legacy migration;
+    undo snapshot independence.
+11. Legacy pipeline invariants (kept from PRs #81/#82): 16-bit-native fill,
+    grain preservation, gradient continuation, no input mutation, far
+    pixels untouched, Telea fallback when no clean source window exists.
 
 ## 8. Rollout / debugging
 
-- The Settings "Heal method" picker doubles as the support/A-B path: all
-  three engines replay the same stored spots live, so a user can flip
-  between them on their own scan and report which looks right. (An earlier
-  draft used a `FREECCR_DUST_AUTOMASK` env knob; superseded by the picker.)
-- No release-notes entry until the next release's "What's New" is written.
+The Settings engine picker is the support/A-B path: all three engines
+replay the same stored spots live. No env knobs.
 
-## 9. Refinement notes — resolved decisions
+## 9. History — how the contracts were learned
 
-- **Outlier test instead of defect-color estimation.** First draft mirrored
-  `_heal_patch`'s defect-color recipe (p75-of-deviation median). Rejected for
-  the mask: with a small speck under a generous dab the top-quartile is
-  dominated by grain and the "defect color" lands on background; and with an
-  edge-straddling dab a single ring median flags the minority side of the
-  edge as the defect. The two-anchor K·sigma outlier test handles any defect
-  fraction and bimodal surrounds without estimating a defect color at all.
-  (`_heal_patch`'s internal defect estimation stays as-is — its defensive use
-  is tolerant of those biases.)
-- **2-means with decile init over a median-luma split** for the anchors: the
-  median split mis-models unbalanced bimodal rings (90/10 puts the minority
-  mode inside one half; its clean pixels then read as outliers and a clean
-  sliver of the dab gets pointlessly healed). Decile-initialized 2-means
-  separates any split the ring can meaningfully witness (minority ≥ ~10%).
-- **Automatic with fallback + a global Settings picker** (maintainer call,
-  superseding the first draft's "no toggle, env knob only"): the default
-  stays fully automatic, but Settings → General exposes the heal engine
-  (Auto-mask / Whole stroke / Inpaint legacy) following the Auto Gain
-  pattern — global, live, persisted, re-renders on change. The env knob was
-  dropped: one control surface, and the picker is strictly more useful (it
-  also restores the pre-v1.1 diffusion engine for users who preferred it).
-- **Buffer scales with width** (`round(w/1080)`), not fixed 1px: a fixed 1px
-  at 6000px export is proportionally 5× thinner than at preview, and defect
-  soft edges scale with resolution.
-- **No second confidence threshold** beyond `K*sigma` (draft had
-  `median(d) >= 2K*sigma`): redundant with K and would reject legitimate
-  faint-but-clear defects; K alone is the sensitivity dial.
-- **Ring exclusion uses the ORIGINAL mask** during the pre-pass so results
-  don't depend on component iteration order.
-
-- **User-feedback round (2026-07-04)** — three corrections from field use:
-  (1) *"feathering is to feather the apply area of the stroke — the border
-  gets less effect than the center"* → feather became the stroke's soft
-  edge under automask (§5.3), replacing the shrunken hole's own rim ramp,
-  and the buffer is clipped to the stroke (§5.4). (2) *"sample from within
-  the stroke to cover the outlier"* → in-stroke clone-source preference in
-  `_heal_patch` (§5.3). (3) *"all dust are white spots/strings"* → the
-  outlier test is bright-only (§5.2 step 4); dark content under a dab is
-  preserved, dark-only dabs fall back to whole-stroke; plus hysteresis halo
-  growth (§5.2 step 5) so auto-detected specks heal without ring remnants.
-  Investigating (3) with the real ONNX model on synthetic film positives
-  showed detection itself works at all brightness levels; the failures were
-  heal-side — auto circles healed whole with halo-poisoned tone anchors
-  (clean gate mis-applied to them) and halos outside the circle surviving.
-  With auto growth + gate exemption the worst residual at detected spots
-  dropped from ~2x grain to the pure-grain baseline (7705 vs 7692 in the
-  probe). The in-stroke source preference needed a quality tolerance
-  (`_HEAL_IN_STROKE_TOL`): an edge-straddling stroke's only in-stroke
-  candidates can sit on the wrong side of the edge, and unconditional
-  preference picked them over far better out-of-stroke sources.
-- **Screenshot round (2026-07-04)** — a user screenshot of a hard-edged
-  healed disc on sky: the feather was a fraction of IMAGE WIDTH (default
-  0.3% ≈ 3 px at preview), constant regardless of brush size, so a big dab
-  read as a sharp-edged patch. The Feather became a fraction of the
-  STROKE's half-thickness (slider 0–100%, default 35%; catalog key
-  `dust_feather_rel`, legacy values migrate proportionally) — big dabs
-  feather proportionally wide, tight traces stay near-hard, and the ramp is
-  resolution-independent by construction. Same round: "AI says no dust
-  found" — the net fires on faint dust (0.999 prob on 3% strings) but the
-  post-gates rejected it; recalibrated in dust_detect.py (adaptive bright
-  margin, dust-string branch with polyline spots) — see
-  spec/dust-removal.md §5.3.
-
-### Open items (non-blocking)
-- If grain speckle ever produces distracting micro-heals, add a minimum
-  outlier-component area (≥2 px) before buffering. Not included: thin hairs
-  are 1–2 px and must not be filtered out.
-- A future "Whole stroke" per-stroke modifier (e.g. paint with Alt) if users
-  ever want to force replacement of clean-looking areas; no evidence yet.
+- v1 shipped shrink-or-whole-stroke with out-of-stroke sampling preferred
+  by ring-SSD. Field testing produced: hard-edged discs (feather was a
+  fixed ~3px image-width fraction), "AI says no dust found" (detection
+  post-gates rejected faint dust and strings the net had found at 0.999),
+  BLACK discs on sky (whole-stroke fallback + ring-SSD choosing film-rebate
+  sources when the dst ring itself was majority-rebate), and neighbor heals
+  reshuffling on every new click (simultaneous healing from one merged
+  mask). Each failure became a contract in §1.
+- Rejected: defect-color estimation for the outlier mask (grain-dominated
+  top-quartile for small specks; single ring median mis-models bimodal
+  surrounds); unconditional in-stroke source preference (an edge-straddling
+  stroke's in-stroke candidates can sit on the wrong side — superseded by
+  the strict in-stroke constraint for dabs plus tone gate everywhere);
+  whole-stroke fallback for outlier-less dabs (contract 2 forbids it; the
+  trace gesture covers deliberate replacement); clean-fraction gates on
+  auto spots (their circles are mostly defect BY DESIGN — gating them left
+  halo-poisoned whole-circle heals).

@@ -214,118 +214,202 @@ class TestApplyDustRemoval:
 
     def test_underscoped_dab_keeps_tone(self):
         # A click smaller than the speck (the small dot ghost): the speck's
-        # edge leaks past the mask but must not lift the fill's tone.
+        # edge leaks past the mask but must not lift the fill's tone —
+        # under the automask and whole-stroke engines alike (the tone gate's
+        # reference falls back to the trimmed ring when the hole is all
+        # defect, so the fill still lands on the sky).
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (100, 100, 3)).copy()
         cv2.circle(img, (50, 50), 6, (62000, 60000, 30000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.04}  # mask r=4 < speck r=6
-        out = apply_dust_removal(img, [spot])
-        center = out[49:52, 49:52].astype(np.float32).reshape(-1, 3).mean(axis=0)
-        assert float(np.abs(center - sky).max()) < 6000
+        for method in ("automask", "clone"):
+            out = apply_dust_removal(img, [spot], method=method)
+            center = out[49:52, 49:52].astype(np.float32)
+            center = center.reshape(-1, 3).mean(axis=0)
+            assert float(np.abs(center - sky).max()) < 6000, method
 
 
-# --- auto-mask (shrink a generous selection to its outliers) -----------------
-# spec/dust-auto-mask.md: a dab loosely circling a defect heals only the
-# defect (+ a small buffer); the clean remainder of the selection is
-# preserved bit-for-bit and doubles as local source area, which keeps heals
-# on the correct side of high-contrast edges.
-from core.ccr_processor import _automask_shrink  # noqa: E402
+# --- auto-mask contracts (spec/dust-auto-mask.md §1) --------------------------
+# Rebuilt suite: each test pins one maintainer-set contract. Film dust is
+# WHITE; a dab heals its bright outliers or does NOTHING; samples come from
+# WITHIN the stroke; the feather is the stroke's soft edge; spots heal
+# independently in order; deliberate whole-area replacement is the trace
+# gesture or the Whole-stroke engine.
 
 
-class TestAutoMaskShrink:
-    """_automask_shrink directly: what shrinks, what stays whole."""
+def _grain(base=30000, sigma=1500, h=100, w=100, seed=9):
+    rng = np.random.default_rng(seed)
+    return np.clip(rng.normal(base, sigma, (h, w, 3)), 0,
+                   65535).astype(np.uint16)
 
-    @staticmethod
-    def _dab_mask(h=100, w=100, cx=50, cy=50, r=15):
-        mask = np.zeros((h, w), np.uint8)
-        cv2.circle(mask, (cx, cy), r, 255, -1)
-        return mask
 
-    def test_shrink_targets_outliers_only(self):
-        img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=4)
-        mask = self._dab_mask(r=15)
-        out = _automask_shrink(img, mask)
-        assert out[50, 50] == 255                    # speck stays masked
-        assert out[50, 60] == 0                      # clean dab pixel released
-        # Shrunken mask stays within speck + buffer (r=4 + ~2px slack).
+def _dab(x, y, r, w=100, h=100):
+    return {"kind": "brush", "pts": [[x / w, y / h]], "r": r / w}
+
+
+class TestAutoMaskContracts:
+    def test_dab_heals_bright_outlier_only(self):
+        # Contracts 1+2: the speck goes; every clean selection pixel is
+        # bit-for-bit original.
+        img = _grain()
+        cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
+        out = apply_dust_removal(img, [_dab(50, 50, 15)])
+        assert abs(int(out[50, 50, 0]) - 30000) < 10000
         yy, xx = np.mgrid[0:100, 0:100]
-        assert not out[np.hypot(yy - 50, xx - 50) > 7].any()
+        keep = (np.hypot(yy - 50, xx - 50) < 15) & \
+               (np.hypot(yy - 50, xx - 50) > 8)
+        assert np.array_equal(out[keep], img[keep])
 
-    def test_dark_speck_falls_back_to_whole_stroke(self):
-        # Film dust is WHITE (blocks light on the negative -> inverts bright);
-        # a dark blob under a dab is image content, not dust, so there is no
-        # bright outlier and the whole-stroke heal takes over (which still
-        # removes it — deliberate dark-removal keeps working via fallback).
-        img = _flat_with_speck(base=40000, speck=2000, cx=50, cy=50, r=4)
-        mask = self._dab_mask(r=15)
-        out = _automask_shrink(img, mask)
-        assert np.array_equal(out, mask)
+    def test_clean_dab_is_noop(self):
+        # Contract 2: nothing dusty under the dab -> the WHOLE image is
+        # bit-for-bit unchanged (no more replaced discs on clean sky).
+        img = _grain(seed=11)
+        out = apply_dust_removal(img, [_dab(50, 50, 15)])
+        assert np.array_equal(out, img)
 
-    def test_halo_joins_the_mask(self):
-        # Hysteresis: a speck's soft Gaussian halo sits below the seed
-        # threshold but must join the mask (grown through the weak threshold)
-        # so the heal leaves no bright ring remnant.
+    def test_dark_content_under_dab_is_preserved(self):
+        # Contract 1: dark detail is not dust; only the white speck heals.
+        img = _grain(seed=15)
+        cv2.circle(img, (43, 50), 2, (62000, 62000, 62000), -1)   # dust
+        cv2.circle(img, (57, 50), 2, (1500, 1500, 1500), -1)      # detail
+        out = apply_dust_removal(img, [_dab(50, 50, 15)])
+        assert abs(int(out[50, 43, 0]) - 30000) < 9000            # healed
+        assert np.array_equal(out[47:54, 54:61], img[47:54, 54:61])  # kept
+
+    def test_dark_only_dab_is_noop(self):
+        # Contract 1: a dab over only-dark content does nothing under
+        # automask; the Whole-stroke engine is the explicit way to remove it.
+        img = _grain(seed=16)
+        cv2.circle(img, (50, 50), 3, (1500, 1500, 1500), -1)
+        spot = _dab(50, 50, 12)
+        assert np.array_equal(apply_dust_removal(img, [spot]), img)
+        out = apply_dust_removal(img, [spot], method="clone")
+        assert abs(int(out[50, 50, 0]) - 30000) < 9000
+
+    def test_dab_samples_within_stroke(self):
+        # Contract 3 (the black-disc report): sky pocket surrounded by black
+        # rebate; a dab around a speck must fill with in-stroke sky — never
+        # rebate — even though rebate windows are the only clean candidates
+        # outside the stroke.
+        rng = np.random.default_rng(30)
+        img = np.clip(rng.normal(2500, 300, (300, 300, 3)), 0,
+                      65535).astype(np.uint16)
+        img[88:212, 88:212] = np.clip(
+            rng.normal(42000, 800, (124, 124, 3)), 0, 65535).astype(np.uint16)
+        cv2.circle(img, (150, 150), 3, (65000, 65000, 65000), -1)
+        out = apply_dust_removal(
+            img, [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 25 / 300}])
+        healed = out[144:157, 144:157].astype(np.float32)
+        assert float(np.median(healed)) > 34000        # sky, not rebate
+        assert abs(int(out[150, 150, 0]) - 42000) < 9000
+
+    def test_edge_straddling_dab_heals_correct_side(self):
+        # Contract 3: speck on the bright side of a hard edge; fill lands at
+        # bright-side statistics; the dark side of the dab stays bit-exact.
+        rng = np.random.default_rng(4)
+        img = np.clip(rng.normal(8000, 500, (100, 100, 3)), 0,
+                      65535).astype(np.uint16)
+        img[:, 50:] = np.clip(rng.normal(50000, 500, (100, 50, 3)),
+                              0, 65535).astype(np.uint16)
+        cv2.circle(img, (60, 50), 3, (65000, 65000, 65000), -1)
+        out = apply_dust_removal(
+            img, [{"kind": "brush", "pts": [[0.52, 0.5]], "r": 0.16}])
+        healed = out[48:53, 58:63].astype(np.float32)
+        assert abs(float(healed.mean()) - 50000) < 4000
+        yy, xx = np.mgrid[0:100, 0:100]
+        dark = (np.hypot(yy - 50, xx - 52) < 16) & (xx < 49)
+        assert np.array_equal(out[dark], img[dark])
+
+    def test_halo_joins_the_heal(self):
+        # A speck's soft halo (below the seed threshold) is hysteresis-grown
+        # into the heal so no bright ring survives.
         img = np.full((100, 100, 3), 30000, np.uint16)
         yy, xx = np.mgrid[0:100, 0:100]
         halo = np.exp(-((yy - 50.0) ** 2 + (xx - 50.0) ** 2) / (2 * 3.0 ** 2))
-        img = np.clip(img + (halo[..., None] * 30000), 0, 65535).astype(np.uint16)
-        out = _automask_shrink(img, self._dab_mask(r=15))
-        # The visible halo (still ~2600 above base at r=6.4) is masked.
-        assert out[50, 50] == 255
-        assert out[50, 56] == 255
-        assert out[50, 62] == 0     # flat field well past the halo: released
+        img = np.clip(img + (halo[..., None] * 30000), 0,
+                      65535).astype(np.uint16)
+        out = apply_dust_removal(img, [_dab(50, 50, 15)])
+        win = out[38:63, 38:63].astype(np.int32)
+        assert int(win.max()) - 30000 < 1500   # halo gone, no ring left
 
-    def test_tight_trace_keeps_whole_stroke(self):
-        # Brush ≈ defect width: nearly everything under the stroke is defect,
-        # so the clean-fraction gate must keep the whole stroke.
-        sky = np.array([20000, 25000, 40000], np.uint16)
-        img = np.broadcast_to(sky, (200, 200, 3)).copy()
+    def test_feather_softens_stroke_border_effect(self):
+        # Contract 4: the feather is the STROKE's soft edge — a defect at the
+        # dab border heals less than one at the center; feather 0 heals both.
+        base = np.full((200, 200, 3), 30000, np.uint16)
+
+        def scene():
+            img = base.copy()
+            cv2.circle(img, (100, 100), 2, (62000, 62000, 62000), -1)
+            cv2.circle(img, (113, 100), 2, (62000, 62000, 62000), -1)
+            return img
+
+        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # dab r=16
+        img = scene()
+        soft = apply_dust_removal(img, [spot], feather=0.6)
+        hard = apply_dust_removal(img, [spot], feather=0.0)
+        res_center = int(soft[100, 100, 0]) - 30000
+        res_border = int(soft[100, 113, 0]) - 30000
+        assert res_center < 3000
+        assert res_border > res_center + 5000
+        assert int(hard[100, 113, 0]) - 30000 < 3000
+
+
+class TestSequentialReplay:
+    def test_adding_a_spot_never_changes_prior_heals(self):
+        # Contract 5 (the "clicking adjacent dust affects the neighbors"
+        # report): spot A's healed pixels are bit-identical whether or not a
+        # later spot B exists next to it.
+        img = _grain(seed=19)
+        cv2.circle(img, (40, 50), 2, (62000, 62000, 62000), -1)
+        cv2.circle(img, (60, 50), 2, (62000, 62000, 62000), -1)
+        a = _dab(40, 50, 9)
+        b = _dab(60, 50, 9)
+        out_a = apply_dust_removal(img, [a])
+        out_ab = apply_dust_removal(img, [a, b])
+        assert np.array_equal(out_a[:, :50], out_ab[:, :50])  # A side identical
+        assert abs(int(out_ab[50, 60, 0]) - 30000) < 9000     # B healed too
+
+    def test_later_spot_may_source_from_healed_area(self):
+        # Sequential replay heals on the running result, so two adjacent
+        # dabs both converge to the background level.
+        img = _grain(seed=23)
+        cv2.circle(img, (46, 50), 2, (62000, 62000, 62000), -1)
+        cv2.circle(img, (54, 50), 2, (62000, 62000, 62000), -1)
+        out = apply_dust_removal(img, [_dab(46, 50, 8), _dab(54, 50, 8)])
+        assert abs(int(out[50, 46, 0]) - 30000) < 9000
+        assert abs(int(out[50, 54, 0]) - 30000) < 9000
+
+
+class TestTraceGesture:
+    def test_trace_heals_whole_stroke(self):
+        # Contract 6: a path much longer than the brush radius means
+        # "replace exactly this outline" — the whole stroke heals even when
+        # its content matches the (leak-contaminated) local surround.
+        sky = np.array([20000, 25000, 40000], np.float32)
+        img = np.broadcast_to(sky.astype(np.uint16), (200, 200, 3)).copy()
         cv2.line(img, (30, 100), (170, 100), (62000, 60000, 30000), 13)
-        mask = np.zeros((200, 200), np.uint8)
-        cv2.line(mask, (40, 100), (160, 100), 255, 9)  # inside the hair
-        out = _automask_shrink(img, mask)
-        assert np.array_equal(out, mask)
+        spot = {"kind": "brush",
+                "pts": [[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]], "r": 2.0 / 200}
+        out = apply_dust_removal(img, [spot])
+        core = out[99:102, 60:140].astype(np.float32).reshape(-1, 3)
+        assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
 
-    def test_clean_dab_stays_whole(self):
-        rng = np.random.default_rng(11)
-        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        mask = self._dab_mask(r=15)
-        out = _automask_shrink(img, mask)
-        assert np.array_equal(out, mask)  # no confident outlier -> unchanged
+    def test_click_is_a_dab_not_a_trace(self):
+        # A single click (no path) over clean grain follows dab semantics:
+        # no outliers -> no-op, never a whole-circle replacement.
+        img = _grain(seed=27)
+        out = apply_dust_removal(img, [_dab(50, 50, 12)])
+        assert np.array_equal(out, img)
 
-    def test_edge_straddling_dab_flags_only_the_speck(self):
-        # Bimodal surround (the bright-face/dark-background case): both sides
-        # of the edge are legit ring modes; only the speck is an outlier.
-        rng = np.random.default_rng(3)
-        img = np.clip(rng.normal(8000, 500, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        img[:, 50:] = np.clip(rng.normal(50000, 500, (100, 100 - 50, 3)),
-                              0, 65535).astype(np.uint16)
-        cv2.circle(img, (60, 50), 3, (65000, 65000, 65000), -1)  # bright side
-        mask = self._dab_mask(cx=52, cy=50, r=16)   # straddles the edge
-        out = _automask_shrink(img, mask)
-        assert out[50, 60] == 255                    # speck masked
-        assert not out[:, :49].any()                 # dark side fully released
-        # Local to the speck (r=3 + hysteresis fringe over grain + buffer);
-        # the rest of the bright side of the dab is released.
-        yy, xx = np.mgrid[0:100, 0:100]
-        assert not out[np.hypot(yy - 50, xx - 60) > 10].any()
 
-class TestHealMethodChoice:
-    """The Settings heal-method choice: apply_dust_removal(method=...) selects
-    the engine; ccr_backend.dust_method drives it through apply_adjustments."""
+class TestHealEngines:
+    """The Settings heal-method choice (spec/dust-auto-mask.md §3)."""
 
-    def test_clone_replaces_whole_stroke(self):
-        rng = np.random.default_rng(12)
-        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
+    def test_whole_stroke_replaces_clean_dab_pixels(self):
+        img = _grain(seed=12)
         cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
-        out = apply_dust_removal(img, [spot], method="clone")
-        assert abs(int(out[50, 50, 0]) - 30000) < 10000  # speck healed
-        # Whole-stroke engine: clean dab pixels are ALSO replaced (unlike
-        # automask, which preserves them bit-for-bit).
+        out = apply_dust_removal(img, [_dab(50, 50, 15)], method="clone")
+        assert abs(int(out[50, 50, 0]) - 30000) < 10000
         yy, xx = np.mgrid[0:100, 0:100]
         keep = (np.hypot(yy - 50, xx - 50) < 13) & \
                (np.hypot(yy - 50, xx - 50) > 8)
@@ -333,9 +417,7 @@ class TestHealMethodChoice:
 
     def test_inpaint_uses_diffusion(self):
         # The legacy engine fills through the 8-bit Telea path: on a flat
-        # 30000 field the fill quantizes to multiples of 257 (30069), the
-        # exact signature test_fill_is_16bit_native_on_flat_field excludes
-        # for the clone engines.
+        # 30000 field the fill quantizes to multiples of 257 (30069).
         img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=4)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}
         out = apply_dust_removal(img, [spot], method="inpaint")
@@ -344,16 +426,10 @@ class TestHealMethodChoice:
         assert (core % 257 == 0).all()
 
     def test_unknown_method_behaves_as_automask(self):
-        rng = np.random.default_rng(13)
-        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
-        out = apply_dust_removal(img, [spot], method="not-a-method")
-        yy, xx = np.mgrid[0:100, 0:100]
-        keep = (np.hypot(yy - 50, xx - 50) < 13) & \
-               (np.hypot(yy - 50, xx - 50) > 8)
-        assert np.array_equal(out[keep], img[keep])  # automask preservation
+        img = _grain(seed=13)
+        out = apply_dust_removal(img, [_dab(50, 50, 15)],
+                                 method="not-a-method")
+        assert np.array_equal(out, img)  # clean dab -> automask no-op
 
     def test_backend_setting_drives_apply_adjustments(self, tmp_path):
         from core.ccr_backend import ccr_backend
@@ -371,94 +447,31 @@ class TestHealMethodChoice:
             out = img.apply_adjustments(src)
         finally:
             ccr_backend.dust_method = prev
-        # The 257-quantized fill proves the backend choice reached the heal.
         core = out[49:52, 49:52].astype(np.int32)
-        assert (core % 257 == 0).all()
+        assert (core % 257 == 0).all()  # the 8-bit Telea fill signature
 
-
-class TestAutoMaskPipeline:
-    """apply_dust_removal end-to-end with the shrink pass."""
-
-    def test_generous_dab_preserves_clean_selection_pixels(self):
-        rng = np.random.default_rng(9)
-        img = np.clip(rng.normal(30000, 2000, (100, 100, 3)), 0,
+    def test_tone_gate_applies_to_whole_stroke_too(self):
+        # The Whole-stroke engine must not clone the black rebate either:
+        # with every clean candidate window on the rebate, the tone gate
+        # rejects them all and the heal falls back to rim diffusion (sky).
+        rng = np.random.default_rng(31)
+        img = np.clip(rng.normal(2500, 300, (300, 300, 3)), 0,
                       65535).astype(np.uint16)
-        cv2.circle(img, (50, 50), 3, (62000, 62000, 62000), -1)
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}  # dab r=15
-        out = apply_dust_removal(img, [spot])
-        # Speck healed to the surround.
-        assert abs(int(out[50, 50, 0]) - 30000) < 10000
-        # Clean selection pixels (inside the dab, away from the speck) are
-        # bit-for-bit original — the whole point of the auto-mask.
-        yy, xx = np.mgrid[0:100, 0:100]
-        keep = (np.hypot(yy - 50, xx - 50) < 15) & \
-               (np.hypot(yy - 50, xx - 50) > 8)
-        assert np.array_equal(out[keep], img[keep])
+        img[88:212, 88:212] = np.clip(
+            rng.normal(42000, 800, (124, 124, 3)), 0, 65535).astype(np.uint16)
+        out = apply_dust_removal(
+            img, [{"kind": "brush", "pts": [[0.5, 0.5]], "r": 25 / 300}],
+            method="clone")
+        healed = out[130:170, 130:170].astype(np.float32)
+        assert float(np.median(healed)) > 25000  # sky-toned, never black
 
-    def test_edge_straddling_dab_heals_on_the_right_side(self):
-        # Speck on the bright side of a hard edge, dab straddling the edge:
-        # the fill must land at bright-side statistics (not pulled dark) and
-        # the dark side of the selection must stay bit-for-bit.
-        rng = np.random.default_rng(4)
-        img = np.clip(rng.normal(8000, 500, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        img[:, 50:] = np.clip(rng.normal(50000, 500, (100, 50, 3)),
-                              0, 65535).astype(np.uint16)
-        cv2.circle(img, (60, 50), 3, (65000, 65000, 65000), -1)
-        spot = {"kind": "brush", "pts": [[0.52, 0.5]], "r": 0.16}
-        out = apply_dust_removal(img, [spot])
-        healed = out[48:53, 58:63].astype(np.float32)
-        assert abs(float(healed.mean()) - 50000) < 4000   # bright-side fill
-        # Dark side under the dab: untouched.
-        yy, xx = np.mgrid[0:100, 0:100]
-        dark = (np.hypot(yy - 50, xx - 52) < 16) & (xx < 49)
-        assert np.array_equal(out[dark], img[dark])
 
-    def test_two_specks_one_dab(self):
-        rng = np.random.default_rng(6)
-        img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        cv2.circle(img, (43, 50), 2, (62000, 62000, 62000), -1)
-        cv2.circle(img, (57, 50), 2, (58000, 58000, 58000), -1)
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
-        out = apply_dust_removal(img, [spot])
-        assert abs(int(out[50, 43, 0]) - 30000) < 9000
-        assert abs(int(out[50, 57, 0]) - 30000) < 9000
-        # The strip between the two specks is original.
-        assert np.array_equal(out[48:53, 47:53], img[48:53, 47:53])
-
-    def test_dark_content_under_dab_is_preserved(self):
-        # White-dust prior: when a dab contains a bright speck AND dark image
-        # detail, only the speck is healed — the dark detail (a shadow, a dark
-        # feature) is not dust and survives bit-for-bit.
-        rng = np.random.default_rng(15)
-        img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        cv2.circle(img, (43, 50), 2, (62000, 62000, 62000), -1)   # dust
-        cv2.circle(img, (57, 50), 2, (1500, 1500, 1500), -1)      # dark detail
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.15}
-        out = apply_dust_removal(img, [spot])
-        assert abs(int(out[50, 43, 0]) - 30000) < 9000            # speck healed
-        assert np.array_equal(out[47:54, 54:61], img[47:54, 54:61])  # kept
-
-    def test_dark_only_dab_still_heals_whole_stroke(self):
-        # A dab over ONLY dark content finds no bright outlier -> whole-stroke
-        # fallback: deliberately painting over something dark still removes it.
-        rng = np.random.default_rng(16)
-        img = np.clip(rng.normal(30000, 1500, (100, 100, 3)), 0,
-                      65535).astype(np.uint16)
-        cv2.circle(img, (50, 50), 3, (1500, 1500, 1500), -1)
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.12}
-        out = apply_dust_removal(img, [spot])
-        assert abs(int(out[50, 50, 0]) - 30000) < 9000
-
+class TestAutoSpots:
     def test_auto_spot_halo_heals_without_ring(self):
-        # AI circles hug the speck; its soft halo extends past them. Under
-        # automask an AUTO spot's mask grows over the connected halo (auto
-        # spots skip the stroke clip and the clean-fraction gate), so no
-        # bright ring survives — the healed area reads as plain grain. The
-        # whole-circle engines leave the halo ring (the "auto detect doesn't
-        # work" report).
+        # AI circles hug the speck; the halo extends past them. An AUTO
+        # spot's heal grows over the connected halo (machine circle, not a
+        # user boundary), so no bright ring survives; the whole-circle
+        # engine demonstrably leaves the ring.
         rng = np.random.default_rng(21)
         img = np.clip(rng.normal(30000, 2000, (200, 200, 3)), 0,
                       65535).astype(np.uint16)
@@ -470,34 +483,21 @@ class TestAutoMaskPipeline:
         spot = {"kind": "auto", "pts": [[0.5, 0.5]], "r": 6.0 / 200}
         out = apply_dust_removal(img, [spot])
         win = out[85:116, 85:116].astype(np.float32)
-        assert float(np.percentile(win, 99.5)) - 30000 < 8000  # grain-level
-        # The legacy whole-circle engine demonstrably leaves the halo ring.
+        assert float(np.percentile(win, 99.5)) - 30000 < 8000
         ring_out = apply_dust_removal(img, [spot], method="clone")
         ring_win = ring_out[85:116, 85:116].astype(np.float32)
         assert float(np.percentile(ring_win, 99.5)) - 30000 > 10000
 
-    def test_feather_softens_stroke_border_effect(self):
-        # User feather semantics: the feather softens the STROKE's apply area
-        # — a defect at the stroke border gets less effect than one at the
-        # center. With feather 0 both heal fully.
-        base = np.full((200, 200, 3), 30000, np.uint16)
-
-        def scene():
-            img = base.copy()
-            cv2.circle(img, (100, 100), 2, (62000, 62000, 62000), -1)  # center
-            cv2.circle(img, (113, 100), 2, (62000, 62000, 62000), -1)  # border
-            return img
-
-        spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.08}  # dab r=16
-        img = scene()
-        soft = apply_dust_removal(img, [spot], feather=0.6)  # 60% of r16 ~10px
-        hard = apply_dust_removal(img, [spot], feather=0.0)
-        res_center = int(soft[100, 100, 0]) - 30000
-        res_border = int(soft[100, 113, 0]) - 30000
-        assert res_center < 3000                     # center: full heal
-        assert res_border > res_center + 5000        # border: reduced effect
-        assert int(hard[100, 113, 0]) - 30000 < 3000  # feather 0: full heal
-
+    def test_auto_string_polyline_heals_along_its_path(self):
+        # Detection emits polyline spots for dust strings; the heal follows
+        # the string, not one big circle.
+        img = _grain(base=30000, sigma=1200, h=200, w=200, seed=33)
+        cv2.line(img, (60, 100), (140, 112), (62000, 62000, 62000), 2)
+        spot = {"kind": "auto",
+                "pts": [[0.3, 0.5], [0.5, 0.53], [0.7, 0.56]], "r": 3.0 / 200}
+        out = apply_dust_removal(img, [spot])
+        line_px = out[98:116, 60:141].astype(np.float32)
+        assert float(np.percentile(line_px, 99.5)) - 30000 < 8000
 
 # --- apply_adjustments integration (dust runs before the early-return guard) -
 class TestApplyAdjustmentsIntegration:
