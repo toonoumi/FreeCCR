@@ -256,9 +256,14 @@ class DustRemovalPanel(QWidget):
         self.sensitivity_slider = QSlider(Qt.Horizontal)
         self.sensitivity_slider.setMinimum(0)
         self.sensitivity_slider.setMaximum(100)
-        self.sensitivity_slider.setValue(35)  # conservative default — fewer false positives
+        # Default 75 (net-prob threshold 0.40), calibrated on real Portra
+        # scans: genuine faint dust scores 0.4-0.6 and the old conservative
+        # 35 (threshold 0.64) dropped it ("no dust found"), while detection
+        # counts plateau near 75 with no false-positive blow-up — the
+        # adaptive bright/shape/border gates carry that defense now.
+        self.sensitivity_slider.setValue(75)
         self.sensitivity_slider.setFixedHeight(theme.CONTROL_H)
-        self.sensitivity_value = QLabel("35")
+        self.sensitivity_value = QLabel("75")
         self.sensitivity_value.setFixedWidth(theme.VALUE_COL_W)
         self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         sens_row.addWidget(self.sensitivity_label)
