@@ -2479,6 +2479,11 @@ class ImagePreview(QWidget):
         img.dust_spots.append(
             {"kind": "brush", "pts": pts, "r": float(self._dust_brush_r)})
         self._commit_dust_change(img)
+        # Tell the user when a dab found no dust (it heals nothing by
+        # contract — a silent no-op reads as a broken brush). §3 of
+        # spec/dust-auto-mask.md.
+        if getattr(self, "dust_panel", None) is not None:
+            self.dust_panel.notify_spot_effect(img, img.dust_spots[-1])
 
     def dust_undo_last(self) -> bool:
         img = ccr_backend.get_image_by_index(self.current_idx)

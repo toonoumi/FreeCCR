@@ -362,6 +362,29 @@ class DustRemovalPanel(QWidget):
         if getattr(img, "dust_spots", None):
             self.image_preview._commit_dust_change(img)
 
+    def notify_spot_effect(self, img, spot):
+        """Called after a stroke lands: when a dab finds no bright dust it
+        heals NOTHING (spec/dust-auto-mask.md §1.2) — say so, because a
+        silent no-op reads as a broken brush. Cheap: runs the analysis on
+        the 1080px working image only."""
+        from core.ccr_backend import ccr_backend
+        from core.ccr_processor import dust_spot_effect_px
+        raw = getattr(img, "resized_raw", None)
+        if raw is None:
+            return
+        try:
+            n = dust_spot_effect_px(
+                raw, spot, getattr(ccr_backend, "dust_method", "automask"))
+        except Exception:
+            return
+        if n == 0:
+            self.status_label.setText(
+                "No bright dust found under that stroke — nothing changed. "
+                "Trace along the defect, or switch Settings → Dust removal "
+                "to Whole stroke to replace the area anyway.")
+        else:
+            self.status_label.setText("")
+
     def _on_undo_last(self):
         if not self.image_preview.dust_undo_last():
             self.status_label.setText("Nothing to undo.")

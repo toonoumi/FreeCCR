@@ -466,6 +466,44 @@ class TestHealEngines:
         assert float(np.median(healed)) > 25000  # sky-toned, never black
 
 
+class TestRealScan:
+    """A REAL Portra-400 scan crop (tests/data/real_scan_sky.png — the
+    maintainer's DSC07237.ARW converted through the app's own pipeline):
+    genuine dust specks on the film-edge band plus clean area. Synthetic
+    targets alone repeatedly passed while real scans failed — every gate/
+    threshold change must hold on this asset."""
+
+    @staticmethod
+    def _asset():
+        p = os.path.join(os.path.dirname(__file__), "data",
+                         "real_scan_sky.png")
+        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        assert img is not None and img.dtype == np.uint16
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def test_dab_heals_real_dust(self):
+        from core.ccr_processor import dust_spot_effect_px
+        img = self._asset()
+        h, w = img.shape[:2]
+        for x, y in ((111, 74), (131, 74)):     # real specks
+            spot = {"kind": "brush", "pts": [[x / w, y / h]], "r": 14 / w}
+            assert dust_spot_effect_px(img, spot) > 0   # not a no-op
+            out = apply_dust_removal(img, [spot])
+            ring = img[y-25:y+25, x-25:x+25].astype(np.float32).mean(axis=2)
+            med = float(np.median(ring))
+            before = img[y-6:y+6, x-6:x+6].astype(np.float32).mean(axis=2)
+            after = out[y-6:y+6, x-6:x+6].astype(np.float32).mean(axis=2)
+            assert (after.max() - med) < 0.6 * (before.max() - med)
+
+    def test_clean_dab_on_real_scan_is_noop(self):
+        from core.ccr_processor import dust_spot_effect_px
+        img = self._asset()
+        h, w = img.shape[:2]
+        spot = {"kind": "brush", "pts": [[40 / w, 120 / h]], "r": 14 / w}
+        assert dust_spot_effect_px(img, spot) == 0
+        assert np.array_equal(apply_dust_removal(img, [spot]), img)
+
+
 class TestAutoSpots:
     def test_auto_spot_halo_heals_without_ring(self):
         # AI circles hug the speck; the halo extends past them. An AUTO

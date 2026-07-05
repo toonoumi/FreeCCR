@@ -79,7 +79,9 @@ change since spots replay live through the chosen engine):
 
 Behavior under Auto-mask:
 - **Dab** (click or short drag) around dust → only the dust disappears.
-  Dab over clean area → nothing happens.
+  Dab over clean area → nothing happens, and the panel SAYS SO (a status
+  hint via `dust_spot_effect_px`; a silent no-op reads as a broken brush)
+  with pointers to the trace gesture and the Whole-stroke engine.
 - **Trace** (drag along a hair, path length > ~2.5x brush radius) → the
   whole stroke heals, as in v1.1 (that gesture means "replace exactly
   this").
@@ -119,8 +121,13 @@ thickness-scaled guard + ring, 1px-padded distance transforms):
 2. **Bright outlier seeds** (contract 1):
    `seed = d > max(K*sigma, ABS)` AND brighter than the NEARER anchor
    (dust on the dark side of an edge counts even when darker than the far
-   side). `_AUTOMASK_K=5`, `_AUTOMASK_ABS=900/65535`, sigma = ring median
-   distance to nearest anchor.
+   side), AND part of a connected cluster of `_AUTOMASK_SEED_MIN=4` px —
+   dust is a shape; lone bright grain pixels are noise. `_AUTOMASK_K=4`
+   (calibrated on the maintainer's real Portra scans: smooth-area dust
+   measures 7–40x the local scatter, dust buried in texture 1–3x — locally
+   indistinguishable from texture/clouds, which is the AI detector's job to
+   find), `_AUTOMASK_ABS=900/65535`, sigma = ring median distance to
+   nearest anchor.
 3. **Hysteresis growth**: seeds grow through connected bright pixels above
    `_AUTOMASK_GROW=0.35` of the seed threshold (covers the soft halo; stray
    grain not connected to a seed is dropped). Brush growth is clipped to
@@ -156,12 +163,23 @@ still heals, because the user's gesture said so.
   constrain to) with the tone gate below.
 - Traces + Whole-stroke/Inpaint engines: neighborhood sources as v1.1.
 - **Tone gate (all clone paths)**: reject any candidate whose cloned
-  content's median deviates from the TONE REFERENCE by more than
-  `max(_HEAL_TONE_ABS=8000, _HEAL_TONE_K=12 x scatter)`. Reference = the
-  hole's own clean interior (dabs; the ring can be majority-alien exactly
-  when it matters — a dab beside the black rebate) or the trimmed ring
-  (traces/auto spots, whose holes are all defect). This is what makes
-  cloning the rebate (or its frame-number digits) into sky impossible.
+  content's median deviates from the tone anchor(s) by more than
+  `max(_HEAL_TONE_ABS=8000, _HEAL_TONE_K=12 x scatter)`. Anchoring is
+  STRUCTURAL (defect estimates proved too fragile to anchor on):
+  ring-anchored paths (shrunken dabs, traces, auto spots — holes that are
+  mostly defect) accept only trimmed-ring-compatible sources; the
+  whole-stroke clone engine runs TWO TIERS — sources compatible with the
+  hole's own majority are preferred (a dab beside the dark frame border
+  has a majority-alien ring, and a ring-matched source filled sky with
+  the border's dark interior on a real scan), ring-compatible sources are
+  the fallback (an underscoped dab's hole is mostly defect; the ring is
+  the honest anchor there). This is what makes cloning the rebate (or its
+  frame-number digits) into sky impossible.
+- **Force-fill needs a distinct, and (clone engine) minority, defect**:
+  on real clean-ish content the defect estimate degenerates to the
+  background mode and `like` swallows the hole — forcing it defeated the
+  feather on real scans ("still not feathered"). Traces stay ring-anchored
+  with forcing, preserving the wide-feather no-blend-back guarantee.
 
 ### 5.5 Feather & composite (contract 4)
 
@@ -240,3 +258,19 @@ replay the same stored spots live. No env knobs.
   trace gesture covers deliberate replacement); clean-fraction gates on
   auto spots (their circles are mostly defect BY DESIGN — gating them left
   halo-poisoned whole-circle heals).
+- Real-scan round (2026-07-04) — "no dust found / the stroke does nothing /
+  still not feathered; use a real image as test target." All synthetic
+  tests passed while the maintainer's real Portra scans failed, exposing
+  four gaps: (a) K=5 seeds missed real dust (dust in texture measures only
+  1–3x the local scatter; smooth-area dust 7–40x) → K=4 + 4-px seed
+  clusters, with the honest limit documented: dust buried in texture is
+  locally indistinguishable from clouds and belongs to the AI detector
+  (which finds 10–29 spots per real frame); (b) silent no-op dabs read as
+  a broken brush → panel status hint via `dust_spot_effect_px`; (c) the
+  degenerate dlike force-fill defeated the feather on real content; (d)
+  the tone reference degenerated on clean/edge dabs, letting a ring-matched
+  source fill sky with the dark frame border's interior → structural
+  two-tier anchoring. A crop of the real converted scan is committed as
+  `tests/data/real_scan_sky.png`, and `TestRealScan` pins
+  dab-heals-real-dust + clean-dab-no-op on it — thresholds can no longer
+  drift on synthetic passes alone.

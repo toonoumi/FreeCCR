@@ -3264,7 +3264,15 @@ DUST_METHODS = (
 # only bright outliers are defects; dark content under a dab is image detail
 # and is preserved (deliberate removal = the trace gesture or the
 # Whole-stroke engine).
-_AUTOMASK_K = 5.0          # seed threshold, multiples of the ring's scatter
+_AUTOMASK_K = 4.0          # seed threshold, multiples of the ring's scatter —
+                           # calibrated on real Portra scans: sky/smooth dust
+                           # measures 7-40x, dust buried in texture 1-3x
+                           # (indistinguishable from texture/clouds locally —
+                           # that is the AI detector's job), clouds start
+                           # producing structure below ~4x
+_AUTOMASK_SEED_MIN = 4     # a seed must be a connected cluster of at least
+                           # this many px — dust is a shape, lone bright
+                           # grain pixels are not (keeps clean dabs no-ops)
 _AUTOMASK_GROW = 0.35      # hysteresis: seeds grow through pixels above this
                            # fraction of the seed threshold, so a speck's soft
                            # halo joins the mask and no bright ring survives
@@ -3368,6 +3376,15 @@ def _automask_outliers(img16: np.ndarray, mask: np.ndarray,
                              float(np.mean(m_hi)))
         bright = win_luma > near_luma
         seed = (d_win > thr) & bright & hole
+        if seed.any():
+            # Dust is a SHAPE: require seeds to form connected clusters of
+            # _AUTOMASK_SEED_MIN px — lone bright grain pixels are noise.
+            n_s, lab_s, st_s, _ = cv2.connectedComponentsWithStats(
+                seed.astype(np.uint8), connectivity=8)
+            small = [i for i in range(1, n_s)
+                     if int(st_s[i, cv2.CC_STAT_AREA]) < _AUTOMASK_SEED_MIN]
+            if small:
+                seed &= ~np.isin(lab_s, small)
         if not seed.any():
             continue  # no bright outlier — this component contributes nothing
         # Hysteresis: grow seeds through the weak (halo) threshold so the
@@ -3392,6 +3409,28 @@ def _automask_outliers(img16: np.ndarray, mask: np.ndarray,
     return out if found else None
 
 
+def dust_spot_effect_px(img16: np.ndarray, spot: dict,
+                        method: str = DUST_METHOD_DEFAULT) -> int:
+    """How many pixels `spot` would heal on `img16` (0 = no-op). UI feedback:
+    under automask a dab with no confident bright outlier does NOTHING
+    (spec/dust-auto-mask.md §1.2) — the dust panel uses this to tell the
+    user, instead of a silent nothing that reads as a broken brush."""
+    h, w = img16.shape[:2]
+    mask0 = rasterize_dust_mask([spot], h, w)
+    if not mask0.any():
+        return 0
+    is_brush = spot.get("kind") == "brush"
+    pts = spot.get("pts") or []
+    path_px = sum(float(np.hypot((b[0] - a[0]) * w, (b[1] - a[1]) * h))
+                  for a, b in zip(pts, pts[1:]))
+    r_px = max(1.0, float(spot.get("r", 0.0)) * w)
+    if method != "automask" or (is_brush
+                                and path_px > _TRACE_LEN_R * r_px):
+        return int((mask0 > 0).sum())  # whole-stroke engines / trace gesture
+    heal = _automask_outliers(img16, mask0, clip_to_stroke=is_brush)
+    return 0 if heal is None else int((heal > 0).sum())
+
+
 def _box_sum(integ: np.ndarray, y0: int, x0: int, y1: int, x1: int) -> int:
     """Sum of a uint8 map over [y0:y1, x0:x1] via its cv2.integral image."""
     return int(integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0])
@@ -3412,7 +3451,8 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather: float,
                 dlike: np.ndarray, stroke_out_integ: np.ndarray = None,
-                in_stroke_only: bool = False) -> bool:
+                in_stroke_only: bool = False,
+                tone_anchor: str = "ring") -> bool:
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3501,12 +3541,33 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     # black film rebate), else the trimmed ring (traces/auto spots, whose
     # holes are all defect).
     like = np.abs(hole_px - defect).mean(axis=1) < thr
-    clean_hole = hole_px[~like]
-    tone_pop = clean_hole if clean_hole.shape[0] >= _HEAL_MIN_RING_PX \
-        else dst_ring
-    tone_ref = np.median(tone_pop, axis=0)
-    tone_tol = max(_HEAL_TONE_ABS, _HEAL_TONE_K * float(
-        np.median(np.abs(tone_pop - tone_ref).mean(axis=1))))
+    # Is the estimated defect truly DISTINCT from the surround? On clean-ish
+    # real content the estimate degenerates to (nearly) the background mode:
+    # `like` then swallows most of the hole, and force-filling it would
+    # defeat the user's feather (the "still not feathered on a real image"
+    # report) — so dlike only applies when the defect stands apart.
+    ring_med2 = np.median(dst_ring, axis=0)
+    ring_scat = float(np.median(np.abs(dst_ring - ring_med2).mean(axis=1)))
+    defect_distinct = float(np.abs(defect - ring_med2).mean()) > max(
+        float(_AUTOMASK_ABS), 3.0 * ring_scat)
+    # Tone references for vetting candidate CONTENT. Structural, not
+    # statistical (defect estimates are too fragile to anchor on).
+    # tone_anchor == "ring" (shrunken dabs, traces, auto spots — holes that
+    # are mostly DEFECT): candidates must match the trimmed ring.
+    # tone_anchor == "hole" (whole-stroke clone engine): candidates matching
+    # the hole's own majority are PREFERRED (a dab beside the dark frame
+    # border can have a majority-alien ring, and a source whose ring merely
+    # matched that mix filled sky with the border's dark interior), and
+    # ring-compatible ones are the fallback tier (an underscoped dab's hole
+    # is mostly defect — there the ring is the honest anchor).
+    def _anchor(pop):
+        ref = np.median(pop, axis=0)
+        tol = max(_HEAL_TONE_ABS, _HEAL_TONE_K * float(
+            np.median(np.abs(pop - ref).mean(axis=1))))
+        return ref, tol
+    ring_ref, ring_tol = _anchor(dst_ring)
+    hole_ref, hole_tol = _anchor(hole_px) if tone_anchor == "hole" \
+        else (None, 0.0)
 
     # Candidate source offsets: rings of directions at thickness-scaled
     # distances. The integral-image check rejects any source that touches
@@ -3532,13 +3593,22 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
             # Tone gate FIRST: never clone tonally alien content (the black
             # film rebate / its frame numbers next to sky, the wrong side of
             # an edge), even when it is the only clean candidate left.
-            if float(np.abs(np.median(src[hole], axis=0)
-                            - tone_ref).mean()) > tone_tol:
+            src_tone = np.median(src[hole], axis=0)
+            hole_ok = (hole_ref is not None and float(
+                np.abs(src_tone - hole_ref).mean()) <= hole_tol)
+            ring_ok = float(np.abs(src_tone - ring_ref).mean()) <= ring_tol
+            if not (hole_ok or ring_ok):
                 continue
             diff = src[ring] - dst_ring
             score = float(np.mean(diff * diff))
+            # Hole-anchor-compatible candidates form the preferred tier
+            # (tracked in best_in_*, reusing the in-stroke preference slot
+            # when no stroke constraint is active).
             if best_score is None or score < best_score:
                 best_score, best_src = score, src
+            if hole_ok and stroke_out_integ is None and \
+                    (best_in_score is None or score < best_in_score):
+                best_in_score, best_in_src = score, src
             # Dab contract (spec/dust-auto-mask.md §5.4): the fill is sampled
             # from within the stroke whenever geometrically possible — a
             # candidate whose CLONED subregion (this patch's hole bbox,
@@ -3585,7 +3655,13 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     depth = max(1.0, float(inside.max()))
     fmap[wy0:wy1, wx0:wx1][hole] = \
         int(max(1.0, min(250.0, round(feather * depth))))
-    if like.any():
+    # Force-fill needs a DISTINCT defect, and under the hole-anchored clone
+    # engine also a MINORITY one — when "defect-like" swallows most of a
+    # whole-stroke hole the estimate is degenerate (clean-ish content) and
+    # forcing it would defeat the user's feather. Traces run ring-anchored,
+    # so their wide-feather no-blend-back guarantee is unaffected.
+    if like.any() and defect_distinct and \
+            (tone_anchor != "hole" or float(like.mean()) < 0.5):
         hy, hx = np.nonzero(hole)
         dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
     return True
@@ -3736,7 +3812,9 @@ def _heal_one_spot(work: np.ndarray, spot: dict, inpaint_radius: int,
                 if not _heal_patch(work, labels, i, bbox, half_th, mask_pad,
                                    integ, filled, fmap, feather, dlike,
                                    stroke_out_integ=stroke_out_integ,
-                                   in_stroke_only=in_stroke_only):
+                                   in_stroke_only=in_stroke_only,
+                                   tone_anchor=("hole" if method == "clone"
+                                                else "ring")):
                     # No usable clone source (for a dab: none INSIDE the
                     # stroke) -> diffusion from the hole's own rim, which is
                     # in-stroke by construction for a shrunken dab hole.
