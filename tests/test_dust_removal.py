@@ -134,10 +134,12 @@ class TestApplyDustRemoval:
 
     def test_fallback_still_fills_when_no_clean_source(self):
         # A spot so large no clean source window exists anywhere must fall
-        # back to diffusion inpainting rather than leaving the speck.
+        # back to diffusion inpainting rather than leaving the speck. A
+        # defect this size is beyond the dab's dust scale — whole-stroke
+        # engine territory (the automask dab correctly no-ops on it).
         img = _flat_with_speck(base=30000, speck=60000, cx=50, cy=50, r=30)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.4}
-        out = apply_dust_removal(img, [spot])
+        out = apply_dust_removal(img, [spot], method="clone")
         assert int(out[50, 50, 0]) < 45000  # moved toward the surround
 
     def test_traced_hair_leaves_no_bright_ghost(self):
@@ -213,20 +215,19 @@ class TestApplyDustRemoval:
         assert float(np.abs(core.mean(axis=0) - sky).max()) < 5000
 
     def test_underscoped_dab_keeps_tone(self):
-        # A click smaller than the speck (the small dot ghost): the speck's
-        # edge leaks past the mask but must not lift the fill's tone —
-        # under the automask and whole-stroke engines alike (the tone gate's
-        # reference falls back to the trimmed ring when the hole is all
-        # defect, so the fill still lands on the sky).
+        # A click smaller than the speck (the small dot ghost): under
+        # automask the speck is LARGER than the dab's dust scale, so the dab
+        # is a no-op (bigger brush / trace / whole-stroke are the remedies).
+        # Under the whole-stroke engine the speck's edge leaks past the mask
+        # but must not lift the fill's tone (the small-dot-ghost defense).
         sky = np.array([20000, 25000, 40000], np.float32)
         img = np.broadcast_to(sky.astype(np.uint16), (100, 100, 3)).copy()
         cv2.circle(img, (50, 50), 6, (62000, 60000, 30000), -1)
         spot = {"kind": "brush", "pts": [[0.5, 0.5]], "r": 0.04}  # mask r=4 < speck r=6
-        for method in ("automask", "clone"):
-            out = apply_dust_removal(img, [spot], method=method)
-            center = out[49:52, 49:52].astype(np.float32)
-            center = center.reshape(-1, 3).mean(axis=0)
-            assert float(np.abs(center - sky).max()) < 6000, method
+        assert np.array_equal(apply_dust_removal(img, [spot]), img)
+        out = apply_dust_removal(img, [spot], method="clone")
+        center = out[49:52, 49:52].astype(np.float32).reshape(-1, 3).mean(axis=0)
+        assert float(np.abs(center - sky).max()) < 6000
 
 
 # --- auto-mask contracts (spec/dust-auto-mask.md §1) --------------------------
@@ -502,6 +503,42 @@ class TestRealScan:
         spot = {"kind": "brush", "pts": [[40 / w, 120 / h]], "r": 14 / w}
         assert dust_spot_effect_px(img, spot) == 0
         assert np.array_equal(apply_dust_removal(img, [spot]), img)
+
+    @staticmethod
+    def _load8(name):
+        p = os.path.join(os.path.dirname(__file__), "data", name)
+        img8 = cv2.imread(p)
+        assert img8 is not None
+        return cv2.cvtColor(img8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
+
+    def test_user_reported_crops_heal(self):
+        # The maintainer's own failure crops ("save as test set image"):
+        # a speck on dark background, a faint speck on sky, and a dust
+        # string on sky. A dab over each must act, never no-op.
+        from core.ccr_processor import dust_spot_effect_px
+        for name, cx, cy, r in (("real_speck_dark.png", 34, 29, 18),
+                                ("real_speck_sky.png", 36, 34, 20),
+                                ("real_string_sky.png", 40, 38, 26)):
+            img = self._load8(name)
+            h, w = img.shape[:2]
+            spot = {"kind": "brush", "pts": [[cx / w, cy / h]], "r": r / w}
+            assert dust_spot_effect_px(img, spot) > 0, name
+            assert not np.array_equal(apply_dust_removal(img, [spot]),
+                                      img), name
+
+    def test_user_sky_photo_dabs(self):
+        # The maintainer's faint-sky-dust photo ("test against this"):
+        # dabs over visible specks act; a clean-sky dab is a no-op.
+        from core.ccr_processor import dust_spot_effect_px
+        img = self._load8("real_sky_dust.png")
+        h, w = img.shape[:2]
+        hits = sum(dust_spot_effect_px(
+            img, {"kind": "brush", "pts": [[x / w, y / h]], "r": 16 / w}) > 0
+            for x, y in ((631, 186), (434, 182), (413, 209), (745, 143),
+                         (211, 359), (668, 226)))
+        assert hits >= 5
+        clean = {"kind": "brush", "pts": [[0.35, 0.62]], "r": 16 / w}
+        assert dust_spot_effect_px(img, clean) == 0
 
 
 class TestAutoSpots:

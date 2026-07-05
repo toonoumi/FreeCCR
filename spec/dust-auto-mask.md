@@ -114,27 +114,33 @@ exclusion is each spot's OWN mask only: earlier dust is already healed in
 For each brush-spot component (window/ring construction as `_heal_patch`:
 thickness-scaled guard + ring, 1px-padded distance transforms):
 
-1. **Two-anchor surround model** — 2-means over ring pixels, anchors
-   initialized at the bottom/top luma-decile medians, 2 rounds. Unimodal
-   ring → anchors coincide; bimodal (dab straddling an edge) → the two
-   modes, even for unbalanced splits a median split mis-models.
-2. **Bright outlier seeds** (contract 1):
-   `seed = d > max(K*sigma, ABS)` AND brighter than the NEARER anchor
-   (dust on the dark side of an edge counts even when darker than the far
-   side), AND part of a connected cluster of `_AUTOMASK_SEED_MIN=4` px —
-   dust is a shape; lone bright grain pixels are noise. `_AUTOMASK_K=4`
-   (calibrated on the maintainer's real Portra scans: smooth-area dust
-   measures 7–40x the local scatter, dust buried in texture 1–3x — locally
-   indistinguishable from texture/clouds, which is the AI detector's job to
-   find), `_AUTOMASK_ABS=900/65535`, sigma = ring median distance to
-   nearest anchor.
-3. **Hysteresis growth**: seeds grow through connected bright pixels above
-   `_AUTOMASK_GROW=0.35` of the seed threshold (covers the soft halo; stray
-   grain not connected to a seed is dropped). Brush growth is clipped to
-   the stroke; an AUTO spot's circle is a machine guess, so its growth may
-   follow the halo past the circle (bounded by the analysis window), and
-   auto components use a 2x-thickness ring guard so their own halo doesn't
-   read as a background mode.
+1. **Two-scale white top-hat** (calibrated on the maintainer's real
+   photos — an earlier anchor-distance metric measured plainly visible sky
+   dust at 1–3x its scatter because ring gradients inflated it): residual
+   = luma − morphological opening at the dust scale (`k ≈ 9px` at preview,
+   resolution-scaled) and at the halo scale (`3k`), each centered on its
+   ring median (the opening sits below the local mean). Dust visibility is
+   contrast against the IMMEDIATE background; clouds and gradients are
+   larger than both kernels and cancel by scale, not amplitude; a positive
+   residual IS the white-dust prior and works on either side of an edge.
+2. **Bright outlier seeds** (contract 1): dust-scale residual
+   `> max(K*sigma, ABS)`, in a connected cluster of `_AUTOMASK_SEED_MIN=4`
+   px — dust is a shape; lone bright grain pixels are noise. `_AUTOMASK_K=4`
+   with sigma = MAD-scaled scatter of the dust-scale residual over the
+   ring; `_AUTOMASK_ABS=900/65535`. Real user-visible sky dust measures
+   8–12x sigma under this metric. Auto (AI) spots — machine-vouched — may
+   also seed at the halo scale (their soft cores can exceed the dust
+   kernel).
+3. **Hysteresis growth** by CONDITIONAL DILATION (a plain connected flood
+   percolates through grain): seeds expand kernel-step-wise through pixels
+   above `_AUTOMASK_GROW=0.35` of the seed threshold at either top-hat
+   scale (the halo-scale term additionally gated at 2x its own scatter),
+   bounded to one seed-half-thickness (+buffer) of the seed — halos scale
+   with their defect, which is what stops growth from crawling through
+   bright grain. Brush growth is clipped to the stroke; an AUTO spot's
+   circle is a machine guess, so its growth may follow the halo past the
+   circle, and auto components use a 2x-thickness ring guard so their own
+   halo doesn't skew the ring statistics.
 4. **Buffer**: dilate by `max(1, round(w/1080))` px, clipped to the stroke
    for brush spots.
 5. **No seeds** → brush dab: NO-OP (contract 2); auto spot: no-op as well

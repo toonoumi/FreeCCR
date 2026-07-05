@@ -3359,23 +3359,41 @@ def _automask_outliers(img16: np.ndarray, mask: np.ndarray,
                 & (mask_pad[wy0:wy1, wx0:wx1] == 0))
         if int(ring.sum()) < _HEAL_MIN_RING_PX:
             continue  # no context to judge outliers against
-        win = img16[wy0:wy1, wx0:wx1].astype(np.float32)
-        ring_px = win[ring]
-        m_lo, m_hi = _ring_anchors(ring_px)
-        d_ring = np.minimum(np.abs(ring_px - m_lo).mean(axis=1),
-                            np.abs(ring_px - m_hi).mean(axis=1))
-        thr = max(_AUTOMASK_K * float(np.median(d_ring)), float(_AUTOMASK_ABS))
-        win_luma = win.mean(axis=2)
-        d_lo = np.abs(win - m_lo).mean(axis=2)
-        d_hi = np.abs(win - m_hi).mean(axis=2)
-        d_win = np.minimum(d_lo, d_hi)
-        # Bright-outlier test against the NEARER anchor's luma: dust on the
-        # dark side of an edge is brighter than ITS side even when darker
-        # than the far side.
-        near_luma = np.where(d_lo <= d_hi, float(np.mean(m_lo)),
-                             float(np.mean(m_hi)))
-        bright = win_luma > near_luma
-        seed = (d_win > thr) & bright & hole
+        # WHITE TOP-HAT metric (calibrated on the maintainer's real sky
+        # crops): dust visibility is contrast against the IMMEDIATE local
+        # background, so subtract a morphological-opening background at the
+        # dust scale — bright structures smaller than the kernel remain as
+        # residual regardless of their area fraction. Real user-visible sky
+        # dust measures 8-12x the residual scatter under this metric; an
+        # earlier anchor-distance metric put the same dust at 1-3x because
+        # ring gradients inflated its scatter ("no bright dust found under
+        # that stroke" on plainly visible dust). Clouds and gradients are
+        # LARGER than the kernel, so they cancel by scale, not amplitude;
+        # a positive residual IS the white-dust prior, and it works on
+        # either side of an edge (the opening follows the local side).
+        win_luma = img16[wy0:wy1, wx0:wx1].astype(np.float32).mean(axis=2)
+        k = max(9, int(round(9 * w / 1080.0)) | 1)
+
+        def _tophat(kk):
+            # White top-hat, centered on its ring median: the opening sits
+            # below the local mean, so plain grain carries a positive
+            # baseline — centering makes thresholds measure lift above
+            # NORMAL grain. Straight edges are reconstructed exactly, so an
+            # edge-straddling window shows no false residual.
+            se_ = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))
+            r_ = win_luma - cv2.morphologyEx(win_luma, cv2.MORPH_OPEN, se_)
+            return r_ - float(np.median(r_[ring])), se_
+        d_win, se = _tophat(k)          # dust scale
+        d_wide, _ = _tophat(3 * k)      # soft-halo scale (still << clouds)
+        sigma = 1.4826 * float(np.median(np.abs(d_win[ring]
+                                                - np.median(d_win[ring]))))
+        thr = max(_AUTOMASK_K * sigma, float(_AUTOMASK_ABS))
+        seed = (d_win > thr) & hole
+        if not clip_to_stroke:
+            # Auto (AI) spots are machine-vouched dust: their core may be
+            # wider than the dust-scale kernel (a soft blob the opening
+            # partially reconstructs), so let them seed at the halo scale.
+            seed |= (d_wide > thr) & hole
         if seed.any():
             # Dust is a SHAPE: require seeds to form connected clusters of
             # _AUTOMASK_SEED_MIN px — lone bright grain pixels are noise.
@@ -3389,16 +3407,42 @@ def _automask_outliers(img16: np.ndarray, mask: np.ndarray,
             continue  # no bright outlier — this component contributes nothing
         # Hysteresis: grow seeds through the weak (halo) threshold so the
         # speck's soft edge joins the mask; weak pixels not connected to any
-        # seed (stray grain) are dropped. Auto spots may grow past the
-        # detected circle (see docstring); brush strokes never leave it.
-        weak = (d_win > _AUTOMASK_GROW * thr) & bright
+        # seed (stray grain) are dropped. Growth listens at BOTH top-hat
+        # scales: a soft halo wider than the dust kernel is only patchily
+        # visible to the small opening, while the halo-scale one sees it —
+        # and since seeds never fire on clouds/gradients, growth cannot
+        # start there. Auto spots may grow past the detected circle (see
+        # docstring); brush strokes never leave it.
+        sigma_w = 1.4826 * float(np.median(np.abs(d_wide[ring]
+                                                  - np.median(d_wide[ring]))))
+        weak = (d_win > _AUTOMASK_GROW * thr) | \
+               (d_wide > max(_AUTOMASK_GROW * thr, 2.0 * sigma_w))
+        # Halos scale with their defect: allow growth only within one
+        # seed-half-thickness (+buffer) of the seed — this is what stops the
+        # lift criterion from crawling through bright grain tendrils while
+        # still covering a soft halo proportional to its core.
+        seed_u8 = seed.astype(np.uint8)
+        seed_halfth = float(cv2.distanceTransform(seed_u8, cv2.DIST_L2,
+                                                  3).max())
+        near_seed = cv2.distanceTransform(
+            (1 - seed_u8), cv2.DIST_L2, 3) <= max(2.0, seed_halfth) + buf
+        weak &= near_seed
         if clip_to_stroke:
             weak &= hole
         weak |= seed
-        n_w, lab_w = cv2.connectedComponents(weak.astype(np.uint8),
-                                             connectivity=8)
-        keep_ids = np.unique(lab_w[seed])
-        grown = np.isin(lab_w, keep_ids) & weak
+        # The top-hat residual is noisy, so a plain connected flood can
+        # percolate through bright grain — grow by CONDITIONAL DILATION
+        # instead: expand the seeds through weak pixels one kernel step at a
+        # time, a few iterations. Wide soft halos are reached; grain chains
+        # die out within a step or two.
+        grown = seed.astype(np.uint8)
+        for _ in range(4):
+            nxt = cv2.dilate(grown, se).astype(bool) & weak
+            nxt = nxt.astype(np.uint8)
+            if int(nxt.sum()) == int(grown.sum()):
+                break
+            grown = nxt
+        grown = grown.astype(bool)
         shrunk = cv2.dilate(grown.astype(np.uint8) * 255, kernel)
         if clip_to_stroke:
             # The heal never reaches outside what the user painted (matching
@@ -3527,7 +3571,12 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     dh = np.abs(hole_px - ring_med).mean(axis=1)
     defect = np.median(hole_px[dh >= np.percentile(dh, 75.0)], axis=0)
     d_def = np.abs(ring_px - defect).mean(axis=1)
-    thr = 0.5 * float(np.percentile(d_def, 95.0))
+    # Cap the leak-trim threshold at the absolute tone scale: true leak is
+    # COLORED LIKE the defect (small d_def), while on a bimodal ring (a dab
+    # straddling an edge, bright speck on the bright side) the p95 rule
+    # scales with the FAR cluster and would swallow the whole near-defect
+    # side — legitimate context, 15k+ away from the defect color.
+    thr = min(0.5 * float(np.percentile(d_def, 95.0)), float(_HEAL_TONE_ABS))
     keep = d_def >= thr
     if int(keep.sum()) < _HEAL_MIN_RING_PX:
         return False
@@ -3601,26 +3650,23 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                 continue
             diff = src[ring] - dst_ring
             score = float(np.mean(diff * diff))
-            # Hole-anchor-compatible candidates form the preferred tier
-            # (tracked in best_in_*, reusing the in-stroke preference slot
-            # when no stroke constraint is active).
             if best_score is None or score < best_score:
                 best_score, best_src = score, src
-            if hole_ok and stroke_out_integ is None and \
-                    (best_in_score is None or score < best_in_score):
-                best_in_score, best_in_src = score, src
-            # Dab contract (spec/dust-auto-mask.md §5.4): the fill is sampled
-            # from within the stroke whenever geometrically possible — a
-            # candidate whose CLONED subregion (this patch's hole bbox,
-            # shifted) lies fully inside the original selection wins over
-            # ANY out-of-stroke candidate. Small dabs whose clean margin
-            # cannot host a clone window fall through to the nearest
-            # tone-compatible content (the gate above already vetted it).
+            # Preferred tier (spec/dust-auto-mask.md §5.4), tracked in
+            # best_in_*: for a dab, candidates whose CLONED subregion (this
+            # patch's hole bbox, shifted) lies fully inside the original
+            # selection beat ANY out-of-stroke candidate; a dab whose clean
+            # margin cannot host a window falls through to the nearest
+            # tone-compatible content (already vetted above). For the
+            # whole-stroke clone engine (no stroke constraint), the
+            # preferred tier is hole-anchor compatibility instead.
             if in_stroke_only and stroke_out_integ is not None:
-                if _box_sum(stroke_out_integ, by0 + dy, bx0 + dx,
-                            by1 + dy, bx1 + dx) == 0 and \
-                        (best_in_score is None or score < best_in_score):
-                    best_in_score, best_in_src = score, src
+                pref = _box_sum(stroke_out_integ, by0 + dy, bx0 + dx,
+                                by1 + dy, bx1 + dx) == 0
+            else:
+                pref = hole_ok and stroke_out_integ is None
+            if pref and (best_in_score is None or score < best_in_score):
+                best_in_score, best_in_src = score, src
 
     if best_in_src is not None:
         best_src = best_in_src
