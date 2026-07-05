@@ -3263,7 +3263,7 @@ def _feather_alpha(mask: np.ndarray, fmap: np.ndarray) -> np.ndarray:
 def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
                 half_th: float, mask_pad: np.ndarray, integ: np.ndarray,
                 filled: np.ndarray, fmap: np.ndarray, feather_px: int,
-                dlike: np.ndarray) -> bool:
+                dlike: np.ndarray, src_off=None):
     """Fill one hole patch (a compact component, or one segment of a long
     stroke) by cloning the best-matching nearby clean patch.
 
@@ -3274,9 +3274,14 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     so gradients continue through the patch while its grain is kept verbatim).
     `bbox` = (bx0, by0, bx1, by1) tight bounds of THIS patch's hole pixels;
     `half_th` = the component's half-thickness (max distance transform), its
-    local scale. Writes the healed hole pixels into `filled` and returns True,
-    or returns False when no fully clean, in-bounds source window exists
-    (caller falls back to diffusion inpaint for this patch).
+    local scale. Writes the healed hole pixels into `filled` and returns the
+    chosen source-window offset `(dy, dx)` (relative to the match window, in
+    this buffer's pixels), or None when no fully clean, in-bounds source
+    window exists (caller falls back to diffusion inpaint for this patch).
+    `src_off`: a pre-planned offset to REUSE (the resolution-stable replay,
+    see apply_dust_removal); taken verbatim when it still lands on a clean
+    in-bounds window, otherwise the normal search runs (plan drift from
+    mask-raster rounding — rare).
 
     Everything local is keyed off the thickness, never the bbox: a traced
     hair's bbox can span half the frame while the stroke is a few px wide.
@@ -3313,7 +3318,7 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     ring = ((away > guard) & (away <= pad)
             & (mask_pad[wy0:wy1, wx0:wx1] == 0))
     if int(ring.sum()) < _HEAL_MIN_RING_PX:
-        return False  # boxed in by other spots — no context to match against
+        return None  # boxed in by other spots — no context to match against
 
     dst = img16[wy0:wy1, wx0:wx1].astype(np.float32)
 
@@ -3341,38 +3346,52 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     thr = 0.5 * float(np.percentile(d_def, 95.0))
     keep = d_def >= thr
     if int(keep.sum()) < _HEAL_MIN_RING_PX:
-        return False
+        return None
     ring[:] = False
     ring[ry[keep], rx[keep]] = True
     dst_ring = dst[ring]
 
-    # Candidate source offsets: rings of directions at thickness-scaled
-    # distances. The integral-image check rejects any source that touches
-    # dust, so offsets need only clear the local thickness — a long stroke
-    # heals from the clean strip right beside it (requiring bbox-diagonal
-    # clearance forced long strokes into the ghost-prone diffusion fallback).
-    # The window diagonal stays as a last-resort ring for compact spots.
-    d_base = 2.0 * half_th + pad + 2.0
-    d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
-    best_score, best_src = None, None
-    for fi, d in enumerate((d_base, 2.0 * d_base, 4.0 * d_base, d0)):
-        for k in range(_HEAL_ANGLES):
-            ang = 2.0 * np.pi * (k + 0.35 * fi) / _HEAL_ANGLES
-            dy = int(round(d * np.sin(ang)))
-            dx = int(round(d * np.cos(ang)))
-            sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
-            if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
-                continue
-            if _box_sum(integ, sy0, sx0, sy1, sx1) != 0:
-                continue  # source window touches dust (this or another spot)
-            src = img16[sy0:sy1, sx0:sx1].astype(np.float32)
-            diff = src[ring] - dst_ring
-            score = float(np.mean(diff * diff))
-            if best_score is None or score < best_score:
-                best_score, best_src = score, src
+    def _source_at(dy, dx):
+        sy0, sx0, sy1, sx1 = wy0 + dy, wx0 + dx, wy1 + dy, wx1 + dx
+        if sy0 < 0 or sx0 < 0 or sy1 > h or sx1 > w:
+            return None
+        if _box_sum(integ, sy0, sx0, sy1, sx1) != 0:
+            return None  # source window touches dust (this or another spot)
+        return img16[sy0:sy1, sx0:sx1].astype(np.float32)
+
+    best_score, best_src, best_off = None, None, None
+    if src_off is not None:
+        # Resolution-stable replay: reuse the offset the plan chose at the
+        # canonical scale instead of re-searching on this buffer's pixels.
+        src = _source_at(int(src_off[0]), int(src_off[1]))
+        if src is not None:
+            best_src = src
+            best_off = (int(src_off[0]), int(src_off[1]))
+    if best_src is None:
+        # Candidate source offsets: rings of directions at thickness-scaled
+        # distances. The integral-image check rejects any source that touches
+        # dust, so offsets need only clear the local thickness — a long stroke
+        # heals from the clean strip right beside it (requiring bbox-diagonal
+        # clearance forced long strokes into the ghost-prone diffusion
+        # fallback). The window diagonal stays as a last-resort ring for
+        # compact spots.
+        d_base = 2.0 * half_th + pad + 2.0
+        d0 = float(np.hypot(wy1 - wy0, wx1 - wx0))
+        for fi, d in enumerate((d_base, 2.0 * d_base, 4.0 * d_base, d0)):
+            for k in range(_HEAL_ANGLES):
+                ang = 2.0 * np.pi * (k + 0.35 * fi) / _HEAL_ANGLES
+                dy = int(round(d * np.sin(ang)))
+                dx = int(round(d * np.cos(ang)))
+                src = _source_at(dy, dx)
+                if src is None:
+                    continue
+                diff = src[ring] - dst_ring
+                score = float(np.mean(diff * diff))
+                if best_score is None or score < best_score:
+                    best_score, best_src, best_off = score, src, (dy, dx)
 
     if best_src is None:
-        return False
+        return None
 
     # Smooth per-channel tone correction from the ring differences: normalized
     # Gaussian convolution interpolates (dst - src) on the ring into the hole,
@@ -3405,7 +3424,26 @@ def _heal_patch(img16: np.ndarray, labels: np.ndarray, comp: int, bbox: tuple,
     if like.any():
         hy, hx = np.nonzero(hole)
         dlike[wy0:wy1, wx0:wx1][hy[like], hx[like]] = 255
-    return True
+    return best_off
+
+
+# Canonical planning scale for the heal = the preview's long side. Buffers at
+# or below it (preview, thumbnails) plan on themselves; larger buffers (hi-res
+# zoom, export) REPLAY the plan computed at this scale so they reproduce the
+# preview's healing structure. See apply_dust_removal.
+_DUST_PLAN_LONG = 1080
+
+
+def _nearest_plan_record(plan, cyn, cxn, tol=0.06):
+    """The plan record whose segment centroid is nearest to (cyn, cxn) in
+    normalized coords, or None when nothing lies within `tol` (a component
+    that only rasterizes at the finer scale — sub-pixel at plan resolution)."""
+    best, best_d = None, tol
+    for rec in plan:
+        d = ((rec[0] - cyn) ** 2 + (rec[1] - cxn) ** 2) ** 0.5
+        if d < best_d:
+            best, best_d = rec, d
+    return best
 
 
 def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
@@ -3432,7 +3470,43 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     masked pixels change, the rest of the frame is bit-for-bit untouched.
     Returns a NEW uint16 array; img16 is never mutated. No-op (returns img16
     unchanged) when there are no spots or the rasterized mask is empty.
+
+    Resolution consistency: the heal PLAN — stroke segmentation, each
+    segment's chosen source window, and the diffusion-fallback decisions —
+    is content-adaptive, so re-deriving it independently per resolution
+    picked visibly different fills at the 1080px preview vs the full-res
+    export ("the preview and the final don't look the same"). Buffers larger
+    than the canonical scale therefore plan on an INTER_AREA downscale at
+    _DUST_PLAN_LONG (matching the preview) and replay that plan with all
+    geometry scaled: same segments, same source patches, same fallbacks —
+    the export heals with the same structure the user approved on screen.
     """
+    if not spots:
+        return img16
+    h, w = img16.shape[:2]
+    long_side = max(h, w)
+    if long_side <= _DUST_PLAN_LONG:
+        return _heal_impl(img16, spots, inpaint_radius, feather)
+    scale = long_side / float(_DUST_PLAN_LONG)
+    pw = max(2, int(round(w / scale)))
+    ph = max(2, int(round(h / scale)))
+    small = cv2.resize(img16, (pw, ph), interpolation=cv2.INTER_AREA)
+    plan = []
+    _heal_impl(small, spots, inpaint_radius, feather, collect=plan)
+    return _heal_impl(img16, spots, inpaint_radius, feather,
+                      plan=plan, scale_up=scale)
+
+
+def _heal_impl(img16: np.ndarray, spots, inpaint_radius: int,
+               feather: float, plan=None, collect=None,
+               scale_up: float = 1.0) -> np.ndarray:
+    """apply_dust_removal's engine at ONE resolution. With `collect` (a list),
+    appends a plan record per heal segment: (cy_norm, cx_norm, offset) where
+    offset is the chosen source displacement normalized over (h, w), or None
+    for a diffusion fallback. With `plan` (+ `scale_up` = this buffer's size
+    over the plan scale), segments reuse the planned offsets/fallbacks
+    instead of re-searching, and the pixel-based geometry (segment size,
+    Telea radius) scales by `scale_up` so segmentation matches the plan's."""
     if not spots:
         return img16
     h, w = img16.shape[:2]
@@ -3453,6 +3527,11 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
     feather_px = max(1, int(round(float(feather) * w)))
     fmap = np.ones((h, w), np.uint8)
     dlike = np.zeros((h, w), np.uint8)
+    # Pixel-based knobs scale with the buffer (relative to the plan scale) so
+    # a stroke splits into the SAME segments here as it did in the plan, and
+    # the diffusion fallback blurs over the same image fraction.
+    seg_min = max(8, int(round(_HEAL_SEG_MIN * max(1.0, scale_up))))
+    telea_r = max(1, int(round(inpaint_radius * max(1.0, scale_up))))
     for i in range(1, n):  # 0 is background
         x0 = int(stats[i, cv2.CC_STAT_LEFT])
         y0 = int(stats[i, cv2.CC_STAT_TOP])
@@ -3464,7 +3543,7 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         hole0 = np.zeros((ch + 2, cw + 2), np.uint8)
         hole0[1:-1, 1:-1] = comp_win
         half_th = float(cv2.distanceTransform(hole0, cv2.DIST_L2, 3).max())
-        seg = max(_HEAL_SEG_MIN, int(round(_HEAL_SEG_THICKNESS * half_th)))
+        seg = max(seg_min, int(round(_HEAL_SEG_THICKNESS * half_th)))
         for ty in range(y0, y0 + ch, seg):
             for tx in range(x0, x0 + cw, seg):
                 sub = comp_win[ty - y0:ty - y0 + seg, tx - x0:tx - x0 + seg]
@@ -3473,8 +3552,26 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
                 ys, xs = np.nonzero(sub)
                 bbox = (tx + int(xs.min()), ty + int(ys.min()),
                         tx + int(xs.max()) + 1, ty + int(ys.max()) + 1)
-                if not _heal_patch(img16, labels, i, bbox, half_th, mask_pad,
-                                   integ, filled, fmap, feather_px, dlike):
+                cyn = (ty + float(ys.mean())) / h
+                cxn = (tx + float(xs.mean())) / w
+                src_off, forced_fb = None, False
+                if plan is not None:
+                    rec = _nearest_plan_record(plan, cyn, cxn)
+                    if rec is not None:
+                        if rec[2] is None:
+                            forced_fb = True  # the plan chose diffusion here
+                        else:
+                            src_off = (int(round(rec[2][0] * h)),
+                                       int(round(rec[2][1] * w)))
+                off = None
+                if not forced_fb:
+                    off = _heal_patch(img16, labels, i, bbox, half_th,
+                                      mask_pad, integ, filled, fmap,
+                                      feather_px, dlike, src_off=src_off)
+                if collect is not None:
+                    collect.append((cyn, cxn, None if off is None
+                                    else (off[0] / h, off[1] / w)))
+                if off is None:
                     fallback[ty:ty + sub.shape[0],
                              tx:tx + sub.shape[1]][sub] = 255
                     # No defect estimate on this path — cap the fade by the
@@ -3486,7 +3583,7 @@ def apply_dust_removal(img16: np.ndarray, spots, inpaint_radius: int = 3,
         # Diffusion fallback (cv2.inpaint supports 8-bit only).
         bgr8 = cv2.cvtColor(cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0),
                             cv2.COLOR_RGB2BGR)
-        telea8 = cv2.inpaint(bgr8, fallback, inpaint_radius, cv2.INPAINT_TELEA)
+        telea8 = cv2.inpaint(bgr8, fallback, telea_r, cv2.INPAINT_TELEA)
         telea16 = cv2.cvtColor(telea8, cv2.COLOR_BGR2RGB).astype(np.uint16) * 257
         fb = fallback > 0
         filled[fb] = telea16[fb]

@@ -357,13 +357,30 @@ def apply_dust_removal(img16, spots, inpaint_radius=3) -> np.ndarray: # uint16 R
      in — the soft fade only happens across clean rim pixels. Outside the
      mask alpha is exactly 0 — away from any spot `out == img16`
      bit-for-bit.
+  7. **Resolution-stable plan**: the heal's content-adaptive decisions —
+     stroke segmentation, each segment's chosen source offset, and the
+     diffusion-fallback verdicts — are computed ONCE at the canonical
+     preview scale (`_DUST_PLAN_LONG` = 1080 long side) and REPLAYED on
+     larger buffers with all pixel geometry scaled (segment size, Telea
+     radius, offsets normalized over width/height; segments matched by
+     nearest normalized centroid). Re-deriving the plan per resolution let
+     the SSD argmin flip between scales, so the export healed from visibly
+     different patches than the preview the user approved ("the preview and
+     the final don't look the same"). Buffers at or below the canonical
+     scale (the preview itself, thumbnails, the detect source) plan on
+     themselves — their behavior is unchanged. A replayed offset that no
+     longer lands on a clean window (mask-raster rounding — rare) falls back
+     to the local search for that segment; the tone membrane and feather
+     composite always run natively, so fills stay 16-bit sharp.
   - Identity fast-path: empty `spots` or all-zero mask → return `img16` unchanged.
   - Returns a new `uint16` RGB array; `img16` is never mutated (non-destructive).
-  - The chosen source patch may differ between preview and export resolution
-    (scoring at different scales); both are plausible clean fills, and tone is
-    anchored to the same ring either way.
+  - Residual preview↔export differences are grain/resampling plus a ≤1 px rim
+    registration from mask rounding at hard edges — the healed structure is
+    identical (regression-tested in `TestResolutionConsistency`).
   - Cost: per-component window work only (no full-frame 8-bit convert unless a
-    fallback fires); ≤ the old Telea path even at export res with 100 spots.
+    fallback fires). Planning searches at 1080 px and native execution only
+    validates + clones, so a full-res export heals FASTER than the old
+    native-resolution search (+ one INTER_AREA downscale of the frame).
 
 ### 5.3 AI detection (`src/core/dust_detect.py`)
 A self-contained module wrapping the ONNX BOPBTL detector. **`onnxruntime` is
