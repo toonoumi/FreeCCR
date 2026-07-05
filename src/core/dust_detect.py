@@ -49,7 +49,13 @@ BRIGHT_RING = 3         # px ring around a blob used as the "surround" reference
 # cap — long-but-thin is not a border/content blob); only THICK elongated
 # detections are treated as structure and dropped. Frame-touching strings are
 # dropped (film borders are bright thin lines too).
-STRING_MAX_TH = 3.5     # px (detect res): max minAreaRect short side of a string
+STRING_MAX_TH = 9.0     # px (detect res): max distance-transform thickness of
+                        # a string's PROBABILITY blob — the U-Net bleeds ~3px
+                        # around the defect, so a real 2px string measures
+                        # ~6-9px here (a real curved hair measured 8.3).
+                        # Genuinely thick structure lines measure wider still,
+                        # and the adaptive bright gate is the primary
+                        # structure defense anyway.
 STRING_STEP = 8         # px between polyline waypoints along a string
 
 _session = None          # cached ort.InferenceSession
@@ -255,15 +261,20 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
             surround_med, scatter = comp_luma, 0.0
         if comp_luma - surround_med < max(BRIGHT_ABS_MIN, BRIGHT_K * scatter):
             continue  # not bright against its surround → not film dust
-        # Shape: true elongation/thickness from the rotated min-area rect
-        # (bbox aspect misreads diagonal strings as compact).
-        ys_c, xs_c = np.nonzero(labels[top:top + ch, left:left + cw] == i)
-        rect_pts = np.column_stack([xs_c + left, ys_c + top]).astype(np.float32)
-        rw, rh = cv2.minAreaRect(rect_pts)[1]
-        long_side, short_side = max(rw, rh) + 1.0, min(rw, rh) + 1.0
-        is_string = (long_side / short_side > MAX_ASPECT
-                     and short_side <= STRING_MAX_TH + 1.0)
-        if long_side / short_side > MAX_ASPECT and not is_string:
+        # Shape: thickness from the DISTANCE TRANSFORM and length from
+        # area/thickness — both curvature-independent. (minAreaRect misread
+        # curved strings: a curl's rotated-rect short side spans the bow,
+        # not the 2px thickness, so real dust strings were dropped as
+        # "structure"; bbox aspect misread diagonal strings as compact.)
+        comp_mask = labels[top:top + ch, left:left + cw] == i
+        padm = np.zeros((ch + 2, cw + 2), np.uint8)
+        padm[1:-1, 1:-1] = comp_mask
+        half_th = float(cv2.distanceTransform(padm, cv2.DIST_L2, 3).max())
+        thickness = max(1.0, 2.0 * half_th - 1.0)
+        length_est = area / thickness
+        elongated = length_est > MAX_ASPECT * thickness
+        is_string = elongated and thickness <= STRING_MAX_TH
+        if elongated and not is_string:
             continue  # thick elongated = structure, not a dust string
         if area > max_blob and not is_string:
             continue  # big compact blob — film border / real content
@@ -273,8 +284,10 @@ def prob_to_spots(prob: np.ndarray, luma: np.ndarray, sensitivity: float,
             if (left <= 1 or top <= 1
                     or left + cw >= w - 1 or top + ch >= h - 1):
                 continue
-            pts = _string_waypoints(rect_pts)
-            r_px = short_side / 2.0 + SPOT_PAD
+            ys_c, xs_c = np.nonzero(comp_mask)
+            pts = _string_waypoints(np.column_stack(
+                [xs_c + left, ys_c + top]).astype(np.float32))
+            r_px = half_th + SPOT_PAD
             spots.append({
                 "kind": kind,
                 "pts": [[float(px) / w, float(py) / h] for px, py in pts],

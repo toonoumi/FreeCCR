@@ -649,7 +649,10 @@ class TestProbToSpots:
         # elongated detections are structure (bike frame / horizon) and drop.
         prob = np.zeros((100, 100), np.float32)
         prob[50, 10:40] = 0.9       # 1x30 thin line -> dust string, kept
-        prob[10:17, 40:90] = 0.9    # 7x50 thick elongated -> structure, dropped
+        # 14x60 thick elongated -> structure, dropped. (Thickness is judged
+        # on the PROBABILITY blob, which bleeds ~3px around a real defect —
+        # so the structure bar sits well above a real string's ~6-9px blob.)
+        prob[10:24, 30:90] = 0.9
         prob[80:83, 80:83] = 0.9    # 3x3 compact speck -> kept
         spots = dust_detect.prob_to_spots(prob, _bright_luma(prob), 60)
         assert len(spots) == 2
