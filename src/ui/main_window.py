@@ -273,6 +273,17 @@ class MainWindow(QMainWindow):
         self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
         self.undo_shortcut.activated.connect(self.undo_last_action)
 
+        # Mode hotkeys: C = crop, D = dust removal, W = white-balance picker.
+        # WindowShortcut context (like the rotate/undo keys) so they fire no
+        # matter which panel has focus. Each handler mirrors the corresponding
+        # toolbar/panel button and is a no-op without a current image.
+        self.crop_shortcut = QShortcut(QKeySequence("C"), self)
+        self.crop_shortcut.activated.connect(self._shortcut_toggle_crop)
+        self.dust_shortcut = QShortcut(QKeySequence("D"), self)
+        self.dust_shortcut.activated.connect(self._shortcut_toggle_dust)
+        self.wb_pick_shortcut = QShortcut(QKeySequence("W"), self)
+        self.wb_pick_shortcut.activated.connect(self._shortcut_wb_pick)
+
 
         # Non-blocking startup update check (2s network timeout, off-thread)
         self._update_worker = UpdateCheckWorker(self)
@@ -404,6 +415,39 @@ class MainWindow(QMainWindow):
         self.crop_panel.setVisible(False)
         if not self.dust_panel.isVisible():
             self.sliders_panel.setVisible(True)
+
+    # --- Mode hotkeys (C / D / W) ----------------------------------------
+    def _shortcut_toggle_crop(self):
+        """C: toggle Crop mode. Dust must be left first — the dust and crop
+        panels both cover the sliders, and only the toggle chokepoints restore
+        the panel stack correctly."""
+        if self.image_preview.current_idx is None:
+            return
+        if self.image_preview.dust_mode:
+            self.toggle_dust_removal(False)
+        self.toggle_crop_panel(not self.image_preview.crop_mode)
+
+    def _shortcut_toggle_dust(self):
+        """D: toggle Dust Removal mode. Leave crop first (commits it, like the
+        Crop panel's Done) so the panel stack swaps cleanly."""
+        if self.image_preview.current_idx is None:
+            return
+        if not self.image_preview.dust_mode and self.image_preview.crop_mode:
+            self.toggle_crop_panel(False)
+        self.toggle_dust_removal()
+
+    def _shortcut_wb_pick(self):
+        """W: toggle the white-balance eyedropper — a press arms it (next click
+        picks a neutral point), a second press disarms it. Gated exactly like
+        the WB Picker button — converted image only, never while crop/dust mode
+        owns the canvas (which already clears any armed pick)."""
+        if self.image_preview.current_idx is None:
+            return
+        if self.image_preview.dust_mode or self.image_preview.crop_mode:
+            return
+        if not self.sliders_panel.wb_picker_btn.isEnabled():
+            return
+        self.sliders_panel._on_pick_neutral_point()
 
     def _sync_dust_action(self, checked: bool):
         action = getattr(self.image_preview, "dust_action", None)

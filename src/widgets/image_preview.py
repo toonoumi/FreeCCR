@@ -1569,6 +1569,12 @@ class ImagePreview(QWidget):
         self.view.bwpoint_mode = None
         self.view.setCursor(_eyedropper_cursor() if enabled else Qt.ArrowCursor)
 
+    def is_wb_pick_active(self):
+        """Whether the WB eyedropper is currently armed (awaiting a click).
+        The click handler and every mode switch clear it, so this reads the
+        live state — the toggle in _on_pick_neutral_point relies on it."""
+        return bool(self.view.wb_pick_mode)
+
     # --- Zoom & hi-res detail --------------------------------------------
     # Wheel zooms relative to the fitted view (Lightroom-style). Once the
     # 1080px preview is displayed past its native resolution, a hi-res

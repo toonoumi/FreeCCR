@@ -1501,10 +1501,17 @@ class SlidersPanel(QWidget):
         self.set_temporary_hint("Synced selected settings to all images!", duration=4000)
 
     def _on_pick_neutral_point(self):
-        if hasattr(self, 'image_preview') and self.image_preview:
-            self.image_preview.set_wb_pick_mode(True)
-            self.set_temporary_hint(
-                "<b>Auto WB:</b> Click a neutral gray or white point on the image.", duration=8000)
+        if not (hasattr(self, 'image_preview') and self.image_preview):
+            return
+        # Toggle: a second press — this button or the W hotkey — disarms the
+        # eyedropper instead of re-arming it.
+        if self.image_preview.is_wb_pick_active():
+            self.image_preview.set_wb_pick_mode(False)
+            self.set_temporary_hint("WB picker cancelled.", duration=2000)
+            return
+        self.image_preview.set_wb_pick_mode(True)
+        self.set_temporary_hint(
+            "<b>Auto WB:</b> Click a neutral gray or white point on the image.", duration=8000)
 
     def _on_crop_clicked(self):
         if not (hasattr(self, 'image_preview') and self.image_preview):
