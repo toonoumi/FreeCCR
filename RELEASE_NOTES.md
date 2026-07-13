@@ -7,9 +7,10 @@
 -->
 ## What's New
 
-**FreeCCR 1.2.2** — a macOS color-accuracy fix.
+**FreeCCR 1.3.0** — a reversal-film look, and faster mode switching.
 
-- **Previews now match exports on wide-gamut Macs.** On Display P3 screens, the app preview rendered more saturated than the exported TIFF/JPEG — the export was always correct (ICC-tagged and color-managed), but Qt's preview window wasn't color-matched to the display. Every window is now tagged sRGB so macOS color-matches the whole app to the display profile, and preview colors match what you export.
+- **White sprocket holes / clear film (reversal look).** A new Settings toggle paints the sprocket holes and clear film border white instead of black after conversion — matching how reversal (slide) film actually looks when scanned. Available for any image with a Black Point set; on for preview, zoom, and export alike.
+- **Keyboard shortcuts for Crop, Dust Removal, and White Balance.** Press **C** to toggle Crop, **D** to toggle Dust Removal, and **W** to toggle the White Balance eyedropper — no more reaching for the mouse to switch modes. The WB eyedropper button also now toggles off on a second click, matching the new hotkey.
 
 ## Install
 
