@@ -71,6 +71,44 @@ def _file_signature(file_path: str) -> dict:
     return {"size": st.st_size, "mtime": st.st_mtime}
 
 
+# --- 3-way merge (trichrome) composite keys ------------------------------
+# A merged image has no single backing file — it is synthesized from three
+# source RAWs (red, green, blue). Its edits are cataloged under a COMPOSITE key
+# derived from all three sources, validated against a COMPOSITE signature (each
+# source's size+mtime). The "merge:" prefix keeps it disjoint from every
+# single-file key (a real path never starts with it), so a merge and a plain
+# open of the red RAW never share a record. See spec/merge-catalog-persistence.md.
+MERGE_KEY_PREFIX = "merge:"
+
+
+def _is_merge_key(key: str) -> bool:
+    return isinstance(key, str) and key.startswith(MERGE_KEY_PREFIX)
+
+
+def _merge_key(sources) -> str:
+    """Composite catalog key for a merge: the ordered (R, G, B) source file keys
+    joined under the merge prefix. Order matters; the merge always sorts inputs
+    by filename, so the same three files always yield the same key."""
+    return MERGE_KEY_PREFIX + "|".join(_file_key(p) for p in sources)
+
+
+def _catalog_key_for_image(img) -> str:
+    """The catalog key this image's edits belong under: the composite merge key
+    for a trichrome-merged image (never a single source file's key, which a
+    later plain open would then read as its own edits), else the file key."""
+    if getattr(img, "is_merged", False) and getattr(img, "merge_sources", None):
+        return _merge_key(img.merge_sources)
+    return _file_key(img.file_path)
+
+
+def _merge_signature(sources) -> dict:
+    """Composite freshness signature: each source's size+mtime in (R, G, B)
+    order. A change to ANY source invalidates the cataloged edits — they were
+    computed against those exact three frames. Raises OSError if a source is
+    unreadable (callers treat that as 'no valid entry')."""
+    return {"sources": [_file_signature(p) for p in sources]}
+
+
 def _ci_to_json(ci):
     if ci is None:
         return None
@@ -149,9 +187,19 @@ def _areas_from_json(areas):
 
 def serialize_image(img) -> dict:
     """Everything needed to bring a CCRImage back to its current state."""
+    is_merged = bool(getattr(img, "is_merged", False))
     return {
         "display_name": img.display_name,
         "is_duplicate": bool(getattr(img, "is_duplicate", False)),
+        # 3-way merge (trichrome): a merged image restores by re-merging its
+        # three sources, so its identity travels with the state. Harmless for a
+        # normal image (is_merged False, merge_sources None). merge_demosaic is
+        # a restore fallback — a re-import prefers the current global setting.
+        "is_merged": is_merged,
+        "merge_sources": (list(img.merge_sources)
+                          if is_merged and getattr(img, "merge_sources", None)
+                          else None),
+        "merge_demosaic": bool(getattr(img, "merge_demosaic", True)),
         "slice_group": getattr(img, "slice_group", None),
         "slice_parent": _slice_parent_to_json(getattr(img, "slice_parent", None)),
         "source_ops": [[int(rot), list(region)] for rot, region in img.source_ops],
@@ -236,21 +284,25 @@ def update_for_images(images, path: str = None, preserved: dict = None) -> None:
     list order). Entries for files not currently loaded are kept.
 
     preserved: states of ACTUAL images removed from the list this session,
-    {file_path: {"signature": sig, "entries": {display_name: state}}} —
+    {catalog_key: {"signature": sig, "entries": {display_name: state}}} —
     removal must not lose their stored edits, so they are merged back into
-    the records alongside the loaded images."""
+    the records alongside the loaded images. Keys are FINAL catalog keys
+    (a file key or a "merge:" composite key), used as-is here."""
     catalog = load_catalog(path)
     grouped = {}
     for img in images:
-        # Merged (trichrome) images are session-only — never persist their edits
-        # under a source RAW's per-file key. See spec/three-way-rgb-merge.md.
-        if getattr(img, "is_merged", False):
+        # A trichrome-merged image is keyed by the composite of its three
+        # sources, NOT by any one source RAW's file key (which a later plain
+        # open would misread as its own edits). A merged image that somehow
+        # lost its sources can't be keyed safely, so skip it rather than
+        # corrupt a file record. See spec/merge-catalog-persistence.md.
+        if getattr(img, "is_merged", False) and not getattr(img, "merge_sources", None):
             continue
-        grouped.setdefault(_file_key(img.file_path), []).append(img)
+        grouped.setdefault(_catalog_key_for_image(img), []).append(img)
     preserved_by_key = {}
-    for file_path, record in (preserved or {}).items():
+    for key, record in (preserved or {}).items():
         if record.get("entries"):
-            preserved_by_key[_file_key(file_path)] = record
+            preserved_by_key[key] = record
     now = time.time()
     for fkey, imgs in grouped.items():
         states = [serialize_image(im) for im in imgs]
@@ -273,7 +325,9 @@ def update_for_images(images, path: str = None, preserved: dict = None) -> None:
                           if getattr(im, "_catalog_signature", None)), None)
         if signature is None:
             try:
-                signature = _file_signature(imgs[0].file_path)
+                signature = (_merge_signature(imgs[0].merge_sources)
+                             if _is_merge_key(fkey)
+                             else _file_signature(imgs[0].file_path))
             except OSError:
                 continue
         catalog["files"][fkey] = {
@@ -308,11 +362,13 @@ def remove_duplicate_entries(removals: dict, path: str = None) -> None:
     discarded copy does not resurrect on the next open. Entries of actual
     images are never touched here.
 
-    removals: {file_path: set of duplicate display_names removed}"""
+    removals: {catalog_key: set of duplicate display_names removed}, where the
+    key is a raw source path (normalized here) or a "merge:" composite key
+    (used as-is)."""
     catalog = load_catalog(path)
     changed = False
-    for file_path, names in removals.items():
-        fkey = _file_key(file_path)
+    for key, names in removals.items():
+        fkey = key if _is_merge_key(key) else _file_key(key)
         record = catalog["files"].get(fkey)
         if not isinstance(record, dict):
             continue
@@ -349,6 +405,29 @@ def entries_for_path(file_path: str, path: str = None, catalog_data: dict = None
     if (stored.get("size") != signature["size"]
             or abs(stored.get("mtime", 0) - signature["mtime"]) > 1.0):
         return None
+    return record.get("images") or None
+
+
+def entries_for_merge(sources, path: str = None, catalog_data: dict = None):
+    """Catalog entries for a trichrome merge of `sources` (R, G, B order), or
+    None when absent or when ANY source changed since it was cataloged (stale
+    edits must not be misapplied). The merge analogue of entries_for_path:
+    validates the composite signature source-by-source."""
+    catalog = catalog_data if catalog_data is not None else load_catalog(path)
+    record = catalog["files"].get(_merge_key(sources))
+    if not isinstance(record, dict) or not record:
+        return None
+    try:
+        current = _merge_signature(sources)["sources"]
+    except OSError:
+        return None
+    stored = (record.get("signature") or {}).get("sources") or []
+    if len(stored) != len(current):
+        return None
+    for s, c in zip(stored, current):
+        if (s.get("size") != c["size"]
+                or abs(s.get("mtime", 0) - c["mtime"]) > 1.0):
+            return None
     return record.get("images") or None
 
 
@@ -392,10 +471,69 @@ def create_images_for_path(file_path: str, path: str = None,
     return images
 
 
-def _restore_image(file_path: str, state: dict):
+def create_images_for_merge(sources, merge_demosaic: bool = True,
+                            path: str = None, catalog_data: dict = None) -> list:
+    """Create the merged CCRImage(s) for a trichrome triplet, restoring
+    cataloged state (conversion, adjustments, crop, dust, slices, duplicates)
+    when the same three frames were merged and edited before.
+
+    All-or-nothing per triplet, like create_images_for_path: any entry failure
+    falls back to a fresh merge, flagged so the next save preserves the stored
+    record. `sources` are the live (R, G, B) paths of THIS import (they equal
+    the stored ones because the composite key matched); `merge_demosaic` is the
+    current global setting the fresh/re-merge decode uses."""
+    from core.ccr_image import CCRImage
+    signature = None
+    try:
+        signature = _merge_signature(sources)
+        entries = entries_for_merge(sources, path, catalog_data)
+    except Exception as e:
+        logging.warning(f"Merge catalog lookup failed for {list(sources)}: {e}")
+        entries = None
+
+    def _plain(restore_failed=False):
+        img = CCRImage(sources[0], is_merged=True, merge_sources=list(sources),
+                       merge_demosaic=merge_demosaic)
+        img._catalog_signature = signature
+        if restore_failed:
+            img._catalog_restore_failed = True
+        return [img]
+
+    if not entries:
+        return _plain()
+    images = []
+    for state in entries:
+        try:
+            images.append(_restore_image(sources[0], state,
+                                         live_merge_sources=list(sources),
+                                         live_merge_demosaic=merge_demosaic))
+        except Exception as e:
+            logging.warning(f"Merge catalog restore failed for "
+                            f"{list(sources)}: {e}")
+            return _plain(restore_failed=True)
+    for img in images:
+        img._catalog_signature = signature
+    return images
+
+
+def _restore_image(file_path: str, state: dict, live_merge_sources=None,
+                   live_merge_demosaic=None):
     from core.ccr_image import CCRImage
     source_ops = [(int(rot), tuple(region))
                   for rot, region in (state.get("source_ops") or [])]
+    # Rebuild a trichrome-merged image when the stored state is one: every
+    # re-read (preview/zoom/export) then re-merges the three sources and applies
+    # source_ops. Prefer the live sources/demosaic (current import + current
+    # global setting) over the stored copies. See spec/merge-catalog-persistence.md.
+    is_merged = bool(state.get("is_merged", False))
+    if is_merged:
+        merge_sources = (list(live_merge_sources) if live_merge_sources
+                         else (state.get("merge_sources") or None))
+        merge_demosaic = (live_merge_demosaic if live_merge_demosaic is not None
+                          else bool(state.get("merge_demosaic", True)))
+    else:
+        merge_sources = None
+        merge_demosaic = True
     img = CCRImage(
         file_path,
         adjustment_settings=dict(state.get("adjustment_settings") or {}),
@@ -409,6 +547,9 @@ def _restore_image(file_path: str, state: dict):
         slice_parent=(dict(state["slice_parent"])
                       if state.get("slice_parent") else None),
         areas=_areas_from_json(state.get("areas")),
+        is_merged=is_merged,
+        merge_sources=merge_sources,
+        merge_demosaic=merge_demosaic,
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])

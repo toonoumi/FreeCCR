@@ -37,13 +37,12 @@ the existing Positive-mode toggle.
 
 - **No image registration / alignment.** The three frames are assumed already
   aligned (tripod, static scene). Misalignment is the user's responsibility.
-- **No cross-session catalog persistence of merged images.** A merged image is a
-  session artifact derived from 3 files; it is excluded from the per-file edit
-  catalog on every serialization path. Re-importing re-merges fresh.
-  *Consequence (intended):* edits to a merged image (reference frame, conversion,
-  crop, sliders, dust) are **not saved between sessions**. A first-merge hint
-  states this. (Follow-up: key the catalog on a composite of the 3 source
-  signatures.)
+- ~~**No cross-session catalog persistence of merged images.**~~ *(Implemented —
+  see `spec/merge-catalog-persistence.md`.)* Originally a merged image was a
+  session artifact excluded from the catalog on every serialization path. It is
+  now persisted under a **composite key of the 3 source signatures**, so edits
+  (reference frame, conversion, crop, sliders, dust) survive between sessions and
+  are restored when the same 3 frames are merged again (and none has changed).
 - **Bayer (RGGB) and monochrome sensors.** "Do not demosaic / take one channel"
   applies to a 2×2 Bayer CFA (collapse each tile → one pixel) and, even more
   naturally, to a monochrome sensor (no CFA at all — the whole grayscale frame is

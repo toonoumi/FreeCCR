@@ -504,7 +504,9 @@ class TestResetSlice:
         s2_idx = next(i for i, im in enumerate(ccr_backend.images)
                       if im.display_name == "scan_s2.png")
         ccr_backend.remove_images_by_indices([s2_idx])  # preserved
-        assert path in ccr_backend._catalog_preserved
+        # _catalog_preserved is keyed by the final catalog key (the normalized
+        # file key for a normal image; a "merge:" composite for a merged one).
+        assert catalog._file_key(path) in ccr_backend._catalog_preserved
         # Reset via a surviving sibling
         s1_idx = next(i for i, im in enumerate(ccr_backend.images)
                       if im.display_name == "scan_s1.png")

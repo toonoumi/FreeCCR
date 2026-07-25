@@ -255,21 +255,35 @@ class CCRBackend:
         if current:
             self.file_paths = [t[0] for t in triplets]
 
+        # Read the catalog ONCE for the batch so a re-merge of the same three
+        # frames restores its saved edits. See spec/merge-catalog-persistence.md.
+        from core.catalog import create_images_for_merge, load_catalog
+        try:
+            catalog_data = load_catalog()
+        except Exception:
+            catalog_data = None
+
         def load_triplet(order, triplet):
             if cancel_flag and cancel_flag():
                 return None
             red = triplet[0]
             try:
-                img = CCRImage(red, is_merged=True, merge_sources=list(triplet),
-                               merge_demosaic=self.rgb_merge_demosaic)
+                # Restores cataloged state (conversion/adjustments/crop/dust/
+                # slices) when this exact triplet was edited before; a fresh
+                # merge otherwise. Returns a LIST (>1 when the merge was sliced
+                # or duplicated last session).
+                imgs = create_images_for_merge(
+                    list(triplet), merge_demosaic=self.rgb_merge_demosaic,
+                    catalog_data=catalog_data)
             except Exception as e:
                 print(f"3-way merge failed for {os.path.basename(red)}: {e}")
                 self.last_merge_error = (
                     "3-way RGB merge could not process some frames:\n\n"
                     f"{e}")
                 return None
-            img._catalog_order = order
-            return img
+            for i, im in enumerate(imgs):
+                im._catalog_order = i   # keep slice order within a triplet
+            return imgs
 
         max_workers = min(8, os.cpu_count() or 1)
         results = []
@@ -277,9 +291,9 @@ class CCRBackend:
             for order, triplet in enumerate(triplets):
                 if cancel_flag and cancel_flag():
                     break
-                img = load_triplet(order, triplet)
-                if img is not None:
-                    results.append(img)
+                imgs = load_triplet(order, triplet)
+                if imgs:
+                    results.extend(imgs)
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(load_triplet, order, triplet): order
@@ -287,9 +301,9 @@ class CCRBackend:
                 for future in concurrent.futures.as_completed(futures):
                     if cancel_flag and cancel_flag():
                         break
-                    img = future.result()
-                    if img is not None:
-                        results.append(img)
+                    imgs = future.result()
+                    if imgs:
+                        results.extend(imgs)
 
         # User cancelled mid-load: suppress any decode error a worker recorded
         # for the aborted import (the pool above has joined, so every write has
@@ -1491,22 +1505,25 @@ class CCRBackend:
         if not removed_images:
             return 0
         try:
-            from core.catalog import serialize_image, remove_duplicate_entries
+            from core.catalog import (serialize_image, remove_duplicate_entries,
+                                       _catalog_key_for_image)
             duplicate_removals = {}
             for img in removed_images:
-                # Merged (trichrome) images are session-only: never serialize
-                # their edits into a source RAW's per-file record (the red
-                # exposure's key), which would corrupt that file on a later
-                # plain open. See spec/three-way-rgb-merge.md.
-                if getattr(img, "is_merged", False):
+                # A trichrome-merged image keys by the composite of its three
+                # sources (not any one source RAW's file key — which a later
+                # plain open would misread as its own edits). A merged image
+                # that lost its sources can't be keyed safely, so leave it
+                # session-only. See spec/merge-catalog-persistence.md.
+                if getattr(img, "is_merged", False) and not getattr(img, "merge_sources", None):
                     continue
+                key = _catalog_key_for_image(img)
                 if getattr(img, "is_duplicate", False):
                     if img.display_name:
-                        duplicate_removals.setdefault(img.file_path,
-                                                      set()).add(img.display_name)
+                        duplicate_removals.setdefault(key, set()).add(
+                            img.display_name)
                 else:
                     record = self._catalog_preserved.setdefault(
-                        img.file_path,
+                        key,
                         {"signature": getattr(img, "_catalog_signature", None),
                          "entries": {}})
                     record["entries"][img.display_name] = serialize_image(img)
@@ -1941,15 +1958,18 @@ class CCRBackend:
         self.images.insert(insert_at, parent)
         # Drop preserved catalog entries for members that were earlier
         # removed (as actuals): otherwise update_for_images would merge those
-        # stale slices back in and resurrect them on the next open.
-        self._purge_preserved_slice_round(template.file_path, subtree)
+        # stale slices back in and resurrect them on the next open. Key by the
+        # final catalog key (composite for a merged template, file key else),
+        # matching how removal preserved them.
+        from core.catalog import _catalog_key_for_image
+        self._purge_preserved_slice_round(_catalog_key_for_image(template), subtree)
         print(f"Reset slice: {len(members)} slice(s) of "
               f"{os.path.basename(template.file_path)} replaced by "
               f"{parent_name or os.path.basename(template.file_path)}")
         return insert_at
 
-    def _purge_preserved_slice_round(self, file_path, groups) -> None:
-        record = self._catalog_preserved.get(file_path)
+    def _purge_preserved_slice_round(self, catalog_key, groups) -> None:
+        record = self._catalog_preserved.get(catalog_key)
         if not record:
             return
         entries = record.get("entries", {})
@@ -1958,7 +1978,7 @@ class CCRBackend:
         for name in stale:
             del entries[name]
         if not entries:
-            self._catalog_preserved.pop(file_path, None)
+            self._catalog_preserved.pop(catalog_key, None)
 
     def set_white_point(self, bgr_tuple):
         self.white_point_bgr = bgr_tuple

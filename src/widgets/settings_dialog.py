@@ -258,8 +258,8 @@ class SettingsDialog(QDialog):
             "own channel — then converted as a negative. "
             "RAW only (Bayer or monochrome); the selected count must be a "
             "multiple of 3. "
-            "Applies to the next import only; merged-image edits are not saved "
-            "between sessions."))
+            "Applies to the next import only. Your edits to a merged image are "
+            "saved and restored the next time you merge the same three frames."))
         detail_row = QHBoxLayout()
         detail_row.setSpacing(theme.GAP_BTN)
         detail_row.addWidget(QLabel("Merge detail:"))
