@@ -46,6 +46,30 @@ RAW_EXTENSIONS = frozenset({
 # Number of source frames per merged image (red, green, blue).
 MERGE_GROUP_SIZE = 3
 
+# Marker stamped into the Software tag of a FreeCCR-generated 3-way-merge linear
+# TIFF (see ccr_backend.bake_merged_to_linear_tiff). It lets such a file be
+# re-opened while 3-way merge mode is ON without toggling the mode off: the
+# loader recognises a marked TIFF and loads it as a normal image instead of
+# treating it as a (RAW) merge input. See spec/merge-linear-tiff-replace.md.
+FREECCR_MERGE_TIFF_MARKER = "FreeCCR:3-way-RGB-merge-linear-v1"
+
+
+def is_freeccr_merge_tiff(path) -> bool:
+    """True when `path` is a TIFF FreeCCR wrote as a baked 3-way-merge result
+    (carries FREECCR_MERGE_TIFF_MARKER in its Software tag). Reads only the TIFF
+    header; a non-TIFF, unreadable, or unmarked file returns False."""
+    if os.path.splitext(str(path))[1].lower() not in (".tif", ".tiff"):
+        return False
+    try:
+        import tifffile
+        from core.ccr_processor import safe_unicode_path
+        with tifffile.TiffFile(safe_unicode_path(str(path))) as tf:
+            tag = tf.pages[0].tags.get("Software")
+            value = tag.value if tag is not None else ""
+        return isinstance(value, str) and FREECCR_MERGE_TIFF_MARKER in value
+    except Exception:
+        return False
+
 
 def is_raw_path(path: str) -> bool:
     """True when the file extension is a RAW format this module can merge."""

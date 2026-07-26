@@ -48,6 +48,12 @@ class CCRBackend:
         # import (CCRImage.merge_demosaic); toggling affects the NEXT import.
         # Persisted by MainWindow. See spec/trichrome-demosaic-mode.md.
         self.rgb_merge_demosaic: bool = True
+        # Opt-in: after a successful merge import, bake each merged image to a
+        # full-resolution linear TIFF, PERMANENTLY delete its three source RAWs,
+        # and reload the list from the TIFFs (flatten a trichrome shoot to one
+        # archival file per frame). Global, persisted by MainWindow; the delete
+        # is always gated by a UI confirmation. See spec/merge-linear-tiff-replace.md.
+        self.rgb_merge_replace: bool = False
         # Last merge-import rejection (bad count / non-RAW / non-Bayer / decode
         # failure), set by the loader and surfaced by the UI after load, then
         # cleared. Reset at the top of every load so it never goes stale.
@@ -118,9 +124,14 @@ class CCRBackend:
         # abandoned loader thread clobbering a newer load.
         self._load_generation = 0
 
-    def load_images_from_files(self, file_paths: List[str], cancel_flag=None) -> int:
+    def load_images_from_files(self, file_paths: List[str], cancel_flag=None,
+                               force_no_merge: bool = False) -> int:
         """Load files (with catalog restore). Returns the number of FILES
-        that produced at least one image (a sliced file yields several)."""
+        that produced at least one image (a sliced file yields several).
+
+        force_no_merge bypasses the 3-way merge branch even when rgb_merge_mode
+        is on — used to reload the linear TIFFs produced by the merge-replace
+        flow (they are normal negatives, not RAW). See spec/merge-linear-tiff-replace.md."""
         self._load_generation += 1
         gen = self._load_generation
         self.images.clear()
@@ -144,8 +155,23 @@ class CCRBackend:
 
         # 3-way RGB merge: handle the whole batch on a dedicated path (sort,
         # validate multiple-of-3 + RAW, group into triplets, merge each).
-        if self.rgb_merge_mode:
-            return self._load_merged_triplets(file_paths, cancel_flag, gen)
+        # force_no_merge skips this so a merge-replace reload loads its TIFFs.
+        if self.rgb_merge_mode and not force_no_merge:
+            from core import ccr_merge
+            # Files we previously baked carry a marker so they re-open as normal
+            # images even in merge mode (no need to toggle merge off). See
+            # spec/merge-linear-tiff-replace.md.
+            passthrough = [p for p in file_paths
+                           if ccr_merge.is_freeccr_merge_tiff(p)]
+            if passthrough:
+                marked = set(passthrough)
+                to_merge = [p for p in file_paths if p not in marked]
+                if to_merge:   # mixed: merge the RAWs, load the baked TIFFs too
+                    return self._load_merged_triplets(
+                        to_merge, cancel_flag, gen, passthrough_paths=passthrough)
+                # every file is a baked merge TIFF → fall through to a normal load
+            else:
+                return self._load_merged_triplets(file_paths, cancel_flag, gen)
 
         # Read the catalog ONCE for the whole batch — per-file reads would
         # re-parse the entire JSON N times across the loader threads.
@@ -231,13 +257,18 @@ class CCRBackend:
         self.file_paths = [img.file_path for img in results]
         return True
 
-    def _load_merged_triplets(self, file_paths: List[str], cancel_flag=None, gen=None) -> int:
+    def _load_merged_triplets(self, file_paths: List[str], cancel_flag=None, gen=None,
+                              passthrough_paths=None) -> int:
         """3-way RGB merge load: sort by filename, validate (multiple of 3, all
         RAW), group into (red, green, blue) triplets, and merge each into one
         CCRImage (in parallel). Returns the number of merged images produced. A
         validation failure records last_merge_error and loads nothing; a per-
         triplet decode failure (e.g. non-Bayer sensor) is recorded and skipped.
-        See spec/three-way-rgb-merge.md."""
+        See spec/three-way-rgb-merge.md.
+
+        passthrough_paths are FreeCCR-baked merge TIFFs (marked) selected in the
+        same import: they are NOT merge inputs but are loaded as normal images
+        alongside the freshly merged triplets. See spec/merge-linear-tiff-replace.md."""
         from core import ccr_merge
 
         ordered = ccr_merge.sort_for_merge(file_paths)
@@ -251,9 +282,10 @@ class CCRBackend:
             return 0
 
         triplets = ccr_merge.group_into_triplets(ordered)
-        # Progress bar in merged units: total = number of triplets (not 3N files).
+        # Progress bar in merged units: triplet count + any passthrough TIFFs.
         if current:
-            self.file_paths = [t[0] for t in triplets]
+            self.file_paths = ([t[0] for t in triplets]
+                               + list(passthrough_paths or []))
 
         # Read the catalog ONCE for the batch so a re-merge of the same three
         # frames restores its saved edits. See spec/merge-catalog-persistence.md.
@@ -304,6 +336,22 @@ class CCRBackend:
                     imgs = future.result()
                     if imgs:
                         results.extend(imgs)
+
+        # Marked FreeCCR merge TIFFs selected alongside the RAWs: load them as
+        # normal images (with catalog restore) so a mixed import opens them
+        # without toggling merge mode off. See spec/merge-linear-tiff-replace.md.
+        if passthrough_paths:
+            from core.catalog import create_images_for_path
+            for p in passthrough_paths:
+                if cancel_flag and cancel_flag():
+                    break
+                try:
+                    imgs = create_images_for_path(p, catalog_data=catalog_data)
+                    for order, im in enumerate(imgs):
+                        im._catalog_order = order
+                    results.extend(imgs)
+                except Exception as e:
+                    print(f"Failed to load merge TIFF {os.path.basename(p)}: {e}")
 
         # User cancelled mid-load: suppress any decode error a worker recorded
         # for the aborted import (the pool above has joined, so every write has
@@ -1264,14 +1312,19 @@ class CCRBackend:
             except Exception as e:
                 print(f"Failed to convert image at index {idx}: {e}")
 
-    def _export_merged_linear(self, image_obj, output_path: str) -> None:
+    def _export_merged_linear(self, image_obj, output_path: str,
+                              mark: bool = False) -> None:
         """Write the raw trichrome combination as an untagged 16-bit linear
         TIFF: what merge_raw_channels produced at full canonical resolution,
         plus FRAMING only — the slice chain and the user crop (which is
         defined in the sliced frame's space, so source_ops must accompany
         it). NO orientation/conversion/adjustments/colour management; an
         axis-aligned crop is a bit-exact sub-array, an angled crop (or a
-        slice rotation) interpolates. See spec/trichrome-linear-tiff-export.md."""
+        slice rotation) interpolates. See spec/trichrome-linear-tiff-export.md.
+
+        mark=True stamps the FreeCCR merge marker into the Software tag (used by
+        the replace-originals bake) so the file re-opens as a normal image even
+        with 3-way merge mode on. See spec/merge-linear-tiff-replace.md."""
         from core import ccr_merge
         from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
         merged, _full = ccr_merge.merge_raw_channels(
@@ -1282,10 +1335,121 @@ class CCRBackend:
         merged = apply_crop_to_image(merged, getattr(image_obj, "crop_rect", None),
                                      getattr(image_obj, "crop_angle", 0.0) or 0.0)
         out = os.path.splitext(output_path)[0] + ".tiff"
+        extra = {"software": ccr_merge.FREECCR_MERGE_TIFF_MARKER} if mark else {}
+        # predictor=True (horizontal differencing, TIFF Predictor 2) decorrelates
+        # adjacent pixels before deflate — still fully lossless and universally
+        # readable (libtiff/OpenCV/tifffile), but ~1.3–2x smaller on 16-bit
+        # continuous-tone data than plain deflate, which barely compresses it.
         if not safe_tifffile_imwrite(out, merged, photometric="rgb",
-                                     compression="deflate"):
+                                     compression="deflate", predictor=True, **extra):
             raise IOError(f"Failed to save image to {out}")
         print(f"Linear merge saved to {out}")
+
+    def _linear_tiff_output_path(self, image_obj) -> str:
+        """Where a merged image's replacement linear TIFF is written: next to its
+        red source, named after the merged display name, with a numeric suffix if
+        that name is already taken (never overwrites an existing file)."""
+        red = image_obj.merge_sources[0]
+        folder = os.path.dirname(red)
+        stem = os.path.splitext(image_obj.display_name
+                                or os.path.basename(red))[0]
+        out = os.path.join(folder, stem + ".tiff")
+        n = 2
+        while os.path.exists(out):
+            out = os.path.join(folder, f"{stem}_{n}.tiff")
+            n += 1
+        return out
+
+    def _verify_linear_tiff(self, out: str, image_obj) -> None:
+        """Confirm a just-written linear TIFF is a real, non-empty uint16 RGB
+        image BEFORE its source RAWs (the only copy) are deleted. Raises on any
+        mismatch. See spec/merge-linear-tiff-replace.md."""
+        import numpy as np
+        import tifffile
+        from core.ccr_processor import safe_unicode_path
+        if not os.path.exists(out) or os.path.getsize(out) <= 0:
+            raise IOError(f"linear TIFF not written or empty: {out}")
+        with tifffile.TiffFile(safe_unicode_path(out)) as tf:
+            series = tf.series[0]
+            shape = tuple(series.shape)
+            dtype = np.dtype(series.dtype)
+        if (dtype != np.uint16 or len(shape) != 3 or shape[2] != 3
+                or shape[0] <= 0 or shape[1] <= 0):
+            raise IOError(f"linear TIFF failed verification "
+                          f"(shape={shape}, dtype={dtype}): {out}")
+
+    def bake_merged_to_linear_tiff(self, images=None, cancel_flag=None,
+                                   progress_cb=None) -> dict:
+        """Write each merged image as a full-resolution 16-bit linear TIFF next
+        to its red source, VERIFY it, then PERMANENTLY delete the source RAWs of
+        every image whose TIFF was written and verified. Destructive — the caller
+        MUST confirm first.
+
+        A source is deleted only after its replacement exists and reads back
+        valid, and only when EVERY merged image referencing it succeeded (shared-
+        source safety). Cancelling deletes nothing and removes any TIFF already
+        written, leaving the session exactly as it was.
+
+        Returns {"tiff_paths", "deleted", "failures": [(name, reason)],
+        "cancelled": bool}. See spec/merge-linear-tiff-replace.md."""
+        imgs = [im for im in (self.images if images is None else images)
+                if getattr(im, "is_merged", False)
+                and getattr(im, "merge_sources", None)]
+        total = len(imgs)
+        written = []            # (image_obj, tiff_path) — TIFF verified on disk
+        failures = []           # (name, reason)
+        bad_sources = set()     # sources of failed images — never delete these
+        cancelled = False
+        for i, im in enumerate(imgs):
+            if cancel_flag and cancel_flag():
+                cancelled = True
+                break
+            name = im.display_name or os.path.basename(im.file_path)
+            if progress_cb:
+                progress_cb(i, total, name)
+            try:
+                out = self._linear_tiff_output_path(im)
+                self._export_merged_linear(im, out, mark=True)
+                out = os.path.splitext(out)[0] + ".tiff"   # writer normalises ext
+                self._verify_linear_tiff(out, im)
+            except Exception as e:
+                print(f"Linear TIFF replace failed for {name}: {e}")
+                failures.append((name, str(e)))
+                bad_sources.update(os.path.normpath(s) for s in im.merge_sources)
+                continue
+            written.append((im, out))
+        if progress_cb:
+            progress_cb(total, total, "")
+
+        if cancelled:
+            # Abort cleanly: no source is ever deleted, and the TIFFs written so
+            # far are removed so the folder is left untouched.
+            for _im, out in written:
+                try:
+                    os.remove(out)
+                except OSError:
+                    pass
+            return {"tiff_paths": [], "deleted": [], "failures": failures,
+                    "cancelled": True}
+
+        # Delete the sources of successfully baked images, skipping any source
+        # also referenced by a FAILED image (never orphan a frame's only copy).
+        to_delete = []
+        for im, _out in written:
+            for s in im.merge_sources:
+                sp = os.path.normpath(s)
+                if sp not in bad_sources:
+                    to_delete.append(sp)
+        deleted = []
+        for sp in dict.fromkeys(to_delete):    # unique, order-preserving
+            try:
+                if os.path.exists(sp):
+                    os.remove(sp)
+                    deleted.append(sp)
+            except OSError as e:
+                failures.append((os.path.basename(sp), f"could not delete: {e}"))
+        return {"tiff_paths": [out for _im, out in written], "deleted": deleted,
+                "failures": failures, "cancelled": False}
 
     def export_image_by_index(self, idx: int, output_path: str, jpg_output: bool = False,
                               jpg_quality: int = 95, max_long_side: int = None,

@@ -141,8 +141,10 @@ def _export_merged_linear(self, image_obj, output_path: str) -> None:
 `apply_crop_to_image` is a no-op for `crop_rect is None`, so the uncropped,
 unsliced export remains byte-identical to round 2.
 
-- `compression="deflate"` is lossless (bit-exact values), matching the normal
-  TIFF export; no `iccprofile` argument → untagged.
+- `compression="deflate", predictor=True` is lossless (bit-exact values); the
+  horizontal predictor (TIFF Predictor 2) decorrelates adjacent pixels so deflate
+  compresses 16-bit continuous-tone data ~1.3–2× (plain deflate barely shrinks
+  it). Universally readable (libtiff/OpenCV/tifffile). No `iccprofile` → untagged.
 - The 3 rawpy decodes per image are the documented cost of any merged-image
   re-read (spec/three-way-rgb-merge.md, Performance note); the parallel export
   pool amortises across images exactly as it does for normal exports.

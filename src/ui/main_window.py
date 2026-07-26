@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel
+from PySide6.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QProgressDialog
 from PySide6.QtGui import QIcon, QShortcut, QKeySequence
 from PySide6.QtCore import (Qt, QEvent, QThread, Signal, QObject, QSettings,
                             QTimer, QMetaObject, Q_ARG)
@@ -88,10 +88,14 @@ class UpdateAvailableDialog(QDialog):
 
 class ImageLoaderWorker(QObject):
     finished = Signal()
-    def __init__(self, folder=None, files=None):
+    def __init__(self, folder=None, files=None, force_no_merge=False):
         super().__init__()
         self.folder = folder
         self.files = files
+        # Load the files as normal images even when 3-way merge is on (used to
+        # reload the linear TIFFs a merge-replace produced). See
+        # spec/merge-linear-tiff-replace.md.
+        self.force_no_merge = force_no_merge
         self._cancelled = False
 
     def cancel(self):
@@ -101,8 +105,34 @@ class ImageLoaderWorker(QObject):
         if self.folder:
             ccr_backend.load_images_from_folder(self.folder, cancel_flag=lambda: self._cancelled)
         elif self.files:
-            ccr_backend.load_images_from_files(self.files, cancel_flag=lambda: self._cancelled)
+            ccr_backend.load_images_from_files(
+                self.files, cancel_flag=lambda: self._cancelled,
+                force_no_merge=self.force_no_merge)
         self.finished.emit()
+
+
+class MergeReplaceWorker(QObject):
+    """Runs the destructive bake-and-delete for the merge-replace flow off the
+    GUI thread: writes each merged image's linear TIFF, verifies it, then deletes
+    the source RAWs. Emits progress and the result dict. See
+    spec/merge-linear-tiff-replace.md."""
+    progress = Signal(int, int, str)   # done, total, current name
+    finished = Signal(object)          # result dict from bake_merged_to_linear_tiff
+
+    def __init__(self, images):
+        super().__init__()
+        self.images = images
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        result = ccr_backend.bake_merged_to_linear_tiff(
+            images=self.images,
+            cancel_flag=lambda: self._cancelled,
+            progress_cb=lambda d, t, n: self.progress.emit(d, t, n))
+        self.finished.emit(result)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -192,6 +222,15 @@ class MainWindow(QMainWindow):
         # res). Captured per image at import. See spec/trichrome-demosaic-mode.md.
         ccr_backend.rgb_merge_demosaic = self._settings.value(
             "import/rgb_merge_demosaic", True, type=bool)
+        # Restore the "replace originals with linear TIFF" opt-in. When on with
+        # merge mode, a successful merge import offers (with confirmation) to bake
+        # each frame to a linear TIFF and delete the source RAWs. See
+        # spec/merge-linear-tiff-replace.md.
+        ccr_backend.rgb_merge_replace = self._settings.value(
+            "import/rgb_merge_replace", False, type=bool)
+        # Guards re-entrancy of the merge-replace flow (its reload also finishes
+        # through _cleanup_loader).
+        self._merge_replacing = False
         # Restore the two-point B/W Density-inversion default (ON — density keeps
         # real highlight headroom in the working space; linear has ~0.15 stops).
         # New two-point conversions bake this; see spec/density-bwpoint-toggle.md.
@@ -717,6 +756,24 @@ class MainWindow(QMainWindow):
              "Trichrome merge detail: single photosite (half resolution).")
             + " Applies to the next import.", duration=5000)
 
+    def on_rgb_merge_replace_toggled(self, checked: bool):
+        """Flip the global 'replace originals with linear TIFF' opt-in and persist
+        it. When on with 3-way merge, a successful merge import prompts to bake
+        each frame to a full-resolution linear TIFF and PERMANENTLY delete its
+        source RAWs (see _maybe_replace_merged_with_tiff). Affects only the next
+        import; nothing is deleted without confirmation.
+        See spec/merge-linear-tiff-replace.md."""
+        ccr_backend.rgb_merge_replace = bool(checked)
+        self._settings.setValue("import/rgb_merge_replace", bool(checked))
+        if checked:
+            msg = ("Replace originals: your next merge import will offer to bake "
+                   "linear TIFFs and delete the source RAWs (you'll confirm).")
+            if not ccr_backend.rgb_merge_mode:
+                msg += " Turn 3-way merge on to use it."
+        else:
+            msg = "Replace originals off — merge imports keep the source RAWs."
+        self.sliders_panel.set_temporary_hint(msg, duration=5000)
+
     # --- Two-point B/W Density inversion (global, persistent) -------------
     def on_density_bwpoint_toggled(self, checked: bool):
         """Flip the global two-point Density-inversion default, persist it, and
@@ -876,6 +933,26 @@ class MainWindow(QMainWindow):
             licenses_text = "No license files found."
         return licenses_text
 
+    def _launch_file_loader(self, files, force_no_merge=False):
+        """Start the async image loader for a file list. Shared by Open Files and
+        the merge-replace reload (force_no_merge loads the generated TIFFs as
+        normal images even while 3-way merge is on)."""
+        self._stop_loader_if_running()
+        # New batch = new roll: the combo returns to "Default"
+        # (the backend loader clears its copy too).
+        self.sliders_panel.reset_film_stock_combo()
+        self.thumbnail_list.show_loading_dialog()
+        self._loader_thread = QThread()
+        self._loader_worker = ImageLoaderWorker(files=files,
+                                                force_no_merge=force_no_merge)
+        self._loader_worker.moveToThread(self._loader_thread)
+        self._loader_thread.started.connect(self._loader_worker.run)
+        self._loader_worker.finished.connect(self._loader_thread.quit)
+        self._loader_worker.finished.connect(self._loader_worker.deleteLater)
+        self._loader_thread.finished.connect(self._cleanup_loader)
+        self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
+        self._loader_thread.start()
+
     def _cleanup_loader(self):
         """Called when the loader thread finishes. Nulls the references so isRunning() is never called on a deleted C++ object."""
         self._loader_thread = None
@@ -887,6 +964,112 @@ class MainWindow(QMainWindow):
         if err:
             ccr_backend.last_merge_error = None
             QMessageBox.warning(self, "3-way RGB merge", err)
+        # Offer to replace trichrome originals with linear TIFFs, if enabled.
+        self._maybe_replace_merged_with_tiff()
+
+    # --- Replace trichrome originals with linear TIFFs -------------------- #
+    def _maybe_replace_merged_with_tiff(self):
+        """After a successful merge import, if the opt-in is on, confirm and then
+        bake each merged frame to a linear TIFF, delete its source RAWs, and
+        reload from the TIFFs. No-op for a normal load, the reload itself, or
+        when the user declines. See spec/merge-linear-tiff-replace.md."""
+        if getattr(self, "_merge_replacing", False):
+            return
+        if not (getattr(ccr_backend, "rgb_merge_mode", False)
+                and getattr(ccr_backend, "rgb_merge_replace", False)):
+            return
+        if getattr(ccr_backend, "last_merge_error", None):
+            return
+        merged = [im for im in ccr_backend.images
+                  if getattr(im, "is_merged", False)
+                  and getattr(im, "merge_sources", None)]
+        if not merged:
+            return
+        n_sources = sum(len(im.merge_sources) for im in merged)
+        resp = QMessageBox.warning(
+            self, "Replace originals with linear TIFF",
+            f"Create {len(merged)} full-resolution linear TIFF file(s) and then "
+            f"PERMANENTLY DELETE the {n_sources} original RAW file(s) that were "
+            f"merged?\n\nThe TIFF keeps the full merged result (all linear data, "
+            f"lossless), but the merge/demosaic choice is baked in and the "
+            f"deletion cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            self.sliders_panel.set_temporary_hint(
+                "Replace originals cancelled — source RAWs kept.", duration=4000)
+            return
+        self._start_merge_replace(merged)
+
+    def _start_merge_replace(self, merged_images):
+        self._merge_replacing = True
+        self._stop_loader_if_running()
+        dlg = QProgressDialog("Writing linear TIFFs…", "Cancel", 0,
+                              len(merged_images), self)
+        dlg.setWindowTitle("Replacing originals")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        self._replace_dialog = dlg
+        self._replace_thread = QThread()
+        self._replace_worker = MergeReplaceWorker(merged_images)
+        self._replace_worker.moveToThread(self._replace_thread)
+        self._replace_thread.started.connect(self._replace_worker.run)
+        self._replace_worker.progress.connect(self._on_replace_progress)
+        self._replace_worker.finished.connect(self._on_replace_finished)
+        self._replace_worker.finished.connect(self._replace_thread.quit)
+        self._replace_worker.finished.connect(self._replace_worker.deleteLater)
+        # Null the Python refs only AFTER the thread's loop has stopped — a
+        # running QThread whose wrapper is GC'd hard-aborts (mirrors the loader).
+        self._replace_thread.finished.connect(self._cleanup_replace)
+        dlg.canceled.connect(self._replace_worker.cancel)
+        self._replace_thread.start()
+
+    def _cleanup_replace(self):
+        self._replace_thread = None
+        self._replace_worker = None
+
+    def _on_replace_progress(self, done, total, name):
+        dlg = getattr(self, "_replace_dialog", None)
+        if dlg is not None:
+            dlg.setMaximum(total)
+            dlg.setValue(done)
+            if name:
+                dlg.setLabelText(f"Writing linear TIFF {done + 1} of {total}:\n{name}")
+
+    def _on_replace_finished(self, result):
+        # Runs on worker.finished (the thread is still stopping — its refs are
+        # nulled later in _cleanup_replace on thread.finished).
+        dlg = getattr(self, "_replace_dialog", None)
+        if dlg is not None:
+            dlg.close()
+        self._replace_dialog = None
+        self._merge_replacing = False
+
+        failures = result.get("failures", [])
+        tiffs = result.get("tiff_paths", [])
+        deleted = result.get("deleted", [])
+
+        if result.get("cancelled"):
+            self.sliders_panel.set_temporary_hint(
+                "Replace cancelled — originals kept.", duration=4000)
+            return
+
+        if failures:
+            shown = "\n".join(f"• {name}: {reason}" for name, reason in failures[:8])
+            if len(failures) > 8:
+                shown += f"\n… and {len(failures) - 8} more"
+            QMessageBox.warning(
+                self, "Replace originals",
+                f"Replaced {len(tiffs)} frame(s); deleted {len(deleted)} "
+                f"original file(s).\n\nSome items were kept because they failed "
+                f"(their originals were NOT deleted):\n\n{shown}")
+
+        if tiffs:
+            # Reload from the generated TIFFs as normal negatives (merge bypassed).
+            self._launch_file_loader(tiffs, force_no_merge=True)
+            self.sliders_panel.set_temporary_hint(
+                f"Replaced {len(tiffs)} frame(s) with linear TIFFs; "
+                f"deleted {len(deleted)} original(s).", duration=5000)
 
     def _stop_loader_if_running(self):
         """Cancel and join any in-progress loader thread. A loader that
@@ -970,27 +1153,19 @@ class MainWindow(QMainWindow):
             if valid_files:
                 # 3-way RGB merge: validate the selection up front (multiple of
                 # 3, all RAW) so the user gets immediate feedback before any load.
+                # FreeCCR-baked merge TIFFs are excluded — they re-open as normal
+                # images even in merge mode. See spec/merge-linear-tiff-replace.md.
                 if ccr_backend.rgb_merge_mode:
                     from core import ccr_merge
-                    ok, err = ccr_merge.validate_merge_inputs(
-                        ccr_merge.sort_for_merge(valid_files))
-                    if not ok:
-                        QMessageBox.warning(self, "3-way RGB merge", err)
-                        return
-                self._stop_loader_if_running()
-                # New batch = new roll: the combo returns to "Default"
-                # (the backend loader clears its copy too).
-                self.sliders_panel.reset_film_stock_combo()
-                self.thumbnail_list.show_loading_dialog()
-                self._loader_thread = QThread()
-                self._loader_worker = ImageLoaderWorker(files=valid_files)
-                self._loader_worker.moveToThread(self._loader_thread)
-                self._loader_thread.started.connect(self._loader_worker.run)
-                self._loader_worker.finished.connect(self._loader_thread.quit)
-                self._loader_worker.finished.connect(self._loader_worker.deleteLater)
-                self._loader_thread.finished.connect(self._cleanup_loader)
-                self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
-                self._loader_thread.start()
+                    to_merge = [p for p in valid_files
+                                if not ccr_merge.is_freeccr_merge_tiff(p)]
+                    if to_merge:
+                        ok, err = ccr_merge.validate_merge_inputs(
+                            ccr_merge.sort_for_merge(to_merge))
+                        if not ok:
+                            QMessageBox.warning(self, "3-way RGB merge", err)
+                            return
+                self._launch_file_loader(valid_files)
             elif files:  # If there were files selected but all were invalid
                 QMessageBox.critical(
                     self,

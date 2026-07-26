@@ -275,6 +275,17 @@ class SettingsDialog(QDialog):
             "resolution. Single photosite reads only the raw colour sites — "
             "no interpolation at all — at half resolution. Applies to the "
             "next import."))
+        self._cb_rgb_replace = QCheckBox(
+            "Replace originals with linear TIFF on import")
+        g3.addWidget(self._cb_rgb_replace)
+        g3.addWidget(self._muted(
+            "After a successful merge import, each merged frame is written as a "
+            "full-resolution 16-bit linear TIFF next to its red source, then the "
+            "three original RAWs are PERMANENTLY DELETED and the list reloads "
+            "from the TIFFs. You confirm before anything is deleted. The "
+            "merge/demosaic choice is baked in and can't be changed afterwards. "
+            "The generated TIFFs reopen normally even with 3-way merge left on. "
+            "Requires 3-way merge to be on."))
         lay.addWidget(grp3)
 
         lay.addStretch(1)
@@ -307,6 +318,8 @@ class SettingsDialog(QDialog):
         profile UI) so a profile import/delete can't clobber a staged toggle."""
         for cb, val in ((self._cb_positive, ccr_backend.positive_mode),
                         (self._cb_rgb_merge, ccr_backend.rgb_merge_mode),
+                        (self._cb_rgb_replace,
+                         getattr(ccr_backend, "rgb_merge_replace", False)),
                         (self._cb_density, ccr_backend.density_bwpoint),
                         (self._cb_auto_gain, ccr_backend.auto_gain),
                         (self._cb_auto_awb, ccr_backend.auto_awb),
@@ -339,6 +352,10 @@ class SettingsDialog(QDialog):
         staged_detail = bool(self._combo_merge_detail.currentData())
         if staged_detail != bool(getattr(ccr_backend, "rgb_merge_demosaic", True)):
             self._mw.on_rgb_merge_demosaic_changed(staged_detail)
+        if (bool(self._cb_rgb_replace.isChecked())
+                != bool(getattr(ccr_backend, "rgb_merge_replace", False))):
+            self._mw.on_rgb_merge_replace_toggled(
+                bool(self._cb_rgb_replace.isChecked()))
         if bool(self._cb_density.isChecked()) != bool(ccr_backend.density_bwpoint):
             self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
         if bool(self._cb_auto_gain.isChecked()) != bool(ccr_backend.auto_gain):
