@@ -7,10 +7,11 @@
 -->
 ## What's New
 
-**FreeCCR 1.3.0** — a reversal-film look, and faster mode switching.
+**FreeCCR 1.3.1** — a smoother trichrome (3-way merge) workflow.
 
-- **White sprocket holes / clear film (reversal look).** A new Settings toggle paints the sprocket holes and clear film border white instead of black after conversion — matching how reversal (slide) film actually looks when scanned. Available for any image with a Black Point set; on for preview, zoom, and export alike.
-- **Keyboard shortcuts for Crop, Dust Removal, and White Balance.** Press **C** to toggle Crop, **D** to toggle Dust Removal, and **W** to toggle the White Balance eyedropper — no more reaching for the mouse to switch modes. The WB eyedropper button also now toggles off on a second click, matching the new hotkey.
+- **Merged frames now remember your edits between sessions.** After a 3-way RGB merge, your conversion, sliders, crop, and dust work is saved and restored the next time you merge the same three source frames — just like a normal image. (If any of the three source files changed on disk, it re-merges fresh.)
+- **Optionally replace originals with a single linear TIFF (off by default).** A new Trichrome-capture setting bakes each merged frame to a full-resolution 16-bit *linear* TIFF, then permanently deletes the three source RAWs and reloads from the TIFF — turning a trichrome shoot into one archival file per frame. You confirm before anything is deleted, and a frame's RAWs are only removed after its TIFF is written and verified. The generated TIFFs reopen normally even with 3-way merge left on.
+- **Smaller lossless linear TIFFs.** The linear-TIFF writer now uses a horizontal predictor, so 16-bit files compress meaningfully (still bit-exact and readable everywhere).
 
 ## Install
 
