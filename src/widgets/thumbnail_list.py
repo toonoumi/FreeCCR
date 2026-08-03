@@ -340,8 +340,9 @@ class ThumbnailList(QWidget):
             item.setText(("⚠ " + filename) if mism else filename)
             item.setForeground(warn if mism else normal)
             item.setToolTip(
-                "Graded under a different camera profile.\nRight-click ▸ "
-                "Replace with current camera profile." if mism else "")
+                "Graded under a different camera profile or field "
+                "correction.\nRight-click ▸ Replace with current camera "
+                "profile." if mism else "")
 
     def replace_with_current_profile(self, indices):
         """Re-grade the given image(s) under the current camera profile by

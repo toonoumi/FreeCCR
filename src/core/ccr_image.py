@@ -395,6 +395,31 @@ class CCRImage:
             logging.warning(f"Input ICC profile could not be applied: {e}")
             return arr
 
+    @staticmethod
+    def _apply_field_correction(arr: Optional[np.ndarray], *,
+                                encoded: bool = False,
+                                mono: bool = False) -> Optional[np.ndarray]:
+        """Multiply a freshly-decoded frame by the active field-correction gain
+        map (lens vignetting + sensor colour shading + light-source unevenness),
+        before slicing, the camera profile, and the negative conversion — the one
+        place every consumer (preview, zoom, slice, merge, export) inherits it
+        from. No-op when no field profile is active.
+
+        Called at the FULL-FRAME point of each decode branch (before
+        _apply_source_ops) so the map always lines up with the whole sensor frame
+        whatever the slice/crop state. See spec/flat-field-correction.md §6.1."""
+        if arr is None:
+            return arr
+        from core import flat_field
+        profile = flat_field.get_active_profile()
+        if profile is None:
+            return arr
+        try:
+            return flat_field.apply_field(arr, profile, encoded=encoded, mono=mono)
+        except Exception as e:
+            logging.warning(f"Field correction could not be applied: {e}")
+            return arr
+
     def _input_icc_will_apply(self) -> bool:
         """Whether read_image will burn an external camera profile into this scan
         — an input ICC **or** a DCP is active (mirrors the apply guard). Drives the
@@ -499,7 +524,8 @@ class CCRImage:
         )
 
     def _read_merged(self, preview: bool = True,
-                     max_long_side: Optional[int] = None) -> Optional[np.ndarray]:
+                     max_long_side: Optional[int] = None,
+                     apply_input_icc: bool = True) -> Optional[np.ndarray]:
         """Decode a 3-way RGB-merged image from its source RAWs. Mirrors the tail
         of read_image's RAW branch (slice ops, full-size capture, optional
         downsize) so export / zoom / slice all compose. The merge's native
@@ -513,6 +539,12 @@ class CCRImage:
         rgb, full_decode_size = ccr_merge.merge_raw_channels(
             self.merge_sources, preview=preview,
             demosaic=getattr(self, "merge_demosaic", True))
+        # Field correction on the full merged frame (camera-native linear, like
+        # the RAW branch). The linear-TIFF bake writes merge_raw_channels output
+        # directly, NOT through read_image, so a baked replacement stays
+        # uncorrected on disk and is corrected on reload — never twice.
+        if apply_input_icc:
+            rgb = self._apply_field_correction(rgb)
         # Sliced merged children read only their region of the source.
         rgb = self._apply_source_ops(rgb)
         self.original_full_size = self._ops_full_size(full_decode_size)
@@ -533,9 +565,12 @@ class CCRImage:
         without mutating global state (used by the IT8 camera-profiling decode,
         see spec/it8-camera-profile.md §6.1): positive_override=False forces the
         raw-linear negative decode regardless of the live Positive-mode toggle,
-        and apply_input_icc=False skips burning in the active input ICC profile —
-        together they yield the bare device RGB an input profile is fitted on.
-        Both default to current behaviour, so existing callers are unaffected.
+        and apply_input_icc=False is the BARE DEVICE DECODE — it forces the
+        camera-native decode space and skips BOTH the active camera profile
+        (ICC/DCP) and the active field correction, so a profiling decode measures
+        untouched device data and profiles can never compound
+        (spec/flat-field-correction.md §10.1). Both default to current behaviour,
+        so existing callers are unaffected.
         """
         # 3-way RGB merge: this image has no single backing file — it is
         # re-synthesized from its three source RAWs. Dispatch BEFORE the
@@ -543,7 +578,8 @@ class CCRImage:
         # always a camera-native negative). All re-read call sites (export,
         # zoom, slice, duplicate) flow through here, so they re-merge for free.
         if getattr(self, "is_merged", False) and self.merge_sources:
-            return self._read_merged(preview=preview, max_long_side=max_long_side)
+            return self._read_merged(preview=preview, max_long_side=max_long_side,
+                                     apply_input_icc=apply_input_icc)
 
         # Ensure file path is properly encoded for Unicode support
         file_path = os.path.normpath(file_path)
@@ -665,6 +701,14 @@ class CCRImage:
                         rgb = raw.postprocess(
                             **self._raw_color_postprocess_kwargs(
                                 positive_decode, preview, no_icc_default))
+
+                    # Field correction (flat-field) on the FULL frame, before the
+                    # slice chain crops it — a monochrome decode gets the neutral
+                    # (channel-averaged) gain so it stays colourless, and a
+                    # Positive decode is sRGB-encoded, not linear.
+                    if apply_input_icc:
+                        rgb = self._apply_field_correction(
+                            rgb, encoded=positive_decode, mono=is_monochrome)
 
                     # Sliced images read only their region of the source.
                     # Single atomic assignment of the final size (see above).
@@ -800,12 +844,20 @@ class CCRImage:
             # unconverted and render black).
             img = _to_uint16_full_range(img)
             # Convert grayscale to RGB
-            if len(img.shape) == 2:
+            is_gray = len(img.shape) == 2
+            if is_gray:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             elif img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # Field correction on the full frame, before the slice chain. The
+            # gain is applied in the file's own space (encoded=False): a
+            # multiplicative falloff stays multiplicative through a power-law
+            # encoding, so a profile measured and applied in the same space is
+            # self-consistent. See spec/flat-field-correction.md §10.4.
+            if apply_input_icc:
+                img = self._apply_field_correction(img, mono=is_gray)
             # Sliced images read only their region of the source
             img = self._apply_source_ops(img)
             # This branch always reads at full resolution regardless of `preview`

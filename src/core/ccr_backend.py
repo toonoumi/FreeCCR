@@ -118,6 +118,13 @@ class CCRBackend:
         # The library (camera_profiles/) keeps every imported/generated profile;
         # the active one is just a selection, not a copy. See spec/camera-profile-library.md.
         self.active_profile_path: Optional[str] = None
+        # Active field-correction (flat-field) profile — independent of the
+        # camera profile: it corrects the rig's vignetting / colour shading /
+        # light-source unevenness at decode time. The parsed profile lives in
+        # flat_field's module-level holder; these mirror it for the UI.
+        # See spec/flat-field-correction.md.
+        self.field_profile_path: Optional[str] = None
+        self.field_profile_name: Optional[str] = None
         # Catalog entries of ACTUAL images removed from the list this
         # session: {file_path: {"signature": sig, "entries": {name: state}}}.
         # Removal must not lose their stored edits, so saves merge these
@@ -944,16 +951,21 @@ class CCRBackend:
                 print(f"Failed to convert image at index {idx}: {e}")
 
     def active_profile_signature(self) -> str:
-        """The camera-profile signature an image decoded NOW would be graded
-        under: 'none' in Positive mode (the profile isn't applied) or when the
-        profile is disabled/unset, else 'icc:<desc>' / 'dcp:<name>'. Drives the
-        per-image thumbnail mismatch warning."""
-        from core import color_management
+        """The grading signature an image decoded NOW would carry: the camera
+        profile ('none' in Positive mode or when disabled/unset, else
+        'icc:<desc>' / 'dcp:<name>' / 'camera_matrix') composed with the active
+        field correction ('+ff:<id>'). Field correction applies in Positive mode
+        too, so it is composed on independently. Drives the per-image thumbnail
+        mismatch warning; compared only for equality."""
+        from core import color_management, flat_field
         if self.positive_mode:
-            return "none"
-        if color_management.camera_matrix_mode():
-            return "camera_matrix"          # Adobe+autoscale decode, distinct from RAW "none"
-        return color_management.active_profile_signature()
+            base = "none"
+        elif color_management.camera_matrix_mode():
+            base = "camera_matrix"          # Adobe+autoscale decode, distinct from RAW "none"
+        else:
+            base = color_management.active_profile_signature()
+        ff = flat_field.active_field_signature()
+        return base if ff == "none" else f"{base}+{ff}"
 
     @staticmethod
     def _profile_content_id(path):
@@ -1060,6 +1072,64 @@ class CCRBackend:
             name = self.input_icc_name
         self.active_profile_path = path
         return name
+
+    # --- Field-correction library (flat-field profiles) --------------------
+    def field_profiles_dir(self) -> str:
+        """Library folder for .ffc field-correction profiles, beside the camera
+        profiles under %APPDATA%/FreeCCR (survives updates/reinstalls)."""
+        from core.catalog import default_catalog_path
+        d = os.path.join(os.path.dirname(default_catalog_path()), "field_profiles")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def list_field_profiles(self) -> list:
+        """Every profile in the library: [{name, path, summary}], by name.
+        Unreadable files are skipped rather than breaking the list."""
+        import glob
+        from core import flat_field
+        out = []
+        for p in glob.glob(os.path.join(self.field_profiles_dir(),
+                                        "*" + flat_field.EXTENSION)):
+            try:
+                prof = flat_field.load_profile(p)
+                summary = prof.summary()
+                name = prof.name
+            except Exception as e:      # never let one bad file break the list
+                print(f"Skipping unreadable field profile {p}: {e}")
+                continue
+            out.append({"name": name, "path": p, "summary": summary})
+        return sorted(out, key=lambda x: x["name"].lower())
+
+    def set_active_field_profile(self, path: Optional[str]) -> Optional[str]:
+        """Activate the field-correction profile at `path`, or None for no field
+        correction. Returns the display name, or None. Raises FieldProfileError
+        on an unreadable/invalid file."""
+        from core import flat_field
+        if not path:
+            flat_field.set_active_profile(None)
+            self.field_profile_path = None
+            self.field_profile_name = None
+            return None
+        prof = flat_field.load_profile(path)
+        flat_field.set_active_profile(prof)
+        self.field_profile_path = path
+        self.field_profile_name = prof.name
+        return prof.name
+
+    def delete_field_profile(self, path: str) -> bool:
+        """Remove a field profile from the library, deactivating it first if it
+        is the active one."""
+        from core import flat_field
+        active = flat_field.get_active_profile()
+        if active is not None and active.path and (
+                os.path.normcase(os.path.abspath(active.path))
+                == os.path.normcase(os.path.abspath(path))):
+            self.set_active_field_profile(None)
+        try:
+            os.remove(path)
+            return True
+        except OSError:
+            return False
 
     def delete_camera_profile(self, path: str) -> bool:
         """Remove a profile file from the library. Deactivates it first if active."""

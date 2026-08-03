@@ -223,6 +223,38 @@ class SettingsDialog(QDialog):
             "it is added to the library above."))
         lay.addWidget(grp)
 
+        # --- Field correction (flat-field) ----------------------------- #
+        grp_ff = QGroupBox("Field correction")
+        gf = QVBoxLayout(grp_ff)
+        gf.setSpacing(theme.GAP_ROW)
+        gf.addWidget(self._muted(
+            "Corrects the dark corners and colour shading your lens, sensor and "
+            "light source put into every frame, measured from one shot of an "
+            "evenly lit blank surface. Applied to every decode before the "
+            "negative conversion."))
+        self._field_entries = []            # library rows, filled on refresh
+        ff_row = QHBoxLayout()
+        ff_row.setSpacing(theme.GAP_BTN)
+        ff_row.addWidget(QLabel("Active:"))
+        self._combo_field = QComboBox()
+        self._combo_field.currentIndexChanged.connect(self._field_selected)
+        ff_row.addWidget(self._combo_field, 1)
+        gf.addLayout(ff_row)
+        self._field_detail = self._muted("")
+        gf.addWidget(self._field_detail)
+        ff_btns = QHBoxLayout()
+        theme.apply_button_row(ff_btns)
+        btn_create = QPushButton("Create Field Correction Profile…")
+        btn_create.clicked.connect(self._create_field)
+        self._btn_field_delete = QPushButton("Delete")
+        theme.style_button(self._btn_field_delete, "danger")
+        self._btn_field_delete.clicked.connect(self._delete_field)
+        ff_btns.addWidget(btn_create)
+        ff_btns.addWidget(self._btn_field_delete)
+        ff_btns.addStretch(1)
+        gf.addLayout(ff_btns)
+        lay.addWidget(grp_ff)
+
         # --- Negative conversion --------------------------------------- #
         grp2 = QGroupBox("Negative conversion")
         g2 = QVBoxLayout(grp2)
@@ -311,6 +343,51 @@ class SettingsDialog(QDialog):
         self._mw.create_camera_profile_from_it8()
         self.refresh_color_management()
 
+    # --- Field correction: immediate, like the camera-profile selection ---- #
+    def _create_field(self):
+        self._mw.create_field_correction_profile()
+        self.refresh_color_management()
+
+    def _delete_field(self):
+        path = self._combo_field.currentData()
+        if not path:
+            return
+        self._mw.delete_field_profile(path)
+        self.refresh_color_management()
+
+    def _field_selected(self, _idx):
+        """User picked from the combo — apply immediately. Guarded by a flag so
+        repopulating the combo in refresh_color_management can't re-trigger it."""
+        if getattr(self, "_loading_field_combo", False):
+            return
+        self._mw.set_active_field_profile(self._combo_field.currentData())
+        self._update_field_detail()
+
+    def _update_field_detail(self):
+        path = self._combo_field.currentData()
+        entry = next((p for p in self._field_entries if p["path"] == path), None)
+        self._field_detail.setText(entry["summary"] if entry else "")
+        self._btn_field_delete.setEnabled(bool(path))
+
+    def refresh_field_correction(self):
+        """Repopulate the field-profile combo from the library and reflect the
+        active selection (without firing the selection handler)."""
+        from core import flat_field
+        active = flat_field.get_active_profile()
+        active_path = active.path if active is not None else None
+        self._field_entries = ccr_backend.list_field_profiles()
+        self._loading_field_combo = True
+        try:
+            self._combo_field.clear()
+            self._combo_field.addItem("None", None)
+            for p in self._field_entries:
+                self._combo_field.addItem(p["name"], p["path"])
+            idx = self._combo_field.findData(active_path) if active_path else 0
+            self._combo_field.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self._loading_field_combo = False
+        self._update_field_detail()
+
     # --- Staged toggles: apply on Done (accept), discard on close ---------- #
     def _init_toggles(self):
         """Seed the toggle checkboxes from the live backend once, at open. They
@@ -378,6 +455,7 @@ class SettingsDialog(QDialog):
 
     def refresh_color_management(self):
         """Reflect the live active profile, the library list, and Positive mode."""
+        self.refresh_field_correction()
         icc = getattr(ccr_backend, "input_icc_name", None)
         dcp = getattr(ccr_backend, "input_dcp_name", None)
         if getattr(ccr_backend, "active_profile_path", None) == ccr_backend.CAMERA_MATRIX:

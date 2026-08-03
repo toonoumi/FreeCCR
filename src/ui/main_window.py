@@ -307,6 +307,20 @@ class MainWindow(QMainWindow):
         self.thumbnail_list.refresh_profile_combo()
         self._refresh_profile_ui()
 
+        # Restore the active field-correction profile (independent of the camera
+        # profile; also applied to every decode). A vanished or unreadable file
+        # falls back to no correction and clears the setting.
+        saved_ff = self._settings.value("import/field_profile_path", "", type=str)
+        if saved_ff and saved_ff != "none" and os.path.exists(saved_ff):
+            try:
+                ccr_backend.set_active_field_profile(saved_ff)
+            except Exception as e:
+                print(f"Could not restore field correction {saved_ff}: {e}")
+                ccr_backend.set_active_field_profile(None)
+                self._settings.remove("import/field_profile_path")
+        elif saved_ff and saved_ff != "none":
+            self._settings.remove("import/field_profile_path")
+
         # Ctrl+Z (Cmd+Z on macOS): undo the last action on the current image;
         # repeated presses walk further back through the undo stack.
         self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
@@ -686,6 +700,62 @@ class MainWindow(QMainWindow):
         else:
             self.sliders_panel.set_temporary_hint(
                 f"Camera profile saved: {base}", duration=4000)
+
+    # --- Field correction (flat-field, global + persistent) ---------------
+    def set_active_field_profile(self, path):
+        """Select the active field-correction profile (a library path), or None.
+        Persisted; re-flags thumbnail mismatches (no re-decode, exactly like a
+        camera-profile change). See spec/flat-field-correction.md §6.3."""
+        from core.flat_field import FieldProfileError
+        try:
+            name = ccr_backend.set_active_field_profile(path)
+        except (FieldProfileError, Exception) as e:
+            QMessageBox.warning(self, "Field correction",
+                                f"Could not use this profile:\n\n{e}")
+            return False
+        self._settings.setValue("import/field_profile_path", path if path else "none")
+        self._refresh_profile_mismatch()
+        self.sliders_panel.set_temporary_hint(
+            f"Field correction: {name}" if name else "Field correction: None",
+            duration=3000)
+        return True
+
+    def delete_field_profile(self, path):
+        """Remove a field-correction profile from the library (with
+        confirmation), deactivating it first if it is the active one."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        if QMessageBox.question(
+                self, "Delete field correction profile",
+                f"Remove “{name}” from your field-correction library?\n"
+                "The file is deleted from FreeCCR's workspace.") != QMessageBox.Yes:
+            return
+        was_active = (path == self._settings.value(
+            "import/field_profile_path", "", type=str))
+        ccr_backend.delete_field_profile(path)
+        if was_active:
+            self._settings.remove("import/field_profile_path")
+        self._refresh_profile_mismatch()
+
+    def create_field_correction_profile(self):
+        """Open the field-correction wizard; on success the profile is already in
+        the library, so just activate it if the user asked for that."""
+        from widgets.field_correction_dialog import FieldCorrectionDialog
+        current_path = None
+        idx = self.image_preview.current_idx
+        if idx is not None:
+            img = ccr_backend.get_image_by_index(idx)
+            if img is not None:
+                current_path = img.file_path
+        dlg = FieldCorrectionDialog(self, current_path=current_path)
+        if dlg.exec() != QDialog.Accepted or not dlg.saved_path:
+            return
+        base = os.path.basename(dlg.saved_path)
+        if dlg.apply_now and self.set_active_field_profile(dlg.saved_path):
+            self.sliders_panel.set_temporary_hint(
+                f"Field correction saved and applied: {base}", duration=4000)
+        else:
+            self.sliders_panel.set_temporary_hint(
+                f"Field correction saved: {base}", duration=4000)
 
     # --- Positive mode (global, persistent) -------------------------------
     def on_positive_mode_toggled(self, checked: bool):
