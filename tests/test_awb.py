@@ -12,11 +12,13 @@ import sys
 import numpy as np
 import pytest
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # the apply-path tests
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from core.awb import (  # noqa: E402
-    AWB_ALGORITHMS, AWB_DEFAULT, AWB_LO, AWB_HI,
+    AWB_ALGORITHMS, AWB_DEFAULT, AWB_LO, AWB_HI, AWB_TONE_LO, AWB_TONE_HI,
     estimate_neutral_rgb, compute_awb_temp_tint,
 )
 from core.ccr_processor import (  # noqa: E402
@@ -57,7 +59,7 @@ def test_white_patch_balances_on_brightest_content():
     cast = (1.1, 1.0, 0.85)
     d = np.full((100, 100, 3), 0.3, dtype=np.float32)
     d[..., 0] *= 0.9                                   # dim content: different cast
-    patch = np.array([0.85 * c for c in cast], dtype=np.float32)   # all <= 0.98
+    patch = np.array([0.75 * c for c in cast], dtype=np.float32)   # inside the band
     d[:5, :, :] = patch                                # 5% brightest rows
     est = estimate_neutral_rgb(_u16(d), ws_windowed=False, algorithm="white_patch")
     rg, bg = _ratios(est)
@@ -104,6 +106,54 @@ def test_out_of_bound_pixels_excluded():
     interior = estimate_neutral_rgb(_u16(d[4:-4]), algorithm="gray_world")
     got = estimate_neutral_rgb(_u16(dirty), algorithm="gray_world")
     assert np.allclose(interior, got, rtol=1e-4)
+
+
+def _scan_frame(rng, cast=CAST, shape=(120, 120), band=20):
+    """An UNCROPPED film scan: image content in the middle, the holder surround
+    above it (masked to pure black in the scan → clipped white once inverted)
+    and the clear film base / sprocket holes below (the scan's maximum → crushed
+    black once inverted). Both carry scanner noise, so they straddle the
+    extremes instead of sitting exactly on 1.0 / 0.0."""
+    d = _cast_scene(rng, cast=cast, shape=shape)
+    d[:band] = rng.uniform(0.95, 1.0, size=(band, shape[1], 1)).astype(np.float32)
+    d[-band:] = rng.uniform(0.0, 0.05, size=(band, shape[1], 1)).astype(np.float32)
+    return d
+
+
+@pytest.mark.parametrize("algorithm",
+                         ["gray_world", "white_patch", "shades_of_gray"])
+def test_film_surround_never_votes(algorithm):
+    """The user's case: on an uncropped scan the estimate must come from the
+    image only — the pure-white holder and pure-black film base are film, not
+    scene, and neither carries a cast. Noisy extremes (0.95-1.0 / 0.0-0.05) are
+    the real-world shape of those regions and must be rejected wholesale."""
+    d = _scan_frame(np.random.default_rng(20))
+    full = estimate_neutral_rgb(_u16(d), algorithm=algorithm)
+    content = estimate_neutral_rgb(_u16(d[20:-20]), algorithm=algorithm)
+    assert full == content
+
+
+def test_film_surround_leaves_the_cast_intact():
+    """Stated as the property that matters: the surround must not drag the
+    estimate toward neutral (its own color), for every algorithm."""
+    d = _scan_frame(np.random.default_rng(21))
+    for algorithm, _label in AWB_ALGORITHMS:
+        rg, bg = _ratios(estimate_neutral_rgb(_u16(d), algorithm=algorithm))
+        assert rg == pytest.approx(CAST[0] / CAST[1], rel=0.05), algorithm
+        assert bg == pytest.approx(CAST[2] / CAST[1], rel=0.05), algorithm
+
+
+def test_tone_band_excludes_extremes_that_pass_the_channel_gate():
+    """The luminance band is a second, independent rejection: a bright (or
+    deep) neutral surround whose channels all sit inside [AWB_LO, AWB_HI] is
+    still outside the midtone band, so it does not vote."""
+    d = _cast_scene(np.random.default_rng(22), shape=(100, 100))
+    dirty = d.copy()
+    dirty[:10] = 0.90        # lum 0.90 > AWB_TONE_HI, every channel < AWB_HI
+    dirty[-10:] = 0.10       # lum 0.10 < AWB_TONE_LO, every channel > AWB_LO
+    got = estimate_neutral_rgb(_u16(dirty), algorithm="gray_world")
+    content = estimate_neutral_rgb(_u16(d[10:-10]), algorithm="gray_world")
+    assert np.allclose(got, content, rtol=1e-4)
 
 
 def test_insufficient_content_returns_none():
@@ -262,6 +312,9 @@ def test_algorithm_registry():
     assert ids == ["gray_world", "white_patch", "shades_of_gray", "gray_edge"]
     assert AWB_DEFAULT in ids
     assert 0.0 < AWB_LO < AWB_HI < 1.0
+    # The band sits strictly inside the channel gate: midtones + a slice of the
+    # shadows and highlights, never the extremes an uncropped scan always has.
+    assert AWB_LO < AWB_TONE_LO < AWB_TONE_HI < AWB_HI
 
 
 def test_backend_defaults(backend):
@@ -269,6 +322,90 @@ def test_backend_defaults(backend):
     singleton still carries them here): auto-AWB opt-in, Gray World."""
     assert backend.auto_awb is False
     assert backend.awb_algorithm == AWB_DEFAULT
+
+
+# --- applying the result (the canvas must show it immediately) ----------------
+# update_preview() paints the CACHED resized_preview and only regenerates it
+# afterwards, so a discrete edit that merely queues the debounced reprocess
+# leaves the canvas on the pre-edit render until something else redraws it.
+# on_wb_sampled therefore has to regenerate FIRST, then display.
+
+@pytest.fixture
+def wb_panel(tmp_path):
+    """A real SlidersPanel over one converted, cast-tinted image, hosted the way
+    MainWindow hosts it (parent().parent() carries image_preview). Yields
+    (panel, image, log) where log records render/show in the order they happen."""
+    import cv2
+    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+    QApplication.instance() or QApplication(sys.argv[:1])
+    from core.ccr_backend import ccr_backend
+    from core.ccr_image import CCRImage
+    from widgets.sliders_panel import SlidersPanel
+
+    path = str(tmp_path / "scan.png")
+    cv2.imwrite(path, np.full((40, 60, 3), 20000, np.uint16))
+    img = CCRImage(path)
+    img.converted = True
+    img.adjustment_settings = {}
+    img.resized_raw = _u16(_cast_scene(np.random.default_rng(30), shape=(40, 60)))
+
+    log = []
+    render = img.update_thumbnail_and_preview
+
+    def _logged_render():
+        log.append("render")
+        return render()
+    img.update_thumbnail_and_preview = _logged_render
+
+    class _PreviewStub:
+        def update_preview(self, idx):
+            log.append("show")
+
+    class _Host(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.image_preview = _PreviewStub()
+            self.mid = QWidget(self)
+
+    host = _Host()
+    QVBoxLayout(host.mid).addWidget(SlidersPanel(host.mid))
+    panel = host.mid.layout().itemAt(0).widget()
+    saved = (ccr_backend.images, ccr_backend.file_paths)
+    ccr_backend.images, ccr_backend.file_paths = [img], [img.file_path]
+    panel.current_idx = 0
+    log.clear()                      # ignore setup renders
+    yield panel, img, log
+    ccr_backend.images, ccr_backend.file_paths = saved
+
+
+def test_wb_result_is_rendered_before_it_is_shown(wb_panel):
+    """The eyedropper/AWB apply path: the new temp/tint reach the settings AND
+    the canvas is repainted from a fresh render, in that order."""
+    panel, img, log = wb_panel
+    panel.on_wb_sampled(-30, 12)
+    assert img.adjustment_settings["temperature"] == -30
+    assert img.adjustment_settings["tint"] == 12
+    assert "render" in log            # not just the stale cached preview
+    assert log[-1] == "show"          # ...and the fresh render is what's shown
+
+
+def test_wb_apply_leaves_no_pending_reprocess(wb_panel):
+    """The debounced reprocess is cancelled — the final state was rendered now,
+    so nothing is left queued to redo it."""
+    panel, _img, _log = wb_panel
+    panel.on_wb_sampled(-30, 12)
+    assert panel._pending_adjustment is None
+    assert not panel._debounce_timer.isActive()
+
+
+def test_auto_wb_button_applies_and_shows(wb_panel, backend):
+    """End-to-end: the AWB button estimates the cast, writes the sliders and
+    leaves a freshly rendered canvas."""
+    panel, img, log = wb_panel
+    backend.awb_algorithm = "gray_world"
+    panel._on_auto_wb()
+    assert img.adjustment_settings["temperature"] < 0      # warm cast → cooled
+    assert "render" in log and log[-1] == "show"
 
 
 if __name__ == "__main__":

@@ -108,7 +108,8 @@ correct it.
   - tint: `t = tanh(slider·0.02)·0.26·balance` → `G·(1−t)`, `R·(1+0.3t)`, `B·(1+0.3t)`
 - The result is applied by `sliders_panel.on_wb_sampled(temp, tint)`
   (`sliders_panel.py:1527`): blockSignals slider set + label update +
-  `on_slider_changed()` (stores into `adjustment_settings`, reprocesses, hint).
+  `on_slider_changed()` (stores into `adjustment_settings`, reprocesses, hint) +
+  `_settle_preview()` (renders and shows the result now — see §4.4).
 - `compute_neutral_temp_tint` is **scale-invariant** (it only uses channel
   ratios), so any positive-scaled RGB triple works as input.
 - Auto Gain (`spec/auto-gain.md`) established: backend flag + QSettings key +
@@ -133,13 +134,37 @@ d = base.astype(float32)
 d = (d - WS_B) * _WS_INV_WIDTH        if ws_windowed else d / 65535.0
 ```
 
-**Valid-pixel mask** (applied per pixel, all three channels must pass):
+**Valid-pixel mask — midtones only.** An uncropped film scan *always* contains
+pure black and pure white that is not scene content: the holder masks the film
+to pure black in the scan (→ clipped white once inverted) and the clear film
+base / sprocket holes are the scan's maximum (→ crushed black once inverted).
+Neither carries a usable cast, both are large, and they are noisy rather than
+exactly 1.0/0.0 — so a wide gate lets them through and they hijack the
+estimator (measured on a synthetic uncropped frame: `white_patch` returned a
+perfectly neutral 1.000/1.000, i.e. it balanced on the holder; `shades_of_gray`
+lost a third of the cast). AWB therefore reads the **midtones plus a slice of
+the shadows and highlights**, via two independent rejections:
 
 ```
-valid = all_channels(d >= AWB_LO) & all_channels(d <= AWB_HI)
-AWB_LO = 0.02      # noise floor / sub-black & holder rejection
-AWB_HI = 0.98      # near-clip & headroom rejection
+lum   = 0.299·R + 0.587·G + 0.114·B          # Rec.601, as compute_auto_gain_offset
+valid = all_channels(d >= AWB_LO) & all_channels(d <= AWB_HI)   # 1. ratios are real
+        & (lum >= AWB_TONE_LO) & (lum <= AWB_TONE_HI)           # 2. tonal region
+
+AWB_LO      = 0.06   # per-channel floor: clear-film black / crushed channel
+AWB_HI      = 0.94   # per-channel ceiling: holder white / blown channel
+AWB_TONE_LO = 0.15   # luminance band: midtones + a slice of the shadows...
+AWB_TONE_HI = 0.85   # ...and a slice of the highlights
 ```
+
+The per-channel gate guarantees no channel is crushed or blown, so the pixel's
+ratios mean something; the luminance band picks the tonal region the WB decision
+is made from. `AWB_LO < AWB_TONE_LO < AWB_TONE_HI < AWB_HI`, so the band is the
+binding limit on neutral content and the gate additionally catches single blown
+channels in saturated colors.
+
+This applies to **every** algorithm, `white_patch` included: it takes the
+brightest *retained* pixel, i.e. the brightest real scene highlight rather than
+the film surround.
 
 If `valid.sum() < MIN_CONTENT_FRACTION · N` (reuse 0.005), the estimate is
 `None` → the button shows a hint ("AWB: not enough usable image content") and the
@@ -170,6 +195,9 @@ Notes:
   gradient magnitude `sqrt(gx²+gy²)` (numpy `np.gradient`), then the Minkowski
   p=6 mean over pixels whose source pixel is valid. Uses `cv2.GaussianBlur` if
   available (cv2 is already a dependency), else a small numpy separable blur.
+  The mask is **eroded** by a 5×5 kernel first: the blur+gradient stencil reaches
+  ~2 px, so a sample merely *next to* a rejected pixel still carries that pixel's
+  edge — and the holder border is the strongest edge in an uncropped scan.
 - Degenerate guard: if any channel estimate ≤ `AWB_EPS` (1e-6), return `None`.
 
 ### 4.3 New module `src/core/awb.py`
@@ -219,6 +247,15 @@ pattern as `ccr_image.py`) to read the selected algorithm.
   ```
   Everything downstream (undo burst, slider set, store, reprocess, hint) is the
   existing `on_wb_sampled` path.
+- **The result must appear immediately.** `on_slider_changed()` only *queues* a
+  debounced (150 ms) reprocess and paints the currently cached
+  `resized_preview` — fine for a slider drag, where the next tick redraws, but a
+  one-shot click would leave the canvas on the pre-AWB render until the user
+  touched something else. `on_wb_sampled` therefore ends with
+  `_settle_preview()`: cancel the pending reprocess, `update_thumbnail_and_preview()`,
+  *then* `update_preview()` + thumbnail refresh. `_settle_preview` is the shared
+  discrete-edit settle, factored out of `_on_curve_edit_finished`
+  (`sliders_panel.py`), and covers the WB eyedropper too — same one-shot shape.
 
 ### 4.5 The post-conversion hook
 

@@ -21,12 +21,30 @@ AWB_ALGORITHMS = [
 ]
 AWB_DEFAULT = "gray_world"
 
-AWB_LO = 0.02          # noise floor: sub-black / film-holder rejection
-AWB_HI = 0.98          # near-clip / headroom rejection
+# An uncropped film scan always contains pure black AND pure white that is not
+# scene content: the holder masks the film to pure black in the scan (→ clipped
+# white once inverted) and the clear film base / sprocket holes are the scan's
+# maximum (→ crushed black once inverted). Neither carries a usable cast, and
+# both are big enough to hijack every estimator. So AWB reads the MIDTONES plus
+# a slice of the shadows and highlights, and nothing else:
+#   1. per-channel gate — no channel crushed or blown, so the ratios are real
+#   2. luminance band  — the tonal region the WB decision is actually made from
+AWB_LO = 0.06          # per-channel floor: clear-film black / crushed channel
+AWB_HI = 0.94          # per-channel ceiling: holder white / blown channel
+AWB_TONE_LO = 0.15     # luminance band: midtones + a slice of the shadows...
+AWB_TONE_HI = 0.85     # ...and a slice of the highlights
 AWB_EPS = 1e-6
 _WP_PERCENTILE = 99.0  # white_patch: robust max-RGB
 _MINK_P = 6.0          # Minkowski norm for shades_of_gray / gray_edge
 _GE_SIGMA = 1.0        # gray_edge pre-smoothing
+_GE_ERODE = 5          # gray_edge: mask shrink (px kernel) around rejected pixels
+# Rec.601 luma over RGB — the convention compute_auto_gain_offset uses.
+_LUMA = (0.299, 0.587, 0.114)
+
+
+def _luminance(flat):
+    """Luma of an (N,3) RGB float array."""
+    return (_LUMA[0] * flat[:, 0] + _LUMA[1] * flat[:, 1] + _LUMA[2] * flat[:, 2])
 
 
 def _gray_edge_estimate(d, valid_mask):
@@ -36,7 +54,13 @@ def _gray_edge_estimate(d, valid_mask):
     sm = cv2.GaussianBlur(d, (0, 0), _GE_SIGMA)
     gy, gx = np.gradient(sm, axis=(0, 1))
     mag = np.sqrt(gx * gx + gy * gy)
-    m = mag.reshape(-1, 3)[valid_mask.reshape(-1)]
+    # The blur + gradient stencil reaches a couple of pixels, so a sample that
+    # merely sits NEXT to a rejected pixel still carries that pixel's edge — the
+    # holder border is the strongest edge in an uncropped scan and would
+    # otherwise dominate the p-mean. Shrink the mask by that reach.
+    kept = cv2.erode(valid_mask.astype(np.uint8),
+                     np.ones((_GE_ERODE, _GE_ERODE), np.uint8)).astype(bool)
+    m = mag.reshape(-1, 3)[kept.reshape(-1)]
     if m.shape[0] == 0:
         return None
     return np.mean(m ** _MINK_P, axis=0) ** (1.0 / _MINK_P)
@@ -46,6 +70,10 @@ def estimate_neutral_rgb(base_u16, ws_windowed=False, algorithm=AWB_DEFAULT):
     """Estimated neutral (cast) RGB triple of a converted base, or None when
     there is not enough usable content. The scale is arbitrary —
     compute_neutral_temp_tint only uses channel ratios. Index 0=R, 1=G, 2=B.
+    Only midtone pixels vote (AWB_LO/AWB_HI + AWB_TONE_LO/AWB_TONE_HI), so the
+    pure black and pure white an uncropped film scan always carries — clear
+    film base, sprocket holes, the holder surround — cannot reach any
+    estimator, white_patch included.
     Unknown algorithm ids fall back to gray_world (forward-compat settings)."""
     if base_u16 is None or getattr(base_u16, "size", 0) == 0:
         return None
@@ -56,7 +84,9 @@ def estimate_neutral_rgb(base_u16, ws_windowed=False, algorithm=AWB_DEFAULT):
     else:
         d *= np.float32(1.0 / 65535.0)
     flat = d.reshape(-1, 3)
-    valid = np.all((flat >= AWB_LO) & (flat <= AWB_HI), axis=1)
+    lum = _luminance(flat)
+    valid = (np.all((flat >= AWB_LO) & (flat <= AWB_HI), axis=1)
+             & (lum >= AWB_TONE_LO) & (lum <= AWB_TONE_HI))
     if valid.sum() < MIN_CONTENT_FRACTION * flat.shape[0]:
         return None
     if algorithm == "white_patch":
