@@ -232,6 +232,92 @@ def test_user_named_combos_elide(window, owner, attr):
         f"{owner}.{attr} holds arbitrary user text and must elide it")
 
 
+def test_selecting_a_film_stock_does_not_widen_the_panel(window):
+    """The status line under the combo NAMES the selected stock.
+
+    Keeping the combo itself narrow is only half of it: a plain QLabel's
+    minimum width is its whole text, so this line was enough on its own to push
+    the scroll content ~200px past the panel and clip every row in it — the
+    combo looked innocent because it already elides.
+    """
+    panel = window.sliders_panel
+    layout = panel.findChild(QScrollArea).widget().layout()
+    before = layout.minimumSize().width()
+    saved = (ccr_backend.black_point_bgr, ccr_backend.white_point_bgr,
+             ccr_backend.film_stock_name)
+    try:
+        ccr_backend.black_point_bgr = (100.0, 100.0, 100.0)
+        ccr_backend.white_point_bgr = None
+        ccr_backend.film_stock_name = "Kodak Portra 400 pushed two stops, 2026 batch"
+        panel._update_bwp_mode_label()
+        _app.processEvents()
+        assert panel.bwp_mode_label.text(), "the status line should be showing"
+        after = layout.minimumSize().width()
+    finally:
+        (ccr_backend.black_point_bgr, ccr_backend.white_point_bgr,
+         ccr_backend.film_stock_name) = saved
+        panel._update_bwp_mode_label()
+    assert after == before <= theme.PANEL_W, (
+        f"naming a film stock widened the content minimum from {before} to "
+        f"{after} (panel is {theme.PANEL_W}px)")
+
+
+def test_long_hint_word_does_not_widen_the_panel(window):
+    """The hint label wraps, which bounds it at its longest WORD — and a film
+    stock named without spaces is a single word."""
+    panel = window.sliders_panel
+    before = panel.minimumSizeHint().width()
+    try:
+        panel.set_temporary_hint(
+            'Film stock "Kodak_Portra_400_pushed_two_stops_2026_batch" deleted.',
+            duration=60000)
+        _app.processEvents()
+        after = panel.minimumSizeHint().width()
+    finally:
+        panel.hint_label.setText("")
+    assert after == before <= theme.PANEL_W, (
+        f"an unbreakable hint word widened the panel minimum from {before} to "
+        f"{after}")
+
+
+# The status line elides the same way the combos do, for the same reason: it
+# carries a user-supplied name in a panel that cannot scroll sideways.
+
+LONG_STATUS = ('Anchor source: film stock (black point only) — '
+               'Kodak Portra 400 pushed two stops, 2026 batch')
+SHORT_STATUS = "Anchor source: white point (two-point)"
+
+
+def _render_label(cls, text, *, width=324):
+    label = cls()
+    label.setText(text)
+    label.setFixedSize(width, theme.CONTROL_H)
+    _app.processEvents()
+    return label.grab().toImage()
+
+
+def test_eliding_label_matches_qt_exactly_for_text_that_fits():
+    """Drawing the text by hand must change nothing but the eliding — placement
+    and colour both come from the label, and either can silently drift."""
+    assert (_render_label(QLabel, SHORT_STATUS)
+            == _render_label(theme.ElidingLabel, SHORT_STATUS)), (
+        "text that fits must render exactly as QLabel draws it")
+
+
+def test_eliding_label_shortens_text_that_does_not_fit():
+    assert (_render_label(QLabel, LONG_STATUS)
+            != _render_label(theme.ElidingLabel, LONG_STATUS)), (
+        "text too long for the label must be elided, not clipped")
+
+
+def test_eliding_label_keeps_the_full_text_in_its_tooltip():
+    """Elision hides part of a name the user chose — the tooltip is the only
+    place it stays readable."""
+    label = theme.ElidingLabel()
+    label.setText(LONG_STATUS)
+    assert label.toolTip() == LONG_STATUS
+
+
 def test_eliding_combo_leaves_the_popup_list_intact(window):
     """Elision is display-only: the dropdown must still offer full names."""
     combo = window.sliders_panel.film_stock_combo

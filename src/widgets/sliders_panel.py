@@ -484,8 +484,11 @@ class SlidersPanel(QWidget):
         self._settings.remove("convert/film_stock_selected")
         self._reload_film_stock_combo(select="")
 
-        # Shows which slope source the next conversion will use.
-        self.bwp_mode_label = QLabel("")
+        # Shows which slope source the next conversion will use. Eliding: this
+        # line names the selected film stock, and a user-supplied name is
+        # arbitrarily long — as a plain QLabel it would set a minimum width the
+        # whole scroll content has to honour, clipping every row in the panel.
+        self.bwp_mode_label = theme.ElidingLabel("")
         self.bwp_mode_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         # Starts empty (no black point yet); an empty label would still reserve a
         # line of height + spacing, leaving a gap between this and the Convert row,
@@ -760,6 +763,12 @@ class SlidersPanel(QWidget):
         # --- Hint label — fixed at bottom, outside scroll area ---
         self.hint_label = QLabel()
         self.hint_label.setWordWrap(True)
+        # Hints quote film-stock names ('Film stock "…" deleted.'), and word
+        # wrap only lowers a label's minimum width to its longest WORD — an
+        # unbroken name is one word, and one long enough would widen the panel
+        # past its fixed width. This drops the minimum to nothing; a name that
+        # cannot wrap is clipped instead of taking the panel with it.
+        theme.keep_out_of_minimum_width(self.hint_label)
         self.hint_label.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 12px; margin-top: 8px;")
         self.hint_label.setText("")
         layout.addWidget(self.hint_label)
@@ -1630,7 +1639,10 @@ class SlidersPanel(QWidget):
         elif wp_set:
             text = "Anchor source: white point (two-point)"
         elif stock:
-            text = f'Anchor source: film stock "{stock}" (black point only)'
+            # Stock name LAST: the label elides from the right, and the mode is
+            # the part worth keeping — a name in the middle would eat
+            # "(black point only)" and leave the line saying nothing useful.
+            text = f'Anchor source: film stock (black point only) — {stock}'
         else:
             text = "Anchor source: default slope (black point only)"
         self.bwp_mode_label.setText(text)

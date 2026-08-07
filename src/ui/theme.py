@@ -14,7 +14,7 @@ import tempfile
 
 from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter, QPen
-from PySide6.QtWidgets import QComboBox, QWidget
+from PySide6.QtWidgets import QComboBox, QLabel, QWidget
 
 # --------------------------------------------------------------------------- #
 # 3.1 Surfaces (neutral grays — zero hue)
@@ -501,6 +501,62 @@ class ElidingComboBox(QComboBox):
         painter.drawText(
             rect, Qt.AlignLeft | Qt.AlignVCenter,
             self.fontMetrics().elidedText(full, Qt.ElideRight, rect.width()))
+
+
+def keep_out_of_minimum_width(widget):
+    """Stop a widget's own text from setting its panel's minimum width.
+
+    ``qSmartMinSize`` — what a layout asks each item for — skips the width
+    entirely when the horizontal policy is Ignored, and only then. Mutate the
+    policy already on the widget rather than building a fresh one: QLabel keeps
+    its height-for-width bit in there, and dropping that stops a word-wrapped
+    label from reporting the taller height its wrapped text needs.
+    """
+    from PySide6.QtWidgets import QSizePolicy
+    policy = widget.sizePolicy()
+    policy.setHorizontalPolicy(QSizePolicy.Ignored)
+    widget.setSizePolicy(policy)
+    return widget
+
+
+class ElidingLabel(QLabel):
+    """A single-line label that shortens its text rather than widening its panel.
+
+    A QLabel's minimum width is the full width of its text, so a label carrying
+    a user-supplied name inside a fixed-width panel does not merely overflow its
+    own line — it raises the minimum width of everything laid out beside it and
+    pushes the panel's content past the edge, where horizontal scrolling is off
+    and the whole panel clips. Word wrap is not a fix on its own: it lowers the
+    minimum only to the longest WORD, and "Kodak_Portra_400_pushed" is one word.
+
+    Eliding happens at PAINT time, against the width the layout actually handed
+    out — a label that is currently hidden has never been laid out, so its own
+    width() at setText time is stale or still the default. The full text stays
+    in the tooltip.
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        keep_out_of_minimum_width(self)
+
+    def setText(self, text):
+        # Not a virtual in Qt, so this only covers Python callers — which is all
+        # of them here. The elided form hides part of the name; the tooltip is
+        # where it stays readable.
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        # QPainter starts on a black pen. The QSS `color:` reaches a QLabel as
+        # its palette foreground role, so read it from there — otherwise muted
+        # text paints black on the dark theme.
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        rect = self.contentsRect()
+        painter.drawText(
+            rect, int(self.alignment()),
+            self.fontMetrics().elidedText(
+                self.text(), Qt.ElideRight, rect.width()))
 
 
 def section_separator():

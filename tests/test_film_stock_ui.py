@@ -71,8 +71,10 @@ def test_black_only_states_and_label(panel):
     ccr_backend.set_black_point(BASE_BGR)
     panel._update_bwp_mode_label()
     assert ccr_backend.film_stock_slopes == (0.85, 0.65, 0.56)
+    # Name last: the label elides from the right (it sits in a fixed-width
+    # panel), so the mode has to come first or a long stock name eats it.
     assert panel.bwp_mode_label.text() == \
-        'Anchor source: film stock "Portra 400" (black point only)'
+        'Anchor source: film stock (black point only) — Portra 400'
     assert not panel.save_film_stock_btn.isEnabled()
     assert panel.delete_film_stock_btn.isEnabled()
     # Back to Default: backend cleared, label reverts, delete gated off.
