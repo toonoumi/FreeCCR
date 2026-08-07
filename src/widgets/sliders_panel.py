@@ -447,10 +447,12 @@ class SlidersPanel(QWidget):
         stock_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         stock_label.setFixedHeight(theme.CONTROL_H)
         stock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.film_stock_combo = QComboBox()
+        # Stock names are user-supplied and can be long: shrinkable_combo keeps
+        # the longest one from setting the panel's minimum width, and the
+        # eliding combo ends the displayed name in "…" instead of letting it run
+        # under the arrow half-drawn.
+        self.film_stock_combo = theme.ElidingComboBox()
         self.film_stock_combo.setFixedHeight(theme.CONTROL_H)
-        # Stock names are user-supplied and can be long; without this the
-        # longest one sets the panel's minimum width and clips the panel.
         theme.shrinkable_combo(self.film_stock_combo)
         self.save_film_stock_btn = QPushButton("＋")
         self.save_film_stock_btn.setFixedWidth(theme.GLYPH_W)

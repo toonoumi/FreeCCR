@@ -113,7 +113,9 @@ class ThumbnailList(QWidget):
         # Camera-profile picker — choose which imported / IT8-generated profile
         # (kept in FreeCCR's library) is applied at decode, or None. Manage the
         # library in Settings ▸ Color Management. See spec/camera-profile-library.md.
-        self.profile_combo = QComboBox()
+        # Eliding: profile names are user-supplied filenames and routinely
+        # outrun this 216px-wide sidebar, where Qt would clip them mid-glyph.
+        self.profile_combo = theme.ElidingComboBox()
         self.profile_combo.setToolTip(
             "Camera input profile applied at decode, from your imported / "
             "IT8-generated library. 'None' applies no profile. Add and manage "

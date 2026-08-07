@@ -135,6 +135,31 @@ def test_panel_survives_a_wider_ui_font():
         _app.setFont(base)
 
 
+def test_long_camera_profile_does_not_widen_the_sidebar(window):
+    """Camera-profile entries are user-imported ICC/DCP filenames of any
+    length. The sidebar is a fixed width, so the combo must elide rather than
+    push the layout's minimum past it."""
+    sidebar = window.thumbnail_list
+    combo = sidebar.profile_combo
+    before = sidebar.layout.minimumSize().width()
+    # blockSignals: selecting an entry fires _on_profile_combo_changed, which
+    # tries to activate the profile and raises a modal warning for a bogus
+    # path — that hangs a headless run. refresh_profile_combo() blocks the same
+    # way when it repopulates.
+    combo.blockSignals(True)
+    combo.addItem("Canon EOS R5 Adobe Standard v3 daylight  (DCP)", "x")
+    combo.setCurrentIndex(combo.count() - 1)
+    combo.blockSignals(False)
+    _app.processEvents()
+    after = sidebar.layout.minimumSize().width()
+    combo.blockSignals(True)
+    combo.removeItem(combo.count() - 1)
+    combo.blockSignals(False)
+    assert after == before <= sidebar.width(), (
+        f"a long camera-profile name widened the sidebar minimum from "
+        f"{before} to {after} (sidebar is {sidebar.width()}px)")
+
+
 def test_long_combo_entry_does_not_widen_the_panel(window):
     """A user-named film stock is arbitrarily long; the combo must elide it
     instead of pushing the panel's content past its edge."""
@@ -155,3 +180,65 @@ def test_long_combo_entry_does_not_widen_the_panel(window):
 def test_panel_combos_are_shrinkable(window, attr):
     combo = getattr(window.sliders_panel, attr)
     assert combo.sizeAdjustPolicy() == QComboBox.AdjustToMinimumContentsLengthWithIcon
+
+
+# --- eliding: the combos that carry user-supplied names ---------------------
+# Width is only half the problem. Qt does not elide a non-editable QComboBox —
+# it draws the label into the edit-field rect and lets the glyphs run under the
+# arrow, so a long film-stock or camera-profile name reads as
+# "Fuji Superia X-TRA 40" with nothing to say it was cut.
+
+LONG_NAME = "Fuji Superia X-TRA 400 — expired 2019 batch"
+SHORT_NAME = "Default"
+
+
+def _render(cls, text, *, enabled=True, width=168):
+    combo = cls()
+    combo.addItem(text)
+    combo.setEnabled(enabled)
+    combo.setFixedSize(width, theme.CONTROL_H)
+    _app.processEvents()
+    return combo.grab().toImage()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_eliding_combo_matches_qt_exactly_for_text_that_fits(enabled):
+    """Painting the label by hand must not change anything but the eliding.
+
+    The custom paintEvent re-draws the label itself, so it can silently drift
+    from Qt on placement (an inset shifts short labels out of line with the
+    rest of the row) or on colour (losing the disabled group). Pixel equality
+    in the fits-fine case is the guard, checked in both enabled states.
+    """
+    assert (_render(QComboBox, SHORT_NAME, enabled=enabled)
+            == _render(theme.ElidingComboBox, SHORT_NAME, enabled=enabled)), (
+        "text that fits must render exactly as Qt draws it")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_eliding_combo_shortens_text_that_does_not_fit(enabled):
+    assert (_render(QComboBox, LONG_NAME, enabled=enabled)
+            != _render(theme.ElidingComboBox, LONG_NAME, enabled=enabled)), (
+        "text too long for the box must be elided, not clipped like Qt's")
+
+
+@pytest.mark.parametrize("owner,attr", [
+    ("sliders_panel", "film_stock_combo"),      # user-named film stocks
+    ("thumbnail_list", "profile_combo"),        # user-imported ICC/DCP names
+])
+def test_user_named_combos_elide(window, owner, attr):
+    combo = getattr(getattr(window, owner), attr)
+    assert isinstance(combo, theme.ElidingComboBox), (
+        f"{owner}.{attr} holds arbitrary user text and must elide it")
+
+
+def test_eliding_combo_leaves_the_popup_list_intact(window):
+    """Elision is display-only: the dropdown must still offer full names."""
+    combo = window.sliders_panel.film_stock_combo
+    combo.blockSignals(True)
+    combo.addItem(LONG_NAME)
+    combo.blockSignals(False)
+    assert combo.itemText(combo.count() - 1) == LONG_NAME
+    combo.blockSignals(True)
+    combo.removeItem(combo.count() - 1)
+    combo.blockSignals(False)

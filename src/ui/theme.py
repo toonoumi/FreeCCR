@@ -14,7 +14,7 @@ import tempfile
 
 from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QComboBox, QWidget
 
 # --------------------------------------------------------------------------- #
 # 3.1 Surfaces (neutral grays — zero hue)
@@ -450,12 +450,57 @@ def shrinkable_combo(combo, *, min_chars=6):
     adding one long preset name (a film stock, a colour profile) is then enough
     to push a fixed-width panel's content past its edge and clip it. Sizing to a
     short contents length instead lets the combo shrink to the space the row can
-    spare and elide the text, which is what a narrow side panel needs.
+    spare, which is what a narrow side panel needs.
+
+    This governs the combo's WIDTH only. Text too long for the resulting box is
+    hard-clipped by Qt unless the combo also elides — see ElidingComboBox.
     """
     from PySide6.QtWidgets import QComboBox
     combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
     combo.setMinimumContentsLength(min_chars)
     return combo
+
+
+class ElidingComboBox(QComboBox):
+    """A combo whose closed-state text ends in "…" when it doesn't fit.
+
+    Qt does not elide a non-editable QComboBox: it draws the label into the
+    edit-field rect and lets the glyphs run under the arrow, so a long
+    user-supplied name (a film stock, a camera profile) reads as
+    ``Fuji Superia X-TRA 40`` with no sign that anything was cut. Nothing in the
+    UI then says the selection is longer than what's shown.
+
+    The frame and arrow are still painted by the active style, so the app's
+    global QSS applies unchanged; only the label is drawn here, elided to the
+    edit-field rect. The popup list is untouched, so the full names are always
+    one click away. Tooltips are left alone — callers set their own.
+    """
+
+    def paintEvent(self, _event):
+        from PySide6.QtWidgets import (QStyle, QStyleOptionComboBox,
+                                       QStylePainter)
+        painter = QStylePainter(self)
+        # Pick the colour group explicitly: the global QSS has no
+        # QComboBox:disabled rule, so a disabled combo's dimmed text comes from
+        # the palette's Disabled group. Drawing the label ourselves would
+        # otherwise render it at full strength and lose the disabled look.
+        group = QPalette.Active if self.isEnabled() else QPalette.Disabled
+        painter.setPen(self.palette().color(group, QPalette.Text))
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        full = opt.currentText
+        # Blank the text so the style paints frame + arrow only; drawing the
+        # label twice would leave the un-elided version showing underneath.
+        opt.currentText = ""
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        # The edit-field sub-control rect already carries the style's padding —
+        # do NOT inset it further, or short labels shift a few px right of where
+        # Qt would have drawn them and the combo stops matching its neighbours.
+        rect = self.style().subControlRect(
+            QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxEditField, self)
+        painter.drawText(
+            rect, Qt.AlignLeft | Qt.AlignVCenter,
+            self.fontMetrics().elidedText(full, Qt.ElideRight, rect.width()))
 
 
 def section_separator():
