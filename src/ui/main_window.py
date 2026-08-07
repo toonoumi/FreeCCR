@@ -161,7 +161,7 @@ class MainWindow(QMainWindow):
         self.image_preview.setMinimumWidth(900)
 
         self.sliders_panel = SlidersPanel(self)
-        self.sliders_panel.setFixedWidth(300)
+        self.sliders_panel.setFixedWidth(theme.PANEL_W)
         self.sliders_panel.set_sliders_enabled(False)
         self.sliders_panel.image_preview = self.image_preview
 
@@ -170,7 +170,7 @@ class MainWindow(QMainWindow):
         # SlidersPanel's parent().parent() chain to MainWindow stays valid.
         # See spec/dust-removal.md.
         self.dust_panel = DustRemovalPanel(self, self.image_preview)
-        self.dust_panel.setFixedWidth(300)
+        self.dust_panel.setFixedWidth(theme.PANEL_W)
         self.dust_panel.setVisible(False)
         self.image_preview.set_dust_panel(self.dust_panel)
 
@@ -178,7 +178,7 @@ class MainWindow(QMainWindow):
         # pattern as dust_panel (keeps SlidersPanel's parent chain valid). See
         # spec/crop-panel.md.
         self.crop_panel = CropPanel(self, self.image_preview)
-        self.crop_panel.setFixedWidth(300)
+        self.crop_panel.setFixedWidth(theme.PANEL_W)
         self.crop_panel.setVisible(False)
         self.image_preview.set_crop_panel(self.crop_panel)
 

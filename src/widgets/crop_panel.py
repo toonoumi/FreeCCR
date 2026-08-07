@@ -51,6 +51,7 @@ class CropPanel(QWidget):
         layout.addWidget(self._section_label("Aspect Ratio"))
         self.aspect_combo = QComboBox()
         self.aspect_combo.setFixedHeight(theme.CONTROL_H)
+        theme.shrinkable_combo(self.aspect_combo)
         for label, key, _ratio in crop_aspect.ASPECT_PRESETS:
             self.aspect_combo.addItem(label, key)
         self.aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)

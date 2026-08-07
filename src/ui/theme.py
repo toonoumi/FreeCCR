@@ -85,8 +85,17 @@ GAP_SECTION = SPACE_XL    # 12 — between functional groups (usually with a sep
 CONTROL_H = 28            # sliders, combos, labels, normal & secondary buttons, tabs
 CONTROL_H_LG = 36         # weighty primary commits (Done, Export)
 GLYPH_W = 28             # square glyph buttons (✕ remove / clear) — one width
-LABEL_COL_W = 90          # right-aligned label gutter — fits the longest label ("Subtracted Sat")
+LABEL_COL_W = 100         # right-aligned label gutter — the longest label
+                          # ("Subtracted Sat") measures 89px in the macOS system
+                          # font, so 90 left it flush against the panel border and
+                          # one font step away from clipping. Keep slack here.
 VALUE_COL_W = 40          # left-aligned value gutter in a 3-column row
+PANEL_W = 340             # the right-hand side panels (sliders / dust / crop).
+                          # Widest row is WB Picker|AWB|Crop|Slice at ~293px, so
+                          # this must stay >= that + 2*GAP_PANEL, with slack for
+                          # systems whose UI font is wider than the one it was
+                          # measured on — a panel that is too narrow silently
+                          # CLIPS its content (horizontal scrolling is off).
 DIALOG_W_SM = 280         # progress / simple dialogs
 DIALOG_W_MD = 440         # forms (export, update, sync)
 
@@ -431,6 +440,22 @@ def apply_button_row(layout, *, spacing=GAP_BTN):
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(spacing)
     return layout
+
+
+def shrinkable_combo(combo, *, min_chars=6):
+    """Stop a QComboBox from dictating its panel's width.
+
+    A QComboBox's default minimumSizeHint is wide enough for its LONGEST ITEM,
+    which propagates all the way out as a hard minimum on the containing panel —
+    adding one long preset name (a film stock, a colour profile) is then enough
+    to push a fixed-width panel's content past its edge and clip it. Sizing to a
+    short contents length instead lets the combo shrink to the space the row can
+    spare and elide the text, which is what a narrow side panel needs.
+    """
+    from PySide6.QtWidgets import QComboBox
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(min_chars)
+    return combo
 
 
 def section_separator():

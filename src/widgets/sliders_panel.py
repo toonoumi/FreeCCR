@@ -449,6 +449,9 @@ class SlidersPanel(QWidget):
         stock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.film_stock_combo = QComboBox()
         self.film_stock_combo.setFixedHeight(theme.CONTROL_H)
+        # Stock names are user-supplied and can be long; without this the
+        # longest one sets the panel's minimum width and clips the panel.
+        theme.shrinkable_combo(self.film_stock_combo)
         self.save_film_stock_btn = QPushButton("＋")
         self.save_film_stock_btn.setFixedWidth(theme.GLYPH_W)
         self.save_film_stock_btn.setFixedHeight(theme.CONTROL_H)
@@ -834,6 +837,7 @@ class SlidersPanel(QWidget):
         self.color_profile_combo = QComboBox()
         self.color_profile_combo.addItems(["Color", "Black & White"])
         self.color_profile_combo.setFixedHeight(theme.CONTROL_H)
+        theme.shrinkable_combo(self.color_profile_combo)
         self.color_profile_combo.currentIndexChanged.connect(self.on_color_profile_changed)
 
         row = QHBoxLayout()
