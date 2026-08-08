@@ -35,7 +35,7 @@ Use the adjustment sliders on the right panel:
 - **White/Black Point**: Set highlight and shadow clipping points
 - **Contrast**: Increase or decrease contrast
 - **Saturation**: Adjust color intensity
-You can use the "Sync to All" button to apply adjustments to all images, or use `Ctrl/Command+C` and `Ctrl/Command+V` to copy and paste settings to another image. Both ask which setting groups you mean — white balance, tone, saturation, crop, curves and so on — so you can copy just the crop, or just the white balance, and leave everything else on the target image untouched.
+You can use the "Sync to All" button to apply adjustments to all images, or use `Ctrl/Command+C` and `Ctrl/Command+V` to copy and paste settings to another image. Both ask which setting groups you mean — white balance, tone, saturation, crop, orientation (90° rotation and mirroring), curves and so on — so you can copy just the crop, or just the white balance, and leave everything else on the target image untouched.
 
 ### Step 7: Export Your Images
 -  (Optional) Select Checkbox **Export Jpg** to export JPEG for web use

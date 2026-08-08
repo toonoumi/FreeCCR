@@ -23,7 +23,8 @@ FILM_STOCK_DEFAULT_LABEL = "Default"
 
 # Setting groups offered by the "Sync to All" and "Copy Settings" dialogs. The
 # adjustment-key groups partition SlidersPanel.ADJUSTMENT_KEYS exactly; "crop"
-# syncs the image's crop box (rect + angle) instead of adjustment keys.
+# syncs the image's crop box (rect + angle) and "orientation" its coarse
+# rotation/mirror flags, instead of adjustment keys.
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
@@ -32,6 +33,12 @@ SYNC_GROUPS = [
       "shadows", "black_point", "contrast")),
     ("sat", "Saturation", ("saturation", "sub_saturation")),
     ("crop", "Crop", ()),
+    # Coarse 90-degree rotation + the mirror flags, synced like crop (whole-image
+    # properties, not adjustment keys). fine_rotation_angle is deliberately NOT
+    # part of this group — it is measured per frame from that frame's own film
+    # edge, and the straighten a user sets rides "crop" as the crop angle.
+    # See spec/orientation-sync-group.md.
+    ("orientation", "Orientation (rotate 90° / mirror)", ()),
     ("channels", "Channel Levels", (
         "ch_input_gain", "ch_master_shift", "ch_master_gain",
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
@@ -46,6 +53,22 @@ SYNC_GROUPS = [
     # slider), so it's synced specially in _perform_sync_to_all, like crop.
     ("curves", "Curves", ()),
 ]
+
+
+def _orientation_of(img):
+    """The "orientation" group's value for an image: coarse rotation + mirrors.
+    Returns the default triple for a missing image so callers can compare
+    without None-checks."""
+    if img is None:
+        return (0, False, False)
+    return (getattr(img, "rotation_angle", 0),
+            bool(getattr(img, "horizontal_mirrored", False)),
+            bool(getattr(img, "vertical_mirrored", False)))
+
+
+def _apply_orientation(img, orientation):
+    """Write an _orientation_of() triple back onto an image."""
+    img.rotation_angle, img.horizontal_mirrored, img.vertical_mirrored = orientation
 
 
 class SyncSettingsDialog(QDialog):
@@ -311,6 +334,9 @@ class SlidersPanel(QWidget):
         self.copied_selection = None   # {gid: bool} used for this clipboard
         self.copied_profile = None     # "color"/"bw" when the profile group was copied
         self.copied_crop = None        # (crop_rect, crop_angle) when crop was copied
+        # (rotation_angle, horizontal_mirrored, vertical_mirrored) when the
+        # orientation group was copied. See spec/orientation-sync-group.md.
+        self.copied_orientation = None
         self._hint_timer = QTimer(self)  # Timer for temporary hints
         self._hint_timer.setSingleShot(True)
         
@@ -1444,6 +1470,7 @@ class SlidersPanel(QWidget):
         sync_crop = bool(selection.get("crop"))
         sync_profile = bool(selection.get("profile"))
         sync_curves = bool(selection.get("curves"))
+        sync_orientation = bool(selection.get("orientation"))
         # Sync always copies the SOURCE image's GLOBAL (whole-image) layer, not
         # the live sliders — those may currently reflect an active area, and
         # areas are per-image (never synced). Read from the global dict.
@@ -1454,6 +1481,7 @@ class SlidersPanel(QWidget):
         crop_rect = src.crop_rect if src is not None else None
         crop_angle = getattr(src, "crop_angle", 0.0) if src is not None else 0.0
         src_profile = getattr(src, "color_profile", "color") if src is not None else "color"
+        src_orientation = _orientation_of(src)
         print(f"Syncing groups {sorted(g for g, on in selection.items() if on)} to all images")
 
         for img in ccr_backend.images:
@@ -1464,7 +1492,9 @@ class SlidersPanel(QWidget):
                                           or getattr(img, "crop_angle", 0.0) != crop_angle)
             profile_changes = sync_profile and getattr(img, "color_profile", "color") != src_profile
             curves_changes = sync_curves and img.adjustment_settings.get("curves") != src_curves
-            if not adj_changes and not crop_changes and not profile_changes and not curves_changes:
+            orient_changes = sync_orientation and _orientation_of(img) != src_orientation
+            if (not adj_changes and not crop_changes and not profile_changes
+                    and not curves_changes and not orient_changes):
                 continue  # nothing to change — and no dead undo snapshot
             img.push_undo_state()
             if adj_changes:
@@ -1498,6 +1528,10 @@ class SlidersPanel(QWidget):
                 img.crop_angle = crop_angle
             if profile_changes:
                 img.color_profile = src_profile
+            if orient_changes:
+                # Display-level only (no reprocess): the thumbnail refresh and
+                # update_preview below re-apply it from these attributes.
+                _apply_orientation(img, src_orientation)
             if adj_changes or profile_changes or curves_changes or crop_changes:
                 # Adjustments, curves, and the color profile all change pixels;
                 # a crop change moves the region the histogram is computed over
@@ -1924,6 +1958,9 @@ class SlidersPanel(QWidget):
                                if selection.get("profile") and img is not None else None)
         self.copied_crop = ((img.crop_rect, getattr(img, "crop_angle", 0.0))
                             if selection.get("crop") and img is not None else None)
+        self.copied_orientation = (_orientation_of(img)
+                                   if selection.get("orientation") and img is not None
+                                   else None)
         self.copied_selection = selection
         print(f"Copied groups {sorted(g for g, on in selection.items() if on)}: "
               f"{self.copied_adjustment}")
@@ -2001,6 +2038,16 @@ class SlidersPanel(QWidget):
                 # target's crop. The reprocess below refreshes the crop-aware
                 # histogram.
                 img.crop_rect, img.crop_angle = self.copied_crop
+            if (selection.get("orientation") and self.copied_orientation is not None
+                    and _orientation_of(img) != self.copied_orientation):
+                # Unlike Sync to All (whose source IS the displayed image), a
+                # paste re-orients what's on screen — a kept zoom would strand
+                # the viewport, exactly as for rotate_left/right and undo.
+                _apply_orientation(img, self.copied_orientation)
+                reset_zoom = getattr(self.parent().parent().image_preview,
+                                     "_reset_zoom", None)
+                if callable(reset_zoom):
+                    reset_zoom()
 
         ccr_backend.set_active_settings_by_index(
             self.current_idx, merged, reprocess=True)
