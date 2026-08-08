@@ -13,6 +13,24 @@ The theme's global QSS sets the control padding these widths come from, so the
 panels are measured inside a real MainWindow with the theme applied — a bare
 panel would report Qt's unstyled defaults instead. The window is never closed:
 MainWindow.closeEvent raises a modal confirm-exit dialog that would hang.
+
+Two kinds of test live here, and only one of them can run everywhere:
+
+* **Fit budgets** — "this row fits the panel" — are absolute pixel claims, so
+  they are only meaningful when the widths come from a real UI font. Qt no
+  longer ships fonts, and the offscreen platform on a machine with no
+  fontconfig (Windows, typically) has *none*: QFontDatabase is empty and every
+  measurement falls back to a last-resort face roughly twice as wide as a real
+  one — "Subtracted Sat" measures 168px there against 76px in Segoe UI. Held to
+  that, PANEL_W would have to exceed 500px to pass, for a font no user will
+  ever see. These tests carry @needs_ui_font and skip where there is none.
+* **Behavioural claims** — "a long name does not widen the panel", "the label
+  elides" — hold under any font, including the fallback, and are ungated. They
+  are what actually covers shrinkable_combo / ElidingLabel / ElidingComboBox,
+  so the guard keeps biting on every platform.
+
+To measure the fit budgets on Windows anyway, run this file against the real
+platform: QT_QPA_PLATFORM=windows pytest tests/test_panel_width.py
 """
 import os
 import sys
@@ -24,7 +42,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from PySide6.QtGui import QFont, QFontMetrics  # noqa: E402
+from PySide6.QtGui import QFont, QFontDatabase, QFontMetrics  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QComboBox, QLabel,  # noqa: E402
                                QScrollArea)
 
@@ -46,6 +64,23 @@ FONT_STRESS = 1.15
 
 PANEL_NAMES = ["sliders_panel", "dust_panel", "crop_panel"]
 
+# An empty font database means Qt resolved every request to its last-resort
+# fallback; nothing measured against it says anything about a real desktop.
+needs_ui_font = pytest.mark.skipif(
+    not QFontDatabase.families(),
+    reason="no fonts installed on this platform (Qt ships none) — pixel budgets "
+           "would be measured against a last-resort fallback face")
+
+
+def _fitting_width(widget_font_source, text, slack):
+    """A render width the text is guaranteed to FIT in, whatever the font.
+
+    Hard-coding it assumes a font: under the fontless fallback the "short"
+    strings below measure ~450px, so a fixed 324px box elides them and the
+    fits-fine comparisons compare the wrong thing.
+    """
+    return QFontMetrics(widget_font_source.font()).horizontalAdvance(text) + slack
+
 
 @pytest.fixture(scope="module")
 def window():
@@ -55,6 +90,7 @@ def window():
     return win
 
 
+@needs_ui_font
 @pytest.mark.parametrize("name", PANEL_NAMES)
 def test_panel_layout_fits_its_width(window, name):
     """A panel layout whose minimum exceeds the panel's fixed width clips."""
@@ -66,6 +102,7 @@ def test_panel_layout_fits_its_width(window, name):
         f"— its content will be clipped")
 
 
+@needs_ui_font
 @pytest.mark.parametrize("name", PANEL_NAMES)
 def test_scroll_content_fits_the_viewport(window, name):
     """Scroll content wider than its viewport is unreachable, not scrollable:
@@ -81,6 +118,7 @@ def test_scroll_content_fits_the_viewport(window, name):
             f"{area.viewport().width()}px")
 
 
+@needs_ui_font
 def test_no_sliders_row_exceeds_the_content_budget(window):
     """Every row of the sliders panel must fit inside the panel minus its
     content margins."""
@@ -92,6 +130,7 @@ def test_no_sliders_row_exceeds_the_content_budget(window):
         f"row {idx} needs {need}px, the content budget is {budget}px")
 
 
+@needs_ui_font
 def test_label_gutter_fits_the_longest_label():
     """LABEL_COL_W is a fixed width and QLabel clips rather than elides, so the
     longest label must fit with room to spare."""
@@ -101,6 +140,7 @@ def test_label_gutter_fits_the_longest_label():
         f"LABEL_COL_W is {theme.LABEL_COL_W}px")
 
 
+@needs_ui_font
 def test_panel_survives_a_wider_ui_font():
     """The headless test font is narrower than a real desktop UI font, so
     fitting it proves little on its own — this is what makes the guard bite.
@@ -155,9 +195,15 @@ def test_long_camera_profile_does_not_widen_the_sidebar(window):
     combo.blockSignals(True)
     combo.removeItem(combo.count() - 1)
     combo.blockSignals(False)
-    assert after == before <= sidebar.width(), (
+    # The behavioural claim — adding the name changed nothing — holds under any
+    # font. Only the "and it fits" tail below needs a real one.
+    assert after == before, (
         f"a long camera-profile name widened the sidebar minimum from "
-        f"{before} to {after} (sidebar is {sidebar.width()}px)")
+        f"{before} to {after}")
+    if QFontDatabase.families():
+        assert before <= sidebar.width(), (
+            f"the sidebar minimum is {before}px but the sidebar is "
+            f"{sidebar.width()}px")
 
 
 def test_long_combo_entry_does_not_widen_the_panel(window):
@@ -172,8 +218,11 @@ def test_long_combo_entry_does_not_widen_the_panel(window):
     _app.processEvents()
     after = layout.minimumSize().width()
     combo.removeItem(combo.count() - 1)
-    assert after == before <= theme.PANEL_W, (
+    assert after == before, (
         f"a long combo entry widened the content minimum from {before} to {after}")
+    if QFontDatabase.families():
+        assert before <= theme.PANEL_W, (
+            f"the content minimum is {before}px, the panel is {theme.PANEL_W}px")
 
 
 @pytest.mark.parametrize("attr", ["film_stock_combo", "color_profile_combo"])
@@ -192,10 +241,17 @@ LONG_NAME = "Fuji Superia X-TRA 400 — expired 2019 batch"
 SHORT_NAME = "Default"
 
 
-def _render(cls, text, *, enabled=True, width=168):
+# Wide enough for SHORT_NAME plus the frame and drop-down arrow the style puts
+# around it, so "text that fits" is true by construction in any font.
+_COMBO_CHROME = 60
+
+
+def _render(cls, text, *, enabled=True, width=None):
     combo = cls()
     combo.addItem(text)
     combo.setEnabled(enabled)
+    if width is None:
+        width = _fitting_width(combo, SHORT_NAME, _COMBO_CHROME)
     combo.setFixedSize(width, theme.CONTROL_H)
     _app.processEvents()
     return combo.grab().toImage()
@@ -257,9 +313,12 @@ def test_selecting_a_film_stock_does_not_widen_the_panel(window):
         (ccr_backend.black_point_bgr, ccr_backend.white_point_bgr,
          ccr_backend.film_stock_name) = saved
         panel._update_bwp_mode_label()
-    assert after == before <= theme.PANEL_W, (
+    assert after == before, (
         f"naming a film stock widened the content minimum from {before} to "
-        f"{after} (panel is {theme.PANEL_W}px)")
+        f"{after}")
+    if QFontDatabase.families():
+        assert before <= theme.PANEL_W, (
+            f"the content minimum is {before}px, the panel is {theme.PANEL_W}px")
 
 
 def test_long_hint_word_does_not_widen_the_panel(window):
@@ -275,9 +334,12 @@ def test_long_hint_word_does_not_widen_the_panel(window):
         after = panel.minimumSizeHint().width()
     finally:
         panel.hint_label.setText("")
-    assert after == before <= theme.PANEL_W, (
+    assert after == before, (
         f"an unbreakable hint word widened the panel minimum from {before} to "
         f"{after}")
+    if QFontDatabase.families():
+        assert before <= theme.PANEL_W, (
+            f"the panel minimum is {before}px, the panel is {theme.PANEL_W}px")
 
 
 # The status line elides the same way the combos do, for the same reason: it
@@ -288,9 +350,11 @@ LONG_STATUS = ('Anchor source: film stock (black point only) — '
 SHORT_STATUS = "Anchor source: white point (two-point)"
 
 
-def _render_label(cls, text, *, width=324):
+def _render_label(cls, text, *, width=None):
     label = cls()
     label.setText(text)
+    if width is None:
+        width = _fitting_width(label, SHORT_STATUS, theme.GAP_TIGHT * 4)
     label.setFixedSize(width, theme.CONTROL_H)
     _app.processEvents()
     return label.grab().toImage()
