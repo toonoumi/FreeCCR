@@ -7,11 +7,14 @@
 -->
 ## What's New
 
-**FreeCCR 1.3.1** — a smoother trichrome (3-way merge) workflow.
+**FreeCCR 1.3.2** — flatter scans, more precise copy/paste, and a few things that were quietly going wrong.
 
-- **Merged frames now remember your edits between sessions.** After a 3-way RGB merge, your conversion, sliders, crop, and dust work is saved and restored the next time you merge the same three source frames — just like a normal image. (If any of the three source files changed on disk, it re-merges fresh.)
-- **Optionally replace originals with a single linear TIFF (off by default).** A new Trichrome-capture setting bakes each merged frame to a full-resolution 16-bit *linear* TIFF, then permanently deletes the three source RAWs and reloads from the TIFF — turning a trichrome shoot into one archival file per frame. You confirm before anything is deleted, and a frame's RAWs are only removed after its TIFF is written and verified. The generated TIFFs reopen normally even with 3-way merge left on.
-- **Smaller lossless linear TIFFs.** The linear-TIFF writer now uses a horizontal predictor, so 16-bit files compress meaningfully (still bit-exact and readable everywhere).
+- **Field correction for your scanning rig.** Shoot one frame of your bare light table, and a 3-step wizard in **Settings → Color Management** measures the lens vignetting, sensor colour shading, and uneven light, then saves it as a reusable profile. The active profile flattens every frame before the negative conversion sees it, so corners stop going dark and warm. It changes only the spatial falloff — never your exposure or white balance.
+- **Ctrl/Cmd+C now asks what to copy.** Copy just the white balance, just the crop, or just the curves instead of the whole slider set — the same group picker Sync to All uses. Paste keeps every setting you *didn't* copy at the target's own value, and Color Profile, Crop, and Curves are copyable at last (the old copy/paste silently dropped them).
+- **Rotation and mirroring can be copied and synced.** A new **Orientation** group in both apply-to-many pickers, so a roll scanned upside-down or emulsion-side-up gets righted once and pushed onto the rest instead of pressing `[` / `]` on every frame.
+- **Auto white balance no longer balances on the film holder.** On an uncropped scan, the black holder and the clear film base / sprocket holes are not scene content, but they were dominating the estimate — one algorithm returned a perfectly neutral result on a strongly cast frame. AWB now reads midtones only, and all four algorithms land on the real cast. Clicking **AWB** (and the WB eyedropper) also updates the canvas immediately instead of waiting for your next click.
+- **Side panels no longer cut off their own controls.** On systems with a wider UI font, the right-hand panels clipped everything past their edge — Convert All, Slice, the Color Profile dropdown, the slider values. The panels are wider now, and long film-stock and camera-profile names shorten with an ellipsis instead of pushing the layout off-screen or running under the dropdown arrow.
+- **A file that fails to load now says why.** Previously it just disappeared from the import. You get one grouped message naming each file and the reason — unsupported compression, damaged, or moved — including the workaround for Nikon Z 8 High Efficiency NEFs, which no open-source decoder can read.
 
 ## Install
 
