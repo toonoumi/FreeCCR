@@ -65,6 +65,11 @@ class DcpProfile:
     look_encoding: int = 0
     tone_curve: Optional[np.ndarray] = None           # (N,2) (x,y) in [0,1]
     embed_policy: int = 1
+    # AsShotNeutral (50728): the camera-native neutral this profile was calibrated
+    # on, green-normalised. FreeCCR writes it into the profiles it generates so the
+    # WB is a property of the profile, not of each frame's metadata; third-party
+    # DCPs carry no such tag and keep the per-frame path. See apply_dcp.
+    as_shot_neutral: Optional[np.ndarray] = None
 
     @property
     def has_forward(self) -> bool:
@@ -166,6 +171,7 @@ def parse_dcp_bytes(data: bytes) -> DcpProfile:
     p.camera_calibration_2 = cc2 if cc2 is not None else np.eye(3)
     ab = vec(_T_ANALOGBAL, 3)
     p.analog_balance = ab[:3] if ab is not None else np.ones(3)
+    p.as_shot_neutral = cm.green_normalised(vec(_T_ASSHOTNEUTRAL, 3))
     if e.get(_T_ILLUM1):                              # truthy guards count-0 tags ([] is falsy)
         p.illuminant_1 = int(e[_T_ILLUM1][0])
     if e.get(_T_ILLUM2):
@@ -267,20 +273,22 @@ def apply_dcp(profile: DcpProfile, rgb_u16: np.ndarray, *,
               apply_look: bool = False) -> np.ndarray:
     """Camera-native unbalanced raw (uint16) -> uint16 LINEAR Adobe RGB.
 
-    as_shot_wb: length-3 camera-native WB multipliers (raw.camera_whitebalance);
-    None -> unity (a DCP is a raw profile, so this is a degraded path). apply_look
-    enables the subjective HueSatMap/LookTable/ToneCurve (off by default)."""
+    A profile that records the neutral it was CALIBRATED on (AsShotNeutral — every
+    profile the IT8 wizard generates) balances every frame with that, so a fixed
+    copy-stand setup renders identically across a roll whatever the camera's WB
+    mode was. Otherwise the frame's as_shot_wb (length-3 camera-native WB
+    multipliers, raw.camera_whitebalance) is used, and None -> unity (a degraded
+    path — a DCP is a raw profile). apply_look enables the subjective
+    HueSatMap/LookTable/ToneCurve (off by default)."""
     if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
         return rgb_u16
     d = rgb_u16.astype(np.float64) / 65535.0
-    m = (np.asarray(as_shot_wb, dtype=np.float64)[:3].copy()
-         if as_shot_wb is not None else np.ones(3))
-    m[m <= 0] = 1.0
-    # Normalise the as-shot multipliers to green=1 — they are raw WB *gains*
-    # (e.g. [2366,1024,1640]); using them un-normalised multiplies the image by
-    # ~1000x and blows it to white. This is the DNG reference-neutral diagonal.
-    if m[1] > 0:
-        m = m / m[1]
+    # Green-normalised WB diagonal. Normalising matters because raw as-shot values
+    # are gains (e.g. [2366,1024,1640]); un-normalised they multiply the image by
+    # ~1000x and blow it to white. This is the DNG reference-neutral diagonal.
+    m = cm.resolve_wb_gains(profile.as_shot_neutral, as_shot_wb)
+    if m is None:
+        m = np.ones(3)
 
     w = _interp_weight(profile, m)
     FM = _blend(profile.forward_matrix_1, profile.forward_matrix_2, w)
@@ -409,6 +417,13 @@ def _to_srational(x: float, den: int = 1000000) -> Tuple[int, int]:
     return int(round(x * den)), den
 
 
+def _to_rational(x: float, den: int = 1000000) -> Tuple[int, int]:
+    """Unsigned RATIONAL (TIFF type 5). Negatives are clamped to 0 — the only
+    unsigned tag written is AsShotNeutral, whose values are positive by
+    construction."""
+    return max(int(round(x * den)), 0), den
+
+
 def _write_ifd(tags: Dict[int, Tuple[str, object]]) -> bytes:
     """Build a little-endian single-IFD TIFF from {tag: (kind, value)}. Tags are
     emitted in ascending order; values >4 bytes go to a word-aligned data block."""
@@ -431,6 +446,9 @@ def _write_ifd(tags: Dict[int, Tuple[str, object]]) -> bytes:
         elif kind == 'srational':
             tcode, cnt = 10, len(val)
             raw = b''.join(struct.pack('<ii', *_to_srational(v)) for v in val)
+        elif kind == 'rational':
+            tcode, cnt = 5, len(val)
+            raw = b''.join(struct.pack('<II', *_to_rational(v)) for v in val)
         else:
             raise ValueError(kind)
         if len(raw) <= 4:
@@ -446,14 +464,21 @@ def _write_ifd(tags: Dict[int, Tuple[str, object]]) -> bytes:
     return header + ifd + data_bytes
 
 
-def build_camera_dcp(fit, name: str, *, illuminant: int = 23) -> bytes:
+def build_camera_dcp(fit, name: str, *, illuminant: int = 23,
+                     bake_neutral: bool = True) -> bytes:
     """Synthesise a minimal single-illuminant matrix DCP from the IT8 fit.
 
     The fit's matrix M maps WHITE-BALANCED camera RGB -> XYZ D50 with M@(1,1,1)=D50,
     which is exactly the DNG ForwardMatrix. The ColorMatrix (XYZ D50 -> un-balanced
     reference camera RGB) is inv(M @ diag(wb)) — NOT inv(ForwardMatrix); the two
     differ by the white-balance diagonal (DNG spec 1.6, ch.6). Parses back via
-    parse_dcp_bytes."""
+    parse_dcp_bytes.
+
+    bake_neutral (default) records the chart's camera-native neutral (1/wb) as
+    AsShotNeutral, so FreeCCR balances every frame on the setup the profile was
+    calibrated on rather than on each frame's as-shot metadata (see apply_dcp).
+    The tag is inert in Adobe/RawTherapee, which read only profile tags; pass
+    False for a portable DCP that defers to the host's per-frame WB."""
     M = np.asarray(fit.matrix, dtype=np.float64)
     wb = np.asarray(fit.wb_mult, dtype=np.float64)[:3]  # raw -> balanced (green=1)
     FM = M                                             # ForwardMatrix: balanced cam -> XYZ D50
@@ -468,4 +493,6 @@ def build_camera_dcp(fit, name: str, *, illuminant: int = 23) -> bytes:
         _T_COLORMATRIX1: ('srational', list(CM.ravel())),
         _T_FORWARDMATRIX1: ('srational', list(FM.ravel())),
     }
+    if bake_neutral:
+        tags[_T_ASSHOTNEUTRAL] = ('rational', list(1.0 / wb))
     return _write_ifd(tags)

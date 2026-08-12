@@ -872,21 +872,28 @@ def build_camera_icc(fit: CameraFit, desc: str, *,
 
     mode='matrix' (default) writes a 3x3 matrix-shaper (M's columns are the XYZ
     D50 colorants, identity TRC). mode='clut' writes a higher-accuracy lut16 cLUT
-    (the 3x3 base + a smooth RBF residual; needs `samples`+`ref`)."""
+    (the 3x3 base + a smooth RBF residual; needs `samples`+`ref`).
+
+    Both record the chart's camera-native neutral (`1/wb_mult`) in the private
+    'CCRn' tag, so apply balances every frame on the setup the profile was
+    calibrated on instead of the frame's as-shot metadata (see
+    spec/camera-profile-calibration-wb.md)."""
     desc = str(desc).encode("ascii", "replace").decode("ascii")
     copyright_text = str(copyright_text).encode("ascii", "replace").decode("ascii")
+    neutral = 1.0 / np.asarray(fit.wb_mult, dtype=np.float64)[:3]
     if mode == "clut":
         if samples is None or ref is None:
             raise ValueError("cLUT mode requires the sampled patches and reference")
         clut_xyz = build_residual_clut(fit, samples, ref, grid=grid)
         return color_management.build_clut_icc(
-            desc, clut_xyz, grid, copyright_text=copyright_text)
+            desc, clut_xyz, grid, copyright_text=copyright_text, neutral=neutral)
     M = np.asarray(fit.matrix, dtype=np.float64)
     return color_management.build_matrix_shaper_icc(
         desc,
         tuple(M[:, 0]), tuple(M[:, 1]), tuple(M[:, 2]),
         _IDENTITY_TRC,
         copyright_text=copyright_text,
+        neutral=neutral,
     )
 
 

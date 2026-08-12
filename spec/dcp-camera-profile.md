@@ -121,7 +121,7 @@ rawler tag enumerations (see Sources). Decimal tag id → (TIFF type, count):
 | 50725 | `ReductionMatrix1` | SRATIONAL | 9 | (≥3-plane reduction; unused for RGB) |
 | 50726 | `ReductionMatrix2` | SRATIONAL | 9 | |
 | 50727 | `AnalogBalance` | RATIONAL | planes (3) | diag analog gains (identity if absent) |
-| 50728 | `AsShotNeutral` | RATIONAL | planes (3) | as-shot neutral in camera RGB (alt to AsShotWhiteXY; we use `raw.camera_whitebalance`) |
+| 50728 | `AsShotNeutral` | RATIONAL | planes (3) | neutral in camera RGB. **Written by `build_camera_dcp` as the profile's calibration neutral and, when present, it OWNS the WB at apply time** (see `spec/camera-profile-calibration-wb.md`); absent ⇒ fall back to the frame's `raw.camera_whitebalance` |
 | 50778 | `CalibrationIlluminant1` | SHORT | 1 | EXIF LightSource enum for matrix set 1 |
 | 50779 | `CalibrationIlluminant2` | SHORT | 1 | …set 2 |
 | 50936 | `ProfileName` | ASCII | n | display name |
@@ -394,8 +394,13 @@ D50-pinned and WB-folded-in (`it8_profile.fit_camera_matrix` §5.4). A DCP's
    `ProfileName` (50936, ASCII), `CalibrationIlluminant1` (50778, SHORT — default
    23=D50, or the wizard's chosen light), `ColorMatrix1` (50721, SRATIONAL×9),
    `ForwardMatrix1` (50964, SRATIONAL×9). Also write `ProfileEmbedPolicy`
-   (50941 = 1, "allow copying without restriction") and `AsShotNeutral`-free (DCP
-   carries no as-shot data; it's a profile not a raw). **Single-illuminant only**
+   (50941 = 1, "allow copying without restriction") and — **superseding this
+   spec's original `AsShotNeutral`-free rule** — `AsShotNeutral` (50728,
+   RATIONAL×3) = the chart's camera-native neutral `1/wb`, so the profile owns the
+   white balance of the fixed setup it was calibrated on instead of deferring to
+   each frame's metadata. The tag is inert in Adobe/RawTherapee (both read only
+   profile tags); `build_camera_dcp(bake_neutral=False)` omits it. See
+   `spec/camera-profile-calibration-wb.md`. **Single-illuminant only**
    — a dual-illuminant DCP needs two charts shot under two lights (out of scope,
    §2). Note this in the wizard.
 5. **Write the IFD** (`_build_dcp_bytes`): little-endian (`II`), magic 42, IFD0 at
