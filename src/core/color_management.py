@@ -120,6 +120,40 @@ def active_profile_signature() -> str:
     return "none"
 
 
+def green_normalised(v) -> "Optional[np.ndarray]":
+    """Sanitised, green-normalised copy of a 3-vector (a camera neutral or a set
+    of WB gains), or None. Non-positive channels fall back to 1.0 — a zero would
+    otherwise blow up the reciprocal."""
+    if v is None:
+        return None
+    m = np.asarray(v, dtype=np.float64)[:3].copy()
+    m[~np.isfinite(m) | (m <= 0)] = 1.0
+    if m[1] > 0:
+        m = m / m[1]
+    return m
+
+
+def resolve_wb_gains(calibration_neutral, as_shot_wb) -> "Optional[np.ndarray]":
+    """The green-normalised WB gains a camera profile should be applied with.
+
+    A profile built from an IT8 chart is calibrated on ONE physical setup (fixed
+    light, fixed camera), and records that setup's camera-native neutral. When it
+    carries one, that neutral OWNS the white balance — `1/n` — and the frame's
+    as-shot metadata is ignored: the profiled decode is unbalanced
+    (`use_camera_wb=False`), so `raw.camera_whitebalance` only reflects the
+    camera's WB *setting*, which on AWB is re-estimated per frame from negative
+    content and drifts colour across a roll under an unchanging light. See
+    spec/camera-profile-calibration-wb.md.
+
+    Profiles without a calibration neutral (imported third-party DCPs, and
+    profiles generated before that was recorded) keep the per-frame behaviour.
+    Returns None only when neither is available (unbalanced degraded path)."""
+    n = green_normalised(calibration_neutral)
+    if n is not None:
+        return 1.0 / n                       # n[1] == 1, so the gains are too
+    return green_normalised(as_shot_wb)
+
+
 def load_input_profile(path: str) -> "InputProfile":
     """Read and parse a matrix-shaper ICC file. Raises UnsupportedICCError for
     LUT/CMYK/unparseable profiles, or OSError if the file can't be read."""
@@ -243,15 +277,28 @@ def _text_type(text: str) -> bytes:
     return struct.pack('>4sI', b'text', 0) + text.encode('ascii') + b'\x00'
 
 
+# Private (vendor) ICC tag holding the camera-native calibration neutral of a
+# FreeCCR-generated camera profile — the neutral of the chart shot the profile was
+# fit from, green-normalised. ICC has no standard slot for a device neutral; the
+# payload reuses the XYZType container (three s15Fixed16) so the tag is
+# well-formed for any CMM, which then ignores the unknown signature.
+# See spec/camera-profile-calibration-wb.md §3.2.
+_CCR_NEUTRAL_SIG = b'CCRn'
+
+
 def build_matrix_shaper_icc(desc: str,
                             r_xyz: Tuple[float, float, float],
                             g_xyz: Tuple[float, float, float],
                             b_xyz: Tuple[float, float, float],
                             trc_para: Tuple[float, float, float, float, float],
                             wtpt: Tuple[float, float, float] = D50_XYZ,
-                            copyright_text: str = "Public Domain. No rights reserved.") -> bytes:
+                            copyright_text: str = "Public Domain. No rights reserved.",
+                            neutral=None) -> bytes:
     """Build a valid ICC v2.4 RGB matrix-shaper profile from D50 colorants and a
-    shared parametric (type-3) TRC. Returns the raw profile bytes."""
+    shared parametric (type-3) TRC. Returns the raw profile bytes.
+
+    neutral: optional camera-native calibration neutral (3 values) recorded in the
+    private 'CCRn' tag — see resolve_wb_gains."""
     tags = {
         'desc': _desc_type(desc),
         'wtpt': _xyz_type(*wtpt),
@@ -266,6 +313,10 @@ def build_matrix_shaper_icc(desc: str,
     tags['bTRC'] = trc
 
     order = ['desc', 'rXYZ', 'gXYZ', 'bXYZ', 'wtpt', 'rTRC', 'gTRC', 'bTRC', 'cprt']
+    nv = green_normalised(neutral)
+    if nv is not None:
+        tags[_CCR_NEUTRAL_SIG.decode('ascii')] = _xyz_type(*nv)
+        order.append(_CCR_NEUTRAL_SIG.decode('ascii'))
     n = len(order)
     header_size = 128
     table_size = 4 + n * 12
@@ -468,6 +519,9 @@ class InputProfile:
         self._luts = [np.ascontiguousarray(l, dtype=np.float32) for l in luts]
         self._clut: Optional["_CLUT"] = None
         self.description = desc
+        # Camera-native neutral this profile was calibrated on ('CCRn'), or None
+        # for a profile that carries none. When set it OWNS the white balance.
+        self.calibration_neutral: Optional[np.ndarray] = None
 
     @classmethod
     def _from_clut(cls, clut: "_CLUT", desc: str) -> "InputProfile":
@@ -479,7 +533,20 @@ class InputProfile:
         self._luts = None
         self._clut = clut
         self.description = desc
+        self.calibration_neutral = None
         return self
+
+    @staticmethod
+    def _read_calibration_neutral(icc: bytes, tags: dict):
+        """The camera-native calibration neutral from the private 'CCRn' tag
+        (XYZType payload), green-normalised, or None. A malformed tag is ignored
+        rather than failing the whole profile."""
+        if _CCR_NEUTRAL_SIG not in tags:
+            return None
+        try:
+            return green_normalised(_parse_xyz(icc, tags[_CCR_NEUTRAL_SIG][0]))
+        except Exception:
+            return None
 
     @classmethod
     def from_bytes(cls, icc: bytes) -> "InputProfile":
@@ -496,7 +563,9 @@ class InputProfile:
             combined = M_XYZ_D50_2_ADOBE @ m_colorants   # device-linRGB -> linear Adobe RGB
             luts = [_parse_trc_to_lut(icc, tags[t][0])
                     for t in (b'rTRC', b'gTRC', b'bTRC')]
-            return cls(combined, luts, cls._read_desc(icc, tags))
+            prof = cls(combined, luts, cls._read_desc(icc, tags))
+            prof.calibration_neutral = cls._read_calibration_neutral(icc, tags)
+            return prof
         # LUT-based: an A2B0 (fall back A2B1) device->PCS cLUT in mft1/mft2/mAB.
         a2b = next((t for t in (b'A2B0', b'A2B1') if t in tags), None)
         if a2b is not None:
@@ -505,7 +574,9 @@ class InputProfile:
                 raise UnsupportedICCError(f"unsupported PCS {pcs!r:s} (only XYZ/Lab)")
             is_v4 = icc[8] >= 4                           # major version byte
             clut = _parse_a2b(icc, tags[a2b][0], pcs, is_v4)
-            return cls._from_clut(clut, cls._read_desc(icc, tags))
+            prof = cls._from_clut(clut, cls._read_desc(icc, tags))
+            prof.calibration_neutral = cls._read_calibration_neutral(icc, tags)
+            return prof
         raise UnsupportedICCError(
             "only RGB matrix-shaper or A2B cLUT ICC profiles are supported "
             "(CMYK / B2A-only profiles are not)")
@@ -523,17 +594,13 @@ class InputProfile:
             pass
         return ""
 
-    @staticmethod
-    def _wb_gains(as_shot_wb):
-        """Green-normalised white-balance multipliers from the frame's as-shot
-        neutral (raw.camera_whitebalance), or None to skip balancing."""
-        if as_shot_wb is None:
-            return None
-        m = np.asarray(as_shot_wb, dtype=np.float32)[:3].copy()
-        m[m <= 0] = 1.0
-        if m[1] > 0:
-            m = m / m[1]
-        return m
+    def _wb_gains(self, as_shot_wb):
+        """Green-normalised white-balance multipliers to apply before the matrix,
+        or None to skip balancing. The profile's own calibration neutral wins when
+        it has one; otherwise the frame's as-shot neutral
+        (raw.camera_whitebalance). See resolve_wb_gains."""
+        m = resolve_wb_gains(getattr(self, "calibration_neutral", None), as_shot_wb)
+        return None if m is None else m.astype(np.float32)
 
     def apply(self, rgb_u16: np.ndarray, as_shot_wb=None) -> np.ndarray:
         """Convert HxWx3 uint16 camera device RGB into uint16 **linear Adobe RGB**
@@ -542,9 +609,11 @@ class InputProfile:
         LINEAR data.
 
         The matrix is a standard camera-profile matrix, so it consumes
-        WHITE-BALANCED data: the raw is balanced with the frame's as-shot neutral
-        (as_shot_wb, green-normalised) before the matrix — exactly what a DNG
-        ForwardMatrix or a RawTherapee input ICC expects. as_shot_wb=None (e.g. a
+        WHITE-BALANCED data, so the raw is balanced before the matrix — exactly
+        what a DNG ForwardMatrix or a RawTherapee input ICC expects. A profile
+        that records the neutral it was CALIBRATED on balances every frame with
+        that (fixed setup ⇒ fixed WB); otherwise the frame's as-shot neutral
+        (as_shot_wb, green-normalised) is used, and as_shot_wb=None (e.g. a
         non-RAW input) skips balancing (degraded path)."""
         if rgb_u16.ndim != 3 or rgb_u16.shape[2] != 3 or rgb_u16.dtype != np.uint16:
             return rgb_u16
@@ -846,10 +915,14 @@ def _lut16_type(clut_xyz: np.ndarray, grid: int) -> bytes:
 
 def build_clut_icc(desc: str, clut_xyz: np.ndarray, grid: int,
                    wtpt: Tuple[float, float, float] = D50_XYZ,
-                   copyright_text: str = "Public Domain. No rights reserved.") -> bytes:
+                   copyright_text: str = "Public Domain. No rights reserved.",
+                   neutral=None) -> bytes:
     """Build a valid ICC v2.4 RGB->XYZ cLUT (lut16) profile. `clut_xyz` is a
     (grid,grid,grid,3) XYZ D50 (Y=1) table indexed [R][G][B]. Parses back via
-    InputProfile.from_bytes (cLUT path)."""
+    InputProfile.from_bytes (cLUT path).
+
+    neutral: optional camera-native calibration neutral recorded in 'CCRn', as in
+    build_matrix_shaper_icc."""
     desc = str(desc).encode('ascii', 'replace').decode('ascii')
     copyright_text = str(copyright_text).encode('ascii', 'replace').decode('ascii')
     tags = {
@@ -859,6 +932,10 @@ def build_clut_icc(desc: str, clut_xyz: np.ndarray, grid: int,
         'cprt': _text_type(copyright_text),
     }
     order = ['desc', 'A2B0', 'wtpt', 'cprt']
+    nv = green_normalised(neutral)
+    if nv is not None:
+        tags[_CCR_NEUTRAL_SIG.decode('ascii')] = _xyz_type(*nv)
+        order.append(_CCR_NEUTRAL_SIG.decode('ascii'))
     n = len(order)
     base = 128 + 4 + n * 12
     data = b''

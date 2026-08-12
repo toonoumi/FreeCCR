@@ -339,7 +339,11 @@ def test_parse_count0_scalar_and_bad_dims():
 
 
 def test_apply_as_shot_wb_none_is_unbalanced():
-    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0), "c"))
+    # A profile with NO baked calibration neutral (a portable DCP, or any
+    # third-party one) still renders the frame's as-shot WB, and falls back to
+    # unbalanced when the frame has none.
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0), "c", bake_neutral=False))
+    assert p.as_shot_neutral is None
     cam = (np.clip(_neutral(M0) * 0.5, 0, 1) * 65535).astype(np.uint16)
     img = np.tile(cam.reshape(1, 1, 3), (2, 2, 1))
     none_out = dcp.apply_dcp(p, img)                            # m = ones (unbalanced)
@@ -351,11 +355,12 @@ def test_apply_as_shot_wb_none_is_unbalanced():
 def test_apply_highlight_not_preclipped():
     # d*m can exceed 1 (film-base highlights); the matrix must see the unclipped
     # value (clip only at the final Adobe output), matching the ICC path.
-    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P), "c"))
-    N = _neutral(M0P)
     # A strong green-normalised WB (m[1] == 1) pushes a balanced channel well past
-    # 1.0 (~2.34) — a film-base highlight the matrix must see UNCLIPPED.
+    # 1.0 (~2.34) — a film-base highlight the matrix must see UNCLIPPED. It is the
+    # profile's own calibration WB here, so apply uses it whatever the frame says.
     m = np.array([2.6, 1.0, 1.9])
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P, m), "c"))
+    N = _neutral(M0P)
     cam = (np.clip(N * 0.9, 0, 1) * 65535).astype(np.uint16)
     img = np.tile(cam.reshape(1, 1, 3), (2, 2, 1))
     assert (cam / 65535.0 * m).max() > 1.0                         # genuinely > 1 pre-matrix
@@ -380,3 +385,69 @@ def test_interp_weight_clamps_outside_calibration_range():
     assert dcp._interp_weight(p, cold) == 0.0   # clamped to set 2 (StdA)
     mid = dcp._interp_weight(p, 1.0 / np.array([1.0, 1.0, 1.0]))
     assert 0.0 <= mid <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Calibration white balance (the profile owns the WB).
+# See spec/camera-profile-calibration-wb.md.
+# --------------------------------------------------------------------------- #
+
+def test_build_bakes_calibration_neutral():
+    # The generated DCP records the chart's camera-native neutral (1/wb_mult,
+    # green-normalised) as AsShotNeutral (50728, RATIONAL x3).
+    wb = np.array([1.9, 1.0, 1.4])
+    data = dcp.build_camera_dcp(_Fit(M0P, wb), "cal", illuminant=23)
+    p = dcp.parse_dcp_bytes(data)
+    np.testing.assert_allclose(p.as_shot_neutral, 1.0 / wb, atol=1e-6)
+    assert abs(p.as_shot_neutral[1] - 1.0) < 1e-9          # green-normalised
+    # ...and it is a well-formed RATIONAL (type 5, count 3) IFD entry.
+    n_entries = struct.unpack('<H', data[8:10])[0]
+    entries = {}
+    for i in range(n_entries):
+        tag, typ, cnt = struct.unpack('<HHI', data[10 + i * 12:10 + i * 12 + 8])
+        entries[tag] = (typ, cnt)
+    assert entries[50728] == (5, 3)
+    assert sorted(entries) == list(entries)        # TIFF requires ascending tags
+    # It also matches the DNG camera neutral the ColorMatrix already implies.
+    np.testing.assert_allclose(p.color_matrix_1 @ D50, 1.0 / wb, atol=1e-5)
+
+
+def test_build_can_omit_calibration_neutral():
+    p = dcp.parse_dcp_bytes(
+        dcp.build_camera_dcp(_Fit(M0P, np.array([1.9, 1.0, 1.4])), "portable",
+                             bake_neutral=False))
+    assert p.as_shot_neutral is None
+    assert p.forward_matrix_1 is not None and p.color_matrix_1 is not None
+
+
+def test_baked_neutral_ignores_frame_metadata():
+    """The regression test for AWB drift: identical sensor data must render
+    identically no matter what the frame's camera_whitebalance says."""
+    wb = np.array([1.9, 1.0, 1.4])
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P, wb), "cal"))
+    rng = np.random.default_rng(3)
+    img = (rng.uniform(0.05, 0.45, (6, 6, 3)) * 65535).astype(np.uint16)
+    ref = dcp.apply_dcp(p, img, as_shot_wb=wb)
+    # Three wildly different per-frame estimates + no metadata at all.
+    for meta in (None, np.array([1.0, 1.0, 1.0]), np.array([2366.0, 1024.0, 1640.0]),
+                 np.array([0.4, 1.0, 3.3])):
+        np.testing.assert_array_equal(dcp.apply_dcp(p, img, as_shot_wb=meta), ref)
+    # And it really is the calibration WB that was used (not "no balancing"):
+    # same output as feeding that WB by hand, to within the RATIONAL quantisation
+    # of the stored neutral (1e-6 -> at most a LSB or two of uint16).
+    unbaked = dcp.parse_dcp_bytes(
+        dcp.build_camera_dcp(_Fit(M0P, wb), "portable", bake_neutral=False))
+    assert np.abs(dcp.apply_dcp(p, img, as_shot_wb=None).astype(int)
+                  - dcp.apply_dcp(unbaked, img, as_shot_wb=wb).astype(int)).max() <= 2
+    assert not np.array_equal(dcp.apply_dcp(unbaked, img, as_shot_wb=None), ref)
+
+
+def test_baked_neutral_renders_chart_neutral_as_grey():
+    # The chart neutral the profile was fit on must come back equal-RGB (D50 grey)
+    # with NO help from frame metadata.
+    wb = np.array([1.9, 1.0, 1.4])
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(_Fit(M0P, wb), "cal"))
+    raw = np.clip(0.5 / wb, 0, 1)                       # camera-native neutral @ 50%
+    img = np.tile((raw * 65535).astype(np.uint16).reshape(1, 1, 3), (2, 2, 1))
+    out = dcp.apply_dcp(p, img)[0, 0].astype(float) / 65535.0
+    assert out.max() - out.min() < 0.01                 # neutral in linear Adobe

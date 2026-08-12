@@ -609,6 +609,17 @@ v0.5/early-v0.6 Adobe-RGB-for-ICC decode.
   (§5.4 step 5). So FreeCCR's single unbalanced camera-native decode is the correct
   shared base for both the matrix ICC **and** a future DCP.
 
+> **Superseded twice — see the later specs.** `spec/camera-profile-color-fix.md`
+> reverted the "fold WB into the matrix" rule: both containers now fit and apply on
+> **white-balanced** data (`CameraFit.wb_mult` holds the balance separately), which
+> is what ICC/DNG conventions and RawTherapee expect. Then
+> `spec/camera-profile-calibration-wb.md` fixed *which* balance apply uses: a
+> generated profile records the chart's own camera-native neutral (`AsShotNeutral`
+> for DCP, the private `CCRn` tag for ICC) and that neutral owns the WB, so a
+> profile built for one fixed copy-stand setup renders every frame identically
+> instead of tracking each frame's (possibly auto-WB) metadata. The decode stays
+> unbalanced and camera-native throughout — only the source of the balance changed.
+
 **Implementation:** `read_image` selects the camera-native path
 (`no_icc_default=False`) whenever an input ICC is active *or* the bare-device
 profiling decode is requested (`apply_input_icc=False`), and the Adobe RGB +

@@ -643,3 +643,70 @@ def test_identity_trc_is_identity():
     lut0 = prof._luts[0]
     xs = np.linspace(0, 1, len(lut0))
     np.testing.assert_allclose(lut0, xs, atol=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# Calibration white balance (the profile owns the WB).
+# See spec/camera-profile-calibration-wb.md.
+# --------------------------------------------------------------------------- #
+
+def _fit_known_camera():
+    M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+    wb = np.array([2.1, 1.0, 1.5])
+    patches = _synthetic_patches()
+    samples = _balanced_samples(M0, patches, wb)
+    return it8.fit_camera_matrix(samples, _ref_from_patches(patches)), samples, wb
+
+
+def test_icc_bakes_calibration_neutral():
+    # The generated ICC records the chart's camera-native neutral (1/wb_mult) in
+    # the private 'CCRn' tag, green-normalised, and reparses it.
+    fit, _, wb = _fit_known_camera()
+    prof = cm.InputProfile.from_bytes(it8.build_camera_icc(fit, "cal"))
+    assert prof.calibration_neutral is not None
+    np.testing.assert_allclose(prof.calibration_neutral, 1.0 / wb, atol=1e-3)
+    assert abs(prof.calibration_neutral[1] - 1.0) < 1e-6      # green-normalised
+
+
+def test_icc_without_calibration_neutral_uses_frame_wb():
+    # A plain matrix-shaper ICC (no 'CCRn') keeps the per-frame behaviour: the
+    # as-shot WB is honoured, and None still means unbalanced.
+    icc = cm.build_matrix_shaper_icc(
+        "plain", (0.4, 0.2, 0.0), (0.3, 0.7, 0.1), (0.2, 0.1, 0.7),
+        (1.0, 1.0, 0.0, 1.0, 0.0))
+    prof = cm.InputProfile.from_bytes(icc)
+    assert prof.calibration_neutral is None
+    img = np.full((2, 2, 3), 20000, dtype=np.uint16)
+    assert not np.array_equal(prof.apply(img, as_shot_wb=None),
+                              prof.apply(img, as_shot_wb=np.array([1.8, 1.0, 1.3])))
+
+
+def test_icc_calibration_neutral_ignores_frame_metadata():
+    """Regression: with a calibration neutral, identical device data renders
+    identically whatever the camera's WB mode wrote into the frame."""
+    fit, samples, wb = _fit_known_camera()
+    prof = cm.InputProfile.from_bytes(it8.build_camera_icc(fit, "cal"))
+    dev = np.tile(samples["GS8"].rgb.astype(np.uint16).reshape(1, 1, 3), (3, 3, 1))
+    ref = prof.apply(dev, as_shot_wb=wb)
+    for meta in (None, np.array([1.0, 1.0, 1.0]), np.array([2366.0, 1024.0, 1640.0]),
+                 np.array([0.4, 1.0, 3.3])):
+        np.testing.assert_array_equal(prof.apply(dev, as_shot_wb=meta), ref)
+    # ...and the chart's own neutral still renders neutral with no metadata help.
+    px = prof.apply(dev)[0, 0].astype(float)
+    assert px.max() - px.min() < 0.04 * 65535
+
+
+def test_resolve_wb_gains_precedence():
+    n = np.array([0.5, 1.0, 0.7])                       # calibration neutral
+    np.testing.assert_allclose(cm.resolve_wb_gains(n, np.array([9.0, 1.0, 4.0])),
+                               1.0 / n)                 # profile wins
+    np.testing.assert_allclose(cm.resolve_wb_gains(None, np.array([2366.0, 1024.0, 1640.0])),
+                               np.array([2366.0, 1024.0, 1640.0]) / 1024.0)
+    assert cm.resolve_wb_gains(None, None) is None      # unbalanced degraded path
+    # Un-normalised / degenerate inputs are sanitised, never propagated.
+    np.testing.assert_allclose(cm.resolve_wb_gains(np.array([1.0, 2.0, 3.0]), None),
+                               1.0 / np.array([0.5, 1.0, 1.5]))
+    np.testing.assert_allclose(cm.resolve_wb_gains(np.array([0.0, 1.0, -2.0]), None),
+                               np.array([1.0, 1.0, 1.0]))

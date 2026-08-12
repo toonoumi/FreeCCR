@@ -410,3 +410,19 @@ def test_build_camera_icc_clut_requires_samples():
     fit = it8.fit_camera_matrix(samples, ref)
     with pytest.raises(ValueError):
         it8.build_camera_icc(fit, 'c', mode='clut')      # no samples/ref
+
+
+def test_clut_icc_bakes_calibration_neutral():
+    """The cLUT container records the calibration neutral too, so a cLUT profile
+    is as WB-stable as the matrix one. See spec/camera-profile-calibration-wb.md."""
+    samples, ref = _nonaffine_camera()
+    fit = it8.fit_camera_matrix(samples, ref)
+    cp = cm.InputProfile.from_bytes(
+        it8.build_camera_icc(fit, 'c', mode='clut', grid=17, samples=samples, ref=ref))
+    assert cp.calibration_neutral is not None
+    np.testing.assert_allclose(cp.calibration_neutral, 1.0 / fit.wb_mult, atol=1e-3)
+    dev = np.tile(np.clip(samples[fit.wb_id].rgb, 0, 65535)
+                  .astype(np.uint16).reshape(1, 1, 3), (3, 3, 1))
+    base = cp.apply(dev, as_shot_wb=fit.wb_mult)
+    for meta in (None, np.array([2366.0, 1024.0, 1640.0]), np.array([0.4, 1.0, 3.3])):
+        np.testing.assert_array_equal(cp.apply(dev, as_shot_wb=meta), base)
