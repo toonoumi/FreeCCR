@@ -111,9 +111,14 @@ the illuminant blend weight from `m`. Feeding them the calibration neutral is
 also more correct (the profile's own light, not a per-frame guess); generated
 profiles are single-illuminant so the weight is 1.0 either way.
 
-A non-RAW input (TIFF/JPEG, `as_shot_wb=None`) previously skipped balancing
-entirely. With a calibration neutral it is now balanced like any other frame,
-which is the correct treatment for camera-native data and a strict improvement.
+The `as_shot_wb=None` path previously skipped balancing entirely. With a
+calibration neutral such a frame is now balanced like any other, which is the
+correct treatment for camera-native data and a strict improvement. Note this is
+not the TIFF/JPEG case: `ccr_image.read_image` applies a camera profile only on
+the RAW branch, so within the app `None` means *a RAW whose
+`camera_whitebalance` could not be read* (the `except` at `ccr_image.py:611`).
+External callers of `apply_dcp`/`InputProfile.apply` — `tools/scan_color_eval`,
+tests — can pass `None` for any input.
 
 ## 5. Integration points
 
