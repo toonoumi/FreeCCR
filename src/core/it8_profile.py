@@ -419,6 +419,38 @@ def decode_target(path: str, sample_max: int = SAMPLE_MAX) -> Optional[np.ndarra
                           positive_override=False, apply_input_icc=False)
 
 
+def decode_target_merged(sources, demosaic: bool = True,
+                         sample_max: int = SAMPLE_MAX) -> Optional[np.ndarray]:
+    """Decode a TRICHROME chart shot — three RAWs merged into one frame — to the
+    same bare device space as decode_target, so everything downstream (sampling,
+    fit, ICC/DCP synthesis) treats it as if it were a single raw.
+
+    A trichrome capture is its own device space: each channel's sensitivity is the
+    sensor's response times that exposure's light, and the channel balance comes
+    from three independent light intensities. A profile fitted on a white-light
+    shot does not describe it, which is why the wizard has to be able to profile
+    the merge itself. See spec/trichrome-camera-profile.md.
+
+    `sources` is the (red, green, blue) triplet, already ordered. read_image
+    dispatches on is_merged BEFORE it looks at the path or Positive mode, so the
+    path argument is a formality; apply_input_icc=False keeps the bare-device
+    contract (no field correction, no camera profile)."""
+    from core.ccr_image import CCRImage
+    from core import ccr_merge
+    srcs = list(sources)
+    if len(srcs) != ccr_merge.MERGE_GROUP_SIZE:
+        raise IT8ReferenceError(
+            f"A trichrome target needs exactly {ccr_merge.MERGE_GROUP_SIZE} RAW "
+            f"files (red, green, blue) — got {len(srcs)}.")
+    img = CCRImage.__new__(CCRImage)
+    img.source_ops = []
+    img.is_merged = True
+    img.merge_sources = srcs
+    img.merge_demosaic = bool(demosaic)
+    return img.read_image(srcs[0], preview=True, max_long_side=sample_max,
+                          positive_override=False, apply_input_icc=False)
+
+
 # --------------------------------------------------------------------------- #
 # 3. Patch grid geometry (4-corner homography -> sample centres).
 # --------------------------------------------------------------------------- #
@@ -865,8 +897,8 @@ def build_camera_icc(fit: CameraFit, desc: str, *,
                      mode: str = "matrix", grid: int = 17,
                      samples: Optional[Dict[str, "PatchSample"]] = None,
                      ref: Optional[IT8Reference] = None,
-                     copyright_text: str = "Public Domain. No rights reserved."
-                     ) -> bytes:
+                     copyright_text: str = "Public Domain. No rights reserved.",
+                     trichrome: bool = False) -> bytes:
     """Synthesise camera-profile ICC bytes from the fit. Round-trips through
     InputProfile.from_bytes.
 
@@ -886,7 +918,8 @@ def build_camera_icc(fit: CameraFit, desc: str, *,
             raise ValueError("cLUT mode requires the sampled patches and reference")
         clut_xyz = build_residual_clut(fit, samples, ref, grid=grid)
         return color_management.build_clut_icc(
-            desc, clut_xyz, grid, copyright_text=copyright_text, neutral=neutral)
+            desc, clut_xyz, grid, copyright_text=copyright_text, neutral=neutral,
+            trichrome=trichrome)
     M = np.asarray(fit.matrix, dtype=np.float64)
     return color_management.build_matrix_shaper_icc(
         desc,
@@ -894,6 +927,7 @@ def build_camera_icc(fit: CameraFit, desc: str, *,
         _IDENTITY_TRC,
         copyright_text=copyright_text,
         neutral=neutral,
+        trichrome=trichrome,
     )
 
 

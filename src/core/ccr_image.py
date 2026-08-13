@@ -373,6 +373,35 @@ class CCRImage:
             new_h = int(h * max_long_side / w)
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+    # Profile+kind pairs already warned about, so a mismatched profile logs once
+    # per session instead of once per decoded frame.
+    _kind_warned: set = set()
+
+    def _warn_kind_mismatch(self, profile) -> None:
+        """Warn when a profile built for one device space is applied to the other.
+
+        A trichrome merge and a normal capture are NOT the same device space (each
+        trichrome channel is the sensor response times its own light), so swapping
+        the profiles produces badly wrong colour with no symptom beyond "the colour
+        looks off". This warns rather than refuses: colour management is the user's
+        call, and a hard block would be worse than a preview they can see is wrong.
+        See spec/trichrome-camera-profile.md section 6."""
+        if profile is None:
+            return
+        prof_tri = bool(getattr(profile, "is_trichrome", False))
+        img_tri = bool(getattr(self, "is_merged", False))
+        if prof_tri == img_tri:
+            return
+        key = (id(profile), img_tri)
+        if key in CCRImage._kind_warned:
+            return
+        CCRImage._kind_warned.add(key)
+        logging.warning(
+            "Camera profile device-space mismatch: a %s profile is being applied "
+            "to a %s image. Build the profile from the same kind of capture.",
+            "trichrome" if prof_tri else "normal",
+            "trichrome (3-way merge)" if img_tri else "normal")
+
     def _apply_input_icc(self, arr: Optional[np.ndarray],
                          as_shot_wb=None) -> Optional[np.ndarray]:
         """Convert a freshly-decoded scan from the globally-assigned input ICC
@@ -389,6 +418,7 @@ class CCRImage:
         profile = color_management.get_active_input_profile()
         if profile is None or color_management.input_profile_disabled():
             return arr
+        self._warn_kind_mismatch(profile)
         try:
             return profile.apply(arr, as_shot_wb=as_shot_wb)
         except Exception as e:
@@ -438,6 +468,7 @@ class CCRImage:
         profile = color_management.get_active_dcp_profile()
         if profile is None or color_management.input_profile_disabled():
             return arr
+        self._warn_kind_mismatch(profile)
         try:
             from core import dcp_profile
             return dcp_profile.apply_dcp(profile, arr, as_shot_wb=as_shot_wb)
@@ -550,7 +581,22 @@ class CCRImage:
         self.original_full_size = self._ops_full_size(full_decode_size)
         if max_long_side:
             rgb = self.resize_image_to_max_pixel(rgb, max_long_side)
-        return rgb
+        # Burn in the camera profile, in the same pipeline position as the RAW
+        # branch (field correction -> slice ops -> downsize -> profile), so a
+        # trichrome capture is colour-managed like any other camera-native scan.
+        #
+        # as_shot_wb is None on purpose: a merge has THREE source RAWs with three
+        # different camera_whitebalance values, and none of them describes the
+        # merged channel balance — that is a property of the three light sources
+        # and their exposures. A FreeCCR-generated profile carries its own
+        # calibration neutral and ignores the as-shot value anyway
+        # (spec/camera-profile-calibration-wb.md), which is exactly right here.
+        # See spec/trichrome-camera-profile.md §5.
+        if not apply_input_icc:
+            return rgb
+        if color_management.get_active_dcp_profile() is not None:
+            return self._apply_input_dcp(rgb, None)
+        return self._apply_input_icc(rgb, None)
 
     def read_image(self, file_path: str, preview = True, max_long_side: Optional[int] = None,
                    positive_override: Optional[bool] = None, apply_input_icc: bool = True) -> Optional[np.ndarray]:

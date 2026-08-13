@@ -258,7 +258,8 @@ class IT8ProfileDialog(QDialog):
 
     PAGE_TARGET, PAGE_REF, PAGE_LOCATE, PAGE_BUILD, PAGE_SAVE = range(5)
 
-    def __init__(self, parent=None, current_path: Optional[str] = None):
+    def __init__(self, parent=None, current_path: Optional[str] = None,
+                 current_merge: Optional[tuple] = None):
         super().__init__(parent)
         self.setWindowTitle("Create Camera Profile from IT8")
         self.setModal(True)
@@ -277,7 +278,13 @@ class IT8ProfileDialog(QDialog):
         self._settings = QSettings("FreeCCR", "FreeCCR")
 
         self._current_path = current_path
+        # (sources, demosaic) when the app's current image is a 3-way merge, so
+        # "Use current image" can profile a trichrome capture without re-picking
+        # the three files. See spec/trichrome-camera-profile.md §3.
+        self._current_merge = current_merge
         self._target_path: Optional[str] = None
+        # Trichrome target: the (R,G,B) source triplet, or None for a single shot.
+        self._target_merge: Optional[list] = None
         self._target_img: Optional[np.ndarray] = None
         self._ref: Optional[it8.IT8Reference] = None
         self._fit: Optional[it8.CameraFit] = None
@@ -347,6 +354,14 @@ class IT8ProfileDialog(QDialog):
         row.addWidget(browse)
         row.addStretch(1)
         lay.addLayout(row)
+        # A trichrome capture is its OWN device space (each channel is the sensor
+        # response times its own light), so it has to be profiled as the merge —
+        # a white-light profile does not describe it.
+        self.trichrome_check = QCheckBox(
+            "Trichrome: merge 3 RAWs (red, green, blue) into one target")
+        self.trichrome_check.setChecked(bool(self._current_merge))
+        self.trichrome_check.toggled.connect(self._on_trichrome_toggled)
+        lay.addWidget(self.trichrome_check)
         self.target_label = QLabel("<i>No target selected.</i>")
         self.target_label.setWordWrap(True)
         lay.addWidget(self.target_label)
@@ -518,17 +533,77 @@ class IT8ProfileDialog(QDialog):
     # Page 1 — target
     # ------------------------------------------------------------------ #
     def _use_current(self):
-        if self._current_path:
+        if self._current_merge:
+            sources, demosaic = self._current_merge
+            self.trichrome_check.setChecked(True)
+            self._set_target_merge(list(sources), bool(demosaic))
+        elif self._current_path:
             self._set_target(self._current_path)
+
+    def _on_trichrome_toggled(self, on: bool):
+        """Switching the target kind invalidates whatever was selected: a single
+        shot and a merged triplet are different device spaces, so keeping the old
+        selection would quietly profile the wrong one."""
+        self._reset_card_accum()
+        self._target_path = None
+        self._target_merge = None
+        self._target_img = None
+        self.target_label.setText("<i>No target selected.</i>")
+        self._update_nav()
 
     def _browse_target(self):
         start = self._settings.value("files/last_open_dir", "", type=str)
+        if self.trichrome_check.isChecked():
+            sources = self._browse_triplet(
+                start, "Select the 3 trichrome target shots (red, green, blue)")
+            if sources:
+                self._set_target_merge(sources, bool(ccr_backend.rgb_merge_demosaic))
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Select IT8 target shot", start,
             "Images (*.dng *.tif *.tiff *.arw *.nef *.cr2 *.cr3 *.raf *.png "
             "*.jpg *.jpeg *.rw2 *.3fr *.fff);;All Files (*)")
         if path:
             self._set_target(path)
+
+    def _browse_triplet(self, start, title):
+        """Pick the three RAWs of a trichrome shot, sorted by basename exactly as
+        an import sorts them, so the wizard and a 3-way import of the same files
+        agree on which frame is red, green and blue. None if cancelled/invalid."""
+        from core import ccr_merge
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, title, start,
+            "RAW files (*.dng *.arw *.nef *.cr2 *.cr3 *.raf *.rw2 *.3fr);;"
+            "All Files (*)")
+        if not paths:
+            return None
+        if len(paths) != ccr_merge.MERGE_GROUP_SIZE:
+            QMessageBox.warning(
+                self, "Trichrome target",
+                f"Select exactly {ccr_merge.MERGE_GROUP_SIZE} RAW files "
+                f"(red, green, blue) \u2014 you selected {len(paths)}.")
+            return None
+        ok, err = ccr_merge.validate_merge_inputs(paths)
+        if not ok:
+            QMessageBox.warning(self, "Trichrome target", err)
+            return None
+        return ccr_merge.sort_for_merge(paths)
+
+    def _set_target_merge(self, sources, demosaic: bool):
+        self._reset_card_accum()           # a new target starts a fresh session
+        self._target_merge = list(sources)
+        self._target_demosaic = bool(demosaic)
+        self._target_path = sources[0]     # naming / last-dir only
+        self._target_img = None            # force re-decode on Next
+        names = ", ".join(os.path.basename(x) for x in sources)
+        mode = "linear demosaic" if demosaic else "single photosite"
+        # The merge mode is shown, not just used: it decides the device space the
+        # profile is fitted in, so a silently-baked mode would be undiagnosable.
+        self.target_label.setText(
+            f"Trichrome target (R, G, B): <b>{names}</b><br>"
+            f"<span style='color:#888'>Merge mode: {mode} "
+            f"(from the 3-way RGB merge setting)</span>")
+        self._update_nav()
 
     def _reset_card_accum(self):
         """Discard any in-progress multi-card accumulation. The target shot and
@@ -569,7 +644,7 @@ class IT8ProfileDialog(QDialog):
             return False
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            arr = it8.decode_target(norm)
+            arr = self._decode_any(norm)
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Decode Error",
@@ -714,11 +789,32 @@ class IT8ProfileDialog(QDialog):
 
     def _browse_next_target(self) -> Optional[str]:
         start = self._settings.value("files/last_open_dir", "", type=str)
+        if self.trichrome_check.isChecked():
+            # Every card of a trichrome session is itself a triplet: mixing in a
+            # single shot would combine samples from two different device spaces.
+            sources = self._browse_triplet(
+                start,
+                "Select the next card 3 trichrome shots (red, green, blue)")
+            if not sources:
+                return None
+            self._target_merge = list(sources)
+            self._target_demosaic = bool(ccr_backend.rgb_merge_demosaic)
+            return sources[0]
         path, _ = QFileDialog.getOpenFileName(
             self, "Select the next IT8 card image", start,
             "Images (*.dng *.tif *.tiff *.arw *.nef *.cr2 *.cr3 *.raf *.png "
             "*.jpg *.jpeg *.rw2 *.3fr *.fff);;All Files (*)")
         return path or None
+
+    def _decode_any(self, norm_path):
+        """Decode the current target, triplet-aware. A trichrome target is merged
+        first and then treated exactly like one raw (same bare device space), so
+        everything downstream - sampling, fit, ICC/DCP synthesis - is unchanged.
+        See spec/trichrome-camera-profile.md section 4."""
+        if self._target_merge:
+            return it8.decode_target_merged(
+                self._target_merge, getattr(self, "_target_demosaic", True))
+        return it8.decode_target(norm_path)
 
     def _load_card_image(self, path: str) -> bool:
         """Decode `path` and load it into the locator as the next card. Returns
@@ -731,7 +827,7 @@ class IT8ProfileDialog(QDialog):
             return False
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            arr = it8.decode_target(norm)
+            arr = self._decode_any(norm)
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Decode Error",
@@ -828,8 +924,9 @@ class IT8ProfileDialog(QDialog):
             self.worst_list.addItem(f"{sid}\tΔE {de:.2f}")
         if not self.name_edit.text().strip():
             illum = self.illum_combo.currentText().strip() or "Daylight"
+            kind = " trichrome" if self._target_merge else ""
             self.name_edit.setText(
-                f"Camera {illum} {datetime.now():%Y-%m-%d}")
+                f"Camera{kind} {illum} {datetime.now():%Y-%m-%d}")
         return True
 
     # ------------------------------------------------------------------ #
@@ -886,6 +983,9 @@ class IT8ProfileDialog(QDialog):
             QMessageBox.warning(self, "Save", "Choose a destination file.")
             return False
         is_dcp = self._is_dcp()
+        # A trichrome profile describes a different device space than a normal
+        # one; recording that is what keeps the two from being swapped silently.
+        tri = bool(self._target_merge)
         # The Output-format selector wins: normalise the path extension to match.
         base = path[:-4] if path.lower().endswith((".icc", ".dcp")) else path
         path = base + (".dcp" if is_dcp else ".icc")
@@ -898,13 +998,14 @@ class IT8ProfileDialog(QDialog):
             if is_dcp:
                 from core import dcp_profile
                 blob = dcp_profile.build_camera_dcp(
-                    self._fit, desc, illuminant=_illuminant_enum(illum))
+                    self._fit, desc, illuminant=_illuminant_enum(illum),
+                    trichrome=tri)
             elif clut:
                 blob = it8.build_camera_icc(
                     self._fit, desc, mode="clut", grid=17,
-                    samples=self._all_samples, ref=self._ref)
+                    samples=self._all_samples, ref=self._ref, trichrome=tri)
             else:
-                blob = it8.build_camera_icc(self._fit, desc)
+                blob = it8.build_camera_icc(self._fit, desc, trichrome=tri)
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(blob)
