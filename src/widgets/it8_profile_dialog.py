@@ -822,7 +822,7 @@ class IT8ProfileDialog(QDialog):
             f"95th {fit.p95_de:.2f} · max {fit.max_de:.2f}<br>"
             f"Patches used: {len(fit.used_ids)} · dropped "
             f"(clipped/missing): {len(fit.dropped_ids)} · "
-            f"white-balanced on {fit.wb_id}{combined}")
+            f"white-balanced on {it8.wb_patch_label(fit)}{combined}")
         self.worst_list.clear()
         for sid, de in fit.per_patch[:20]:
             self.worst_list.addItem(f"{sid}\tΔE {de:.2f}")
