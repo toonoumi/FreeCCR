@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from core import it8_profile as it8  # noqa: E402
 from core import color_management as cm  # noqa: E402
+from core import dcp_profile as dcp  # noqa: E402
 
 D50 = np.array(cm.D50_XYZ)                 # [0,1] scale, Y=1
 
@@ -710,3 +711,189 @@ def test_resolve_wb_gains_precedence():
                                1.0 / np.array([0.5, 1.0, 1.5]))
     np.testing.assert_allclose(cm.resolve_wb_gains(np.array([0.0, 1.0, -2.0]), None),
                                np.array([1.0, 1.0, 1.0]))
+
+
+# --------------------------------------------------------------------------- #
+# White balance averaged over a range of neutral patches.
+# See spec/wb-neutral-range-average.md.
+# --------------------------------------------------------------------------- #
+
+_WB_M0 = _pin(np.array([[0.46, 0.31, 0.17],
+                        [0.23, 0.70, 0.07],
+                        [0.02, 0.12, 0.93]]))
+_WB_TRUE = np.array([2.1, 1.0, 1.5])
+
+
+def _chromatic_patches():
+    """The synthetic colour patches with every (accidentally) near-neutral one
+    removed. A grey ramp alone is rank-deficient for a 3x3 fit, so the wedge
+    fixtures need real colour to condition the least squares — but any neutral
+    among them would join the WB candidate set and blur what the tests assert."""
+    out = {}
+    for cid, xyz in _synthetic_patches().items():
+        if cid.startswith("GS"):
+            continue
+        lab = it8.xyz_to_lab(xyz)
+        if float(np.hypot(lab[1], lab[2])) < it8._NEUTRAL_CHROMA:
+            continue
+        out[cid] = xyz
+    return out
+
+
+def _wedge_patches(cast=(0.0, 0.0), n=48, l_lo=24.0, l_hi=64.0):
+    """A grey wedge spanning L* l_lo..l_hi as ids H49..H72, I49..I72, plus a
+    lighter anchor patch and colour patches to condition the fit. `cast` adds a
+    CONSTANT (a*, b*) to every wedge patch — the systematic, non-neutral
+    reference the real chart has."""
+    ids = [f"{r}{c}" for r in ("H", "I") for c in range(49, 49 + n // 2)]
+    patches = _chromatic_patches()
+    for i, sid in enumerate(ids):
+        L = l_hi - (l_hi - l_lo) * i / max(1, len(ids) - 1)
+        patches[sid] = it8.lab_to_xyz(np.array([L, cast[0], cast[1]]))
+    patches["C49"] = it8.lab_to_xyz(np.array([87.0, 0.4, -0.3]))     # anchor
+    return patches, ids
+
+
+def _wedge_fit(cast=(0.0, 0.0), **kw):
+    patches, ids = _wedge_patches(cast)
+    ref = _ref_from_patches(patches)
+    samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+    return it8.fit_camera_matrix(samples, ref, **kw), ids, samples, ref
+
+
+def test_wb_range_exact_neutral_ramp():
+    # A perfectly neutral wedge: averaging must recover the true wb exactly, i.e.
+    # the new path is not a regression on the case the old one already handled.
+    fit, ids, _, _ = _wedge_fit()
+    np.testing.assert_allclose(fit.wb_mult, _WB_TRUE, atol=1e-9)
+    np.testing.assert_allclose(fit.matrix, _WB_M0, atol=1e-9)
+    assert fit.wb_ids == ids                       # every wedge patch used, in order
+    assert fit.wb_id == "C49"                      # anchor unchanged (lightest neutral)
+
+
+def test_wb_range_corrects_systematic_reference_cast():
+    """The reason the estimate is reference-corrected (spec §4.2).
+
+    The real chart's wedge carries a systematic cast (mean a* -3.5, b* -2.1); a
+    naive average of the patches' raw ratios assumes they are neutral and bakes
+    that cast into the white balance with the sign flipped. Correcting each patch
+    against its own reference Lab recovers the TRUE wb instead."""
+    fit, ids, samples, ref = _wedge_fit(cast=(-3.5, -2.1))
+    # rtol matches the refiner's own convergence threshold (§4.3, 1e-4 in log).
+    np.testing.assert_allclose(fit.wb_mult, _WB_TRUE, rtol=1e-4)
+
+    # What a naive "force these patches to equal-RGB" average would have produced:
+    logs = []
+    for sid in ids:
+        n = samples[sid].rgb / 65535.0
+        logs.append(np.log(n[1] / n))
+    naive = np.exp(np.mean(logs, axis=0))
+    naive = naive / naive[1]
+    err = np.abs(naive / _WB_TRUE - 1.0).max()
+    assert err > 0.01, "the cast must actually bias a naive average"
+    assert np.abs(fit.wb_mult / _WB_TRUE - 1.0).max() < err / 10
+
+
+def test_wb_range_averages_away_noise():
+    # Per-patch noise: the averaged estimate beats the single lightest patch.
+    patches, ids = _wedge_patches()
+    ref = _ref_from_patches(patches)
+    rng = np.random.default_rng(11)
+    single_err, avg_err = [], []
+    for _ in range(8):
+        samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+        for sid in samples:                        # 1% per-channel measurement noise
+            samples[sid] = it8.PatchSample(
+                rgb=samples[sid].rgb * (1.0 + rng.normal(0, 0.01, 3)),
+                valid=True, n_pix=900)
+        avg = it8.fit_camera_matrix(samples, ref)
+        one = it8.fit_camera_matrix(samples, ref, wb_ids=[])
+        avg_err.append(np.abs(avg.wb_mult / _WB_TRUE - 1.0).max())
+        single_err.append(np.abs(one.wb_mult / _WB_TRUE - 1.0).max())
+    assert np.mean(avg_err) < np.mean(single_err) / 2
+
+
+def test_wb_range_rejects_an_outlier_patch():
+    # One patch ruined (a dust speck / specular sheen on the chart) must not move
+    # the estimate, and must not be reported as having been used.
+    patches, ids = _wedge_patches()
+    ref = _ref_from_patches(patches)
+    samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+    clean = it8.fit_camera_matrix(samples, ref).wb_mult
+    samples[ids[10]] = it8.PatchSample(
+        rgb=samples[ids[10]].rgb * np.array([1.6, 1.0, 0.7]), valid=True, n_pix=900)
+    fit = it8.fit_camera_matrix(samples, ref)
+    assert ids[10] not in fit.wb_ids
+    np.testing.assert_allclose(fit.wb_mult, clean, rtol=2e-3)
+
+
+def test_wb_range_band_and_overrides():
+    # Only patches inside the L* band are candidates...
+    patches, ids = _wedge_patches()
+    patches["G49"] = it8.lab_to_xyz(np.array([80.0, 0.2, 0.1]))   # highlight, outside
+    patches["J49"] = it8.lab_to_xyz(np.array([20.0, 0.2, 0.1]))   # shadow, outside
+    patches["J72"] = it8.lab_to_xyz(np.array([8.0, 0.2, 0.1]))    # shadow, in the noise
+    ref = _ref_from_patches(patches)
+    samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+    fit = it8.fit_camera_matrix(samples, ref)
+    assert not ({"G49", "J49", "J72"} & set(fit.wb_ids))
+    # ...unless the band is widened — except J72, which is so deep that a channel
+    # lands under the noise floor, and a ratio measured there is meaningless.
+    wide = it8.fit_camera_matrix(samples, ref, wb_l_range=(5.0, 90.0))
+    assert "G49" in wide.wb_ids and "J49" in wide.wb_ids
+    assert "J72" not in wide.wb_ids
+    # ...or an explicit list is given, which skips the neutrality/band gates.
+    exact = it8.fit_camera_matrix(samples, ref, wb_ids=["H49", "H50", "H51", "G49"])
+    assert exact.wb_ids == ["G49", "H49", "H50", "H51"]           # chart order
+
+
+def test_wb_range_falls_back_to_single_patch():
+    # A chart with one usable neutral behaves exactly as before the change.
+    patches = {"C49": it8.lab_to_xyz(np.array([87.0, 0.4, -0.3]))}
+    patches.update(_chromatic_patches())           # colour only: one neutral in total
+    ref = _ref_from_patches(patches)
+    samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+    fit = it8.fit_camera_matrix(samples, ref)
+    assert fit.wb_ids == [fit.wb_id]
+    n = samples[fit.wb_id].rgb / 65535.0
+    np.testing.assert_allclose(fit.wb_mult, n[1] / n, atol=1e-12)   # the old formula
+    assert it8.wb_patch_label(fit) == fit.wb_id
+
+
+def test_wb_range_invalid_patches_never_used():
+    patches, ids = _wedge_patches()
+    ref = _ref_from_patches(patches)
+    samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+    samples[ids[0]] = it8.PatchSample(rgb=samples[ids[0]].rgb, valid=False, n_pix=900)
+    samples[ids[1]] = it8.PatchSample(rgb=np.zeros(3), valid=True, n_pix=900)  # noise floor
+    fit = it8.fit_camera_matrix(samples, ref)
+    assert ids[0] not in fit.wb_ids and ids[1] not in fit.wb_ids
+
+
+def test_wb_range_independent_of_anchor_and_converges():
+    # The estimate is a property of the wedge, not of which patch it started from
+    # (spec §4.3: wb enters the fit only through the D50 pin).
+    patches, ids = _wedge_patches(cast=(-3.5, -2.1))
+    ref = _ref_from_patches(patches)
+    samples = _balanced_samples(_WB_M0, patches, _WB_TRUE)
+    a = it8.fit_camera_matrix(samples, ref)                       # anchor C49
+    b = it8.fit_camera_matrix(samples, ref, wb_id=ids[-1])        # anchor: darkest
+    np.testing.assert_allclose(a.wb_mult, b.wb_mult, rtol=1e-4)   # §4.3 threshold
+    assert b.wb_id == ids[-1]                                     # anchor did move
+    np.testing.assert_allclose(a.matrix @ np.ones(3), D50, atol=1e-12)
+
+
+def test_wb_range_flows_into_the_baked_profiles():
+    # The averaged neutral is what gets baked into both containers
+    # (spec/camera-profile-calibration-wb.md).
+    fit, _, _, _ = _wedge_fit(cast=(-3.5, -2.1))
+    p = dcp.parse_dcp_bytes(dcp.build_camera_dcp(fit, "cal"))
+    np.testing.assert_allclose(p.as_shot_neutral, 1.0 / fit.wb_mult, atol=1e-6)
+    np.testing.assert_allclose(p.color_matrix_1 @ D50, 1.0 / fit.wb_mult, atol=1e-5)
+    prof = cm.InputProfile.from_bytes(it8.build_camera_icc(fit, "cal"))
+    np.testing.assert_allclose(prof.calibration_neutral, 1.0 / fit.wb_mult, atol=1e-3)
+
+
+def test_wb_patch_label():
+    fit, ids, _, _ = _wedge_fit()
+    assert it8.wb_patch_label(fit) == f"{ids[0]}–{ids[-1]} ({len(ids)} patches)"

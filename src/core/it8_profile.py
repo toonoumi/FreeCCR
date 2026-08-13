@@ -720,10 +720,22 @@ class CameraFit:
     per_patch: List[Tuple[str, float]]     # (id, dE2000), worst-first
     used_ids: List[str]
     dropped_ids: List[str]
-    wb_id: str
+    wb_id: str                             # anchor patch (exposure / white-relative)
+    wb_ids: List[str] = field(default_factory=list)   # patches averaged for the WB
 
 
 _NEUTRAL_CHROMA = 6.0   # max CIELab chroma for a patch to count as "neutral"
+
+# The midtone band of a neutral ramp, in reference L*. Below it the deep shadows
+# bend the channel RATIOS (veiling flare, black-level error) — the very quantity the
+# white balance is; above it a channel clips and the chart's Dmin flattens. Selects
+# rows H-I of an ISO 12641-2 advanced grey wedge and roughly GS16..GS22 of a classic
+# 24-step strip: both ~5-45% of the chart white's luminance.
+# See spec/wb-neutral-range-average.md §3.
+WB_L_RANGE: Tuple[float, float] = (24.0, 64.0)
+_WB_MIN_PATCHES = 3     # fewer candidates than this -> single-patch fallback
+_WB_MAX_ITERS = 4       # §4.3 converges in 1-2; this is a guard, not a budget
+_WB_NOISE_FLOOR = 0.01  # a candidate channel below 1% of full scale is noise, not signal
 
 
 def _pick_wb_id(samples: Dict[str, PatchSample], ref: IT8Reference,
@@ -754,15 +766,157 @@ def _pick_wb_id(samples: Dict[str, PatchSample], ref: IT8Reference,
     return best
 
 
+def _patch_sort_key(sid: str):
+    """Chart order for a patch id: 'GS7' < 'GS12', 'H49' < 'H50' < 'I49'."""
+    m = re.match(r"^(GS|[A-Z])(\d+)$", sid.upper())
+    return (0, m.group(1), int(m.group(2))) if m else (1, sid.upper(), 0)
+
+
+def _wb_candidates(samples: Dict[str, PatchSample], ref: IT8Reference,
+                   l_range: Tuple[float, float],
+                   wb_ids: Optional[List[str]] = None) -> List[str]:
+    """The neutral patches to average the white balance over, in chart order.
+
+    Auto (wb_ids=None): valid, near-neutral patches whose reference L* falls in the
+    midtone band — see WB_L_RANGE. An explicit wb_ids skips the neutrality and band
+    gates (the caller has chosen) but is still filtered for a valid sample, a usable
+    reference, and the noise floor. See spec/wb-neutral-range-average.md §3."""
+    lo, hi = float(l_range[0]), float(l_range[1])
+    out: List[str] = []
+    for sid in (wb_ids if wb_ids is not None else list(samples.keys())):
+        ps = samples.get(sid)
+        lab = ref.lab(sid)
+        if ps is None or not ps.valid or lab is None or ref.xyz(sid) is None:
+            continue
+        if wb_ids is None:
+            if float(np.hypot(lab[1], lab[2])) >= _NEUTRAL_CHROMA:
+                continue
+            if not (lo <= float(lab[0]) <= hi):
+                continue
+        # A channel down in the noise makes its RATIO meaningless, whatever the
+        # chart says the patch's L* is (an underexposed shot).
+        if float(np.min(np.asarray(ps.rgb, dtype=np.float64))) < _WB_NOISE_FLOOR * 65535.0:
+            continue
+        out.append(sid)
+    return sorted(out, key=_patch_sort_key)
+
+
+def _robust_log_mean(logs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-channel mean of log-ratios with MAD outlier rejection (§4.3).
+
+    Returns (mean_log per channel, keep mask of patches kept in EVERY channel) —
+    one dusty, sheened or half-clipped patch cannot pull the average."""
+    med = np.median(logs, axis=0)
+    mad = np.median(np.abs(logs - med), axis=0) * 1.4826
+    keep = np.abs(logs - med) <= np.maximum(2.5 * mad, 1e-6)     # (N,3)
+    out = np.empty(3)
+    for ch in range(3):
+        sel = logs[keep[:, ch], ch]
+        out[ch] = float(sel.mean()) if sel.size else float(med[ch])
+    return out, keep.all(axis=1)
+
+
+def _fit_matrix(d: np.ndarray, X: np.ndarray, wb: np.ndarray, n1: float,
+                weight: str) -> np.ndarray:
+    """Least-squares balanced-device -> XYZ D50 matrix, pinned so M@(1,1,1)==D50.
+
+    d: (N,3) normalised raw device RGB (un-balanced). X: (N,3) white-normalised
+    reference XYZ. n1: the anchor patch's green level (the exposure scale)."""
+    bN = (d * wb) / n1                       # balanced, white-relative device
+    if weight == "1/Y":
+        sw = np.sqrt(1.0 / np.clip(X[:, 1], 0.02, None))[:, None]
+        A, *_ = np.linalg.lstsq(bN * sw, X * sw, rcond=None)
+    else:
+        A, *_ = np.linalg.lstsq(bN, X, rcond=None)
+    M = A.T                                  # balanced device RGB -> XYZ D50
+    # Pin balanced white (1,1,1) EXACTLY to D50 (Y=1). A row (output) scale fixes
+    # both the neutral chromaticity and the residual exposure; for a good fit it
+    # is ~uniform. This is the white-relative anchor every standard CMM expects.
+    white = M @ np.ones(3)
+    white = np.where(np.abs(white) < 1e-9, 1e-9, white)
+    return np.diag(D50_XYZ / white) @ M
+
+
+def _refine_wb(wb0: np.ndarray, cand: List[str], samples: Dict[str, PatchSample],
+               ref: IT8Reference, d: np.ndarray, X: np.ndarray, n1: float,
+               weight: str, white_Y: float) -> Tuple[np.ndarray, List[str]]:
+    """Re-estimate the WB by averaging the candidate neutrals, each corrected
+    against the colour the REFERENCE says it is (spec §4.2).
+
+    Forcing the candidates to equal-RGB would be wrong: a printed grey wedge carries
+    a systematic cast (the maintainer's runs to Lab chroma 4.8, mean a* -3.5), and a
+    systematic cast does not average out — it would be baked into the neutral with
+    the sign flipped. So each patch is measured against M's prediction of its own
+    reference XYZ, which makes non-neutral candidates safe to include.
+
+    Returns (wb, patches averaged). An empty list means "no usable estimate" and the
+    caller keeps the single-patch value."""
+    wb = np.asarray(wb0, dtype=np.float64).copy()
+    dev = {sid: np.clip(np.asarray(samples[sid].rgb, dtype=np.float64) / 65535.0,
+                        1e-6, None) for sid in cand}
+    xref = {sid: (np.asarray(ref.xyz(sid), dtype=np.float64) / 100.0) / white_Y
+            for sid in cand}
+    used: List[str] = []
+    for _ in range(_WB_MAX_ITERS):
+        M = _fit_matrix(d, X, wb, n1, weight)
+        try:
+            Minv = np.linalg.inv(M)
+        except np.linalg.LinAlgError:
+            break                            # degenerate fit -> single-patch value
+        logs, ids = [], []
+        for sid in cand:
+            b = dev[sid] * wb / n1           # measured balanced device
+            p = Minv @ xref[sid]             # device that WOULD produce the reference
+            if np.any(b <= 0) or np.any(p <= 0) or not np.all(np.isfinite(p)):
+                continue
+            c = p / b
+            logs.append(np.log(c / c[1]))    # green-normalised correction
+            ids.append(sid)
+        if len(logs) < _WB_MIN_PATCHES:
+            break
+        mean_log, keep = _robust_log_mean(np.asarray(logs, dtype=np.float64))
+        c = np.exp(mean_log)
+        c = c / c[1]
+        # A runaway correction means a degenerate fit, not a better neutral.
+        if not np.all(np.isfinite(c)) or c.max() > 2.0 or c.min() < 0.5:
+            break
+        wb = wb * c
+        wb = wb / wb[1]
+        used = [sid for sid, k in zip(ids, keep) if k]
+        if float(np.abs(mean_log).max()) < 1e-4:
+            break                            # converged
+    return (wb, used) if used else (np.asarray(wb0, dtype=np.float64), [])
+
+
+def wb_patch_label(fit: "CameraFit") -> str:
+    """Human-readable summary of the patches the white balance came from:
+    'H49-I72 (48 patches)', or a single id when only the anchor was usable."""
+    ids = list(getattr(fit, "wb_ids", None) or [])
+    if len(ids) <= 1:
+        return fit.wb_id
+    return f"{ids[0]}–{ids[-1]} ({len(ids)} patches)"
+
+
 def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
                       ids: Optional[List[str]] = None, weight: str = "none",
-                      wb_id: Optional[str] = None) -> CameraFit:
+                      wb_id: Optional[str] = None,
+                      wb_ids: Optional[List[str]] = None,
+                      wb_l_range: Tuple[float, float] = WB_L_RANGE) -> CameraFit:
     """Fit the 3x3 camera matrix from sampled device RGB + reference XYZ.
 
     ids: patch ids to use (default: every sampled id present in the reference).
     weight: 'none' (plain XYZ least squares, the documented baseline) or '1/Y'
-    (down-weight bright patches). wb_id: force the white-balance patch (default:
-    auto-pick the lightest neutral). See spec §5.4."""
+    (down-weight bright patches). wb_id: force the ANCHOR patch — the one that sets
+    the white-relative exposure normalisation (default: auto-pick the lightest
+    neutral). See spec §5.4.
+
+    The white balance itself is averaged over a RANGE of neutral patches (the
+    midtone band of the grey ramp, wb_l_range), each corrected against its reference
+    colour, rather than read off the anchor alone: one patch's noise, dust or sheen
+    would otherwise propagate into every frame the profile is applied to. wb_ids
+    overrides the selection with an explicit list. With fewer than three usable
+    candidates the anchor's own ratios are used, exactly as before.
+    See spec/wb-neutral-range-average.md."""
     chosen_wb = _pick_wb_id(samples, ref, wb_id)
     if chosen_wb is None:
         raise IT8ReferenceError("No valid neutral patch to white-balance on — "
@@ -809,26 +963,30 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
     # convention; the same balance is rebuilt per-image at apply time from the
     # frame's own as-shot neutral.
     n_raw = np.clip(samples[chosen_wb].rgb / 65535.0, 1e-6, None)
+    n1 = float(n_raw[1])
     wb = n_raw[1] / n_raw                    # neutral -> equal RGB; wb[1] == 1
+
+    # ...but read off ONE patch that is only a starting point: average the ratios
+    # over the midtone band of the grey ramp instead, each patch corrected against
+    # its own reference colour. The anchor keeps its other job — the exposure scale
+    # n1 below, and the white-relative reference normalisation above — so only the
+    # channel ratios move. See spec/wb-neutral-range-average.md.
+    wb_used: List[str] = [chosen_wb]
+    cand = _wb_candidates(samples, ref, wb_l_range, wb_ids)
+    if len(cand) >= _WB_MIN_PATCHES:
+        wb_avg, averaged = _refine_wb(wb, cand, samples, ref, d, X, n1, weight,
+                                      white_Y if white_Y > 1e-6 else 1.0)
+        if averaged:
+            wb, wb_used = wb_avg, averaged
+
     # Balanced device, normalised so the white/neutral patch reads ~ (1,1,1):
     # makes the matrix WHITE-RELATIVE so the chart's absolute exposure drops OUT
     # of the gain (ArgyllCMS / colprof default), not baked into it.
-    bN = (d * wb) / float(n_raw[1])
+    bN = (d * wb) / n1
 
-    # --- (Weighted) least squares  X ~= bN @ A ;  M = A.T  => XYZ = M @ balanced
-    if weight == "1/Y":
-        sw = np.sqrt(1.0 / np.clip(X[:, 1], 0.02, None))[:, None]
-        A, *_ = np.linalg.lstsq(bN * sw, X * sw, rcond=None)
-    else:
-        A, *_ = np.linalg.lstsq(bN, X, rcond=None)
-    M = A.T                                  # balanced device RGB -> XYZ D50
-
-    # Pin balanced white (1,1,1) EXACTLY to D50 (Y=1). A row (output) scale fixes
-    # both the neutral chromaticity and the residual exposure; for a good fit it
-    # is ~uniform. This is the white-relative anchor every standard CMM expects.
-    white = M @ np.ones(3)
-    white = np.where(np.abs(white) < 1e-9, 1e-9, white)
-    M = np.diag(D50_XYZ / white) @ M         # M @ (1,1,1) == D50
+    # --- (Weighted) least squares  X ~= bN @ A ;  M = A.T  => XYZ = M @ balanced,
+    # then pinned so M @ (1,1,1) == D50.
+    M = _fit_matrix(d, X, wb, n1, weight)
 
     # Quality: predicted Lab vs the white-normalised reference Lab (same relative-
     # colorimetric space the matrix maps into, so ΔE measures COLOUR error only).
@@ -850,6 +1008,7 @@ def fit_camera_matrix(samples: Dict[str, PatchSample], ref: IT8Reference, *,
         used_ids=used,
         dropped_ids=dropped,
         wb_id=chosen_wb,
+        wb_ids=wb_used,
     )
 
 
