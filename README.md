@@ -170,6 +170,16 @@ python write_version.py   # required on first run or after tagging
 python src/main.py
 ```
 
+FreeCCR can also be pointed at images from the command line — files, folders, or
+a mix. A single folder opens like **Open Folder**; anything else opens as a file
+list, with each folder expanded to the images inside it:
+
+```bash
+python src/main.py /rolls/roll-07          # open a whole folder
+python src/main.py a.nef b.nef c.nef       # open specific frames
+python src/main.py --help                  # usage, then exit
+```
+
 <details>
 <summary><strong>Build a standalone Windows executable + installer</strong></summary>
 

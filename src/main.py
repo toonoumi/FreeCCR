@@ -58,8 +58,23 @@ except Exception as _e:  # noqa: BLE001
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
+from PySide6.QtCore import QTimer
 
 def main():
+    # Command-line file/folder arguments (spec/cli-file-args.md). --help and
+    # --version answer and exit before any Qt object exists; the remaining
+    # positional paths seed the startup import further down. Qt's own switches
+    # stay in sys.argv for QApplication to consume.
+    from utils import cli_args
+    if cli_args.wants_help(sys.argv[1:]):
+        print(cli_args.USAGE)
+        return
+    if cli_args.wants_version(sys.argv[1:]):
+        from version import VERSION
+        print(f"FreeCCR {VERSION}")
+        return
+    startup_paths = cli_args.strip_qt_options(sys.argv[1:])
+
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
@@ -76,6 +91,11 @@ def main():
 
     apply_windows_dark_titlebar(window)  # dark native title bar (Win10/11)
     window.show()
+    if startup_paths:
+        # Queued, not called inline: the import puts a modal-ish loading dialog
+        # up and pumps events, so the window must be shown and the event loop
+        # running first — otherwise the user stares at an unpainted frame.
+        QTimer.singleShot(0, lambda: window.load_paths(startup_paths))
     sys.exit(app.exec())
 
 if __name__ == "__main__":
