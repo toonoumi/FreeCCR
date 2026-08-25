@@ -92,17 +92,27 @@ as a dialog import would, so the next dialog opens where the CLI pointed.
    `-qwindowtitle`, `-qwindowicon`, and their `--` spellings). `-opt=value`
    carries its value inline and consumes nothing. `--` ends option processing:
    everything after it is a path, even a leading-dash one.
-2. **Classify** each remaining argument: existing directory, existing file, or
+2. **Expand wildcards.** An argument containing `*`, `?` or `[` that does not
+   already name an existing path is replaced in place by its `glob` matches,
+   sorted case-insensitively (`recursive=True`, so an explicit `**` walks). A
+   pattern matching nothing is left literal for step 2 to report. Unix shells
+   do this before `argv` reaches us; cmd.exe and PowerShell do not, so doing it
+   here is what makes `freeccr *.tif` behave the same on every host. Checking
+   for an existing path first keeps a file literally named `shot[1].tif`
+   openable. Because expansion happens before the rules below, a pattern
+   behaves exactly like the paths it matched — one matching a single folder
+   takes the single-folder rule.
+3. **Classify** each remaining argument: existing directory, existing file, or
    missing.
-3. **Plan.** One argument, a directory ⇒ `folder=` that path. Otherwise expand
+4. **Plan.** One argument, a directory ⇒ `folder=` that path. Otherwise expand
    every directory (non-recursive, `SUPPORTED_EXTS`, sorted case-insensitively
    by name) and concatenate with the named files in argument order,
    de-duplicated by normalised absolute path, first occurrence winning.
-4. **Dispatch** on the GUI thread via `QTimer.singleShot(0, …)` after
+5. **Dispatch** on the GUI thread via `QTimer.singleShot(0, …)` after
    `window.show()`: `MainWindow.load_paths(paths)` runs the plan, calls the same
    helpers the dialogs call, then reports `problems`.
 
-Steps 1–3 are pure (no Qt, no `MainWindow`) and live in `src/utils/cli_args.py`;
+Steps 1–4 are pure (no Qt, no `MainWindow`) and live in `src/utils/cli_args.py`;
 only step 4 touches the GUI.
 
 ## 5. Integration points
@@ -146,6 +156,12 @@ only step 4 touches the GUI.
 - **Missing paths** land in `problems` and not in `files`; an empty folder is
   reported too; a plan of nothing but missing paths yields empty `folder`/`files`.
 - **Nested folders are not walked** (a subdirectory contributes nothing).
+- **Wildcards** expand to their matches in case-insensitive order and plan as a
+  file list; `?` matches one character; an unmatched pattern is reported as
+  *no files match this pattern* rather than *not found*; a real file named
+  `shot[1].nef` wins over character-class interpretation; a pattern matching
+  one folder takes the single-folder rule and several folders expand in a list;
+  `**` recurses while a single `*` stays at one level.
 
 `tests/test_cli_startup.py` (GUI, offscreen, mirrors `test_tether_watcher.py`'s
 `MainWindow()` usage):

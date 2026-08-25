@@ -11,8 +11,9 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from utils.cli_args import (OpenPlan, expand_folder, plan_open,  # noqa: E402
-                            strip_qt_options, wants_help, wants_version)
+from utils.cli_args import (OpenPlan, expand_folder, expand_globs,  # noqa: E402
+                            plan_open, strip_qt_options, wants_help,
+                            wants_version)
 
 # Stand-in for core.tether_watcher.is_supported (same rule, no Qt import).
 SUPPORTED = {".nef", ".dng", ".tif", ".jpg"}
@@ -154,6 +155,82 @@ def test_expansion_is_not_recursive(tmp_path):
 
 def test_unreadable_folder_expands_to_nothing(tmp_path):
     assert expand_folder(str(tmp_path / "does-not-exist"), _supported) == []
+
+
+# --- wildcard expansion --------------------------------------------------
+# Unix shells expand these before argv reaches us; cmd.exe and PowerShell do
+# not, so FreeCCR expands them itself and both hosts behave alike.
+
+def test_star_pattern_expands_to_its_matches_sorted(tmp_path):
+    _touch(tmp_path, "B.nef", "a.nef", "c.jpg")
+    got = expand_globs([str(tmp_path / "*.nef")])
+    assert got == [str(tmp_path / "a.nef"), str(tmp_path / "B.nef")]
+
+
+def test_question_mark_pattern_matches_one_character(tmp_path):
+    _touch(tmp_path, "roll-1.nef", "roll-12.nef")
+    got = expand_globs([str(tmp_path / "roll-?.nef")])
+    assert got == [str(tmp_path / "roll-1.nef")]
+
+
+def test_pattern_plans_as_a_file_list(tmp_path):
+    a, b = _touch(tmp_path, "a.nef", "b.nef")
+    plan = plan_open([str(tmp_path / "*.nef")], _supported)
+    assert plan.folder is None and plan.files == [a, b]
+    assert plan.problems == []
+
+
+def test_pattern_and_named_file_keep_argument_order_and_dedupe(tmp_path):
+    a, b = _touch(tmp_path, "a.nef", "b.nef")
+    plan = plan_open([b, str(tmp_path / "*.nef")], _supported)
+    # The named file comes first; the pattern re-offers it and it collapses.
+    assert plan.files == [b, a]
+
+
+def test_unmatched_pattern_is_reported_as_a_pattern(tmp_path):
+    plan = plan_open([str(tmp_path / "*.nef")], _supported)
+    assert plan.files == []
+    assert len(plan.problems) == 1
+    assert "no files match this pattern" in plan.problems[0]
+
+
+def test_a_real_file_named_like_a_pattern_wins(tmp_path):
+    # glob would read `shot[1].nef` as a character class; the file exists, so
+    # it must open as itself.
+    real, = _touch(tmp_path, "shot[1].nef")
+    assert expand_globs([real]) == [real]
+    assert plan_open([real], _supported).files == [real]
+
+
+def test_pattern_matching_one_folder_takes_the_single_folder_rule(tmp_path):
+    d = tmp_path / "roll-1"
+    d.mkdir()
+    _touch(d, "a.nef")
+    plan = plan_open([str(tmp_path / "roll-*")], _supported)
+    assert plan == OpenPlan(str(d), [], [])
+
+
+def test_pattern_matching_folders_expands_each_in_a_list(tmp_path):
+    for name in ("roll-1", "roll-2"):
+        (tmp_path / name).mkdir()
+    one, = _touch(tmp_path / "roll-1", "a.nef")
+    two, = _touch(tmp_path / "roll-2", "b.nef")
+    plan = plan_open([str(tmp_path / "roll-*")], _supported)
+    assert plan.folder is None and plan.files == [one, two]
+
+
+def test_double_star_recurses_only_when_asked(tmp_path):
+    (tmp_path / "sub").mkdir()
+    deep, = _touch(tmp_path / "sub", "deep.nef")
+    top, = _touch(tmp_path, "top.nef")
+    assert expand_globs([str(tmp_path / "**" / "*.nef")]) == [deep, top]
+    # A single star stays at one level.
+    assert expand_globs([str(tmp_path / "*.nef")]) == [top]
+
+
+def test_non_wildcard_arguments_pass_through_untouched():
+    args = ["/a/b.nef", "relative.nef", "-"]
+    assert expand_globs(args) == args
 
 
 if __name__ == "__main__":

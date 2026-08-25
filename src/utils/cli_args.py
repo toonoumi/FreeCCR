@@ -1,13 +1,14 @@
 """
 Command-line file / folder arguments.
 
-`freeccr [PATH ...]` seeds the startup import with files, folders, or a mix, so
-a roll can be opened from a shell or a script without walking the Open Files /
-Open Folder dialogs. This module is the PURE half — argument parsing, folder
-expansion and planning, no Qt and no MainWindow — so the whole decision is
-unit-testable; `MainWindow.load_paths` performs the plan. See
-spec/cli-file-args.md.
+`freeccr [PATH ...]` seeds the startup import with files, folders, wildcard
+patterns, or a mix, so a roll can be opened from a shell or a script without
+walking the Open Files / Open Folder dialogs. This module is the PURE half —
+argument parsing, glob and folder expansion, planning, no Qt and no MainWindow
+— so the whole decision is unit-testable; `MainWindow.load_paths` performs the
+plan. See spec/cli-file-args.md.
 """
+import glob
 import os
 from typing import Callable, List, NamedTuple, Optional, Sequence
 
@@ -16,12 +17,20 @@ USAGE = """Usage: freeccr [OPTIONS] [PATH ...]
   PATH   image files and/or folders to open at startup.
          One folder alone loads like Open Folder; anything else loads as a
          file list, with each folder expanded to the images inside it.
+         Wildcards (*.tif, roll-?.nef) are expanded by FreeCCR itself, so
+         they work in cmd.exe and PowerShell as well as in a Unix shell.
 
 Options:
   -h, --help      show this message and exit
   -V, --version   show the version and exit
 
 Qt options (-platform, -style, ...) are also accepted."""
+
+# Characters that make an argument a wildcard pattern rather than a literal
+# path. `[` is included because glob honours character classes, but an argument
+# naming a real file always wins over pattern interpretation (see expand_globs),
+# so a photo literally called `shot[1].tif` still opens.
+WILDCARD_CHARS = "*?["
 
 HELP_FLAGS = frozenset({"-h", "--help"})
 VERSION_FLAGS = frozenset({"-V", "--version"})
@@ -101,6 +110,37 @@ def strip_qt_options(argv: Sequence[str]) -> List[str]:
     return paths
 
 
+def _has_wildcard(arg: str) -> bool:
+    return any(ch in arg for ch in WILDCARD_CHARS)
+
+
+def expand_globs(args: Sequence[str]) -> List[str]:
+    """Expand wildcard arguments (`*.tif`, `roll-?.nef`, `**/*.dng`) in place,
+    each to its matches sorted case-insensitively.
+
+    Unix shells expand these before the program starts; cmd.exe and PowerShell
+    hand the pattern over untouched, so `freeccr *.tif` used to reach us as the
+    literal string and be reported as not found. Doing it here makes both hosts
+    behave the same. It stays a no-op under a Unix shell: a pattern the shell
+    matched arrives already expanded, and one it could not match is passed
+    through literally and matches nothing here either.
+
+    An argument naming an existing path is never treated as a pattern, so a
+    file called `shot[1].tif` opens as itself. A pattern matching nothing is
+    passed through unchanged for plan_open to report."""
+    out: List[str] = []
+    for arg in args:
+        if not _has_wildcard(arg) or os.path.exists(arg):
+            out.append(arg)
+            continue
+        # recursive=True only gives `**` its meaning; other patterns are
+        # unaffected, and `**` is a depth the user asked for explicitly.
+        matches = glob.glob(arg, recursive=True)
+        matches.sort(key=lambda pth: (pth.lower(), pth))
+        out.extend(matches or [arg])
+    return out
+
+
 def expand_folder(folder: str,
                   is_supported: Optional[Callable[[str], bool]] = None
                   ) -> List[str]:
@@ -130,8 +170,12 @@ def plan_open(args: Sequence[str],
     normalised absolute path (first occurrence wins). A named file is kept
     whatever its extension — the Open Files dialog has an All Files filter, so
     the CLI is no stricter — while folder-expanded files are filtered.
-    Arguments that contribute nothing are reported, never silently dropped."""
-    args = [a for a in args if a]
+    Arguments that contribute nothing are reported, never silently dropped.
+
+    Wildcard arguments are expanded first (see expand_globs), so a pattern
+    behaves exactly like the paths it matches — including the single-folder
+    rule, which a pattern matching one folder therefore takes."""
+    args = expand_globs([a for a in args if a])
     problems: List[str] = []
     if not args:
         return OpenPlan(None, [], problems)
@@ -157,6 +201,8 @@ def plan_open(args: Sequence[str],
                 _add(path)
         elif os.path.isfile(arg):
             _add(arg)
+        elif _has_wildcard(arg):
+            problems.append(f"{arg} — no files match this pattern")
         else:
             problems.append(f"{arg} — not found")
     return OpenPlan(None, files, problems)
