@@ -28,8 +28,11 @@ FILM_STOCK_DEFAULT_LABEL = "Default"
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
     ("wb", "White Balance / Tint", ("temperature", "tint")),
-    ("tone", "Tone (gain, brightness, contrast, ...)",
-     ("exposure", "brightness", "gamma", "highlights", "white_point",
+    # Gain is no longer here: it lives in Channel Levels as Master Gain, and
+    # syncs with the "channels" group below rather than splitting one stage
+    # across two groups.
+    ("tone", "Tone (brightness, contrast, ...)",
+     ("brightness", "gamma", "highlights", "white_point",
       "shadows", "black_point", "contrast")),
     ("sat", "Saturation", ("saturation", "sub_saturation")),
     ("crop", "Crop", ()),
@@ -39,7 +42,7 @@ SYNC_GROUPS = [
     # edge, and the straighten a user sets rides "crop" as the crop angle.
     # See spec/orientation-sync-group.md.
     ("orientation", "Orientation (rotate 90° / mirror)", ()),
-    ("channels", "Channel Levels", (
+    ("channels", "Channel Levels (incl. Master Gain)", (
         "ch_input_gain", "ch_master_shift", "ch_master_gain",
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
@@ -286,7 +289,10 @@ class SlidersPanel(QWidget):
     # Order must match the create_slider() call order exactly — the two
     # lists are zipped positionally.
     ADJUSTMENT_KEYS = [
-        "temperature", "tint", "exposure", "brightness", "gamma", "highlights",
+        # "exposure" is deliberately absent: the Gain slider was removed (Master
+        # Gain replaces it). The pipeline parameter still exists for the baked
+        # auto-exposure and for area layers — it just has no slider to zip to.
+        "temperature", "tint", "brightness", "gamma", "highlights",
         "white_point", "shadows", "black_point", "contrast", "saturation",
         "sub_saturation",
         # Per-channel levels controls (collapsible section)
@@ -390,7 +396,7 @@ class SlidersPanel(QWidget):
         layout.addWidget(scroll_area, 1)  # stretch=1: fills remaining height
 
         self.slider_labels = [
-            "Temperature", "Tint", "Gain", "Brightness", "Gamma",
+            "Temperature", "Tint", "Brightness", "Gamma",
             "Highlights", "White Point", "Shadows", "Black Point", "Contrast", "Saturation",
             "Subtracted Sat"
         ]
@@ -533,6 +539,23 @@ class SlidersPanel(QWidget):
         convert_row.addWidget(self.convert_all_bwp_btn)
         scroll_layout.addLayout(convert_row)
 
+        # Channel Levels sits directly under the Convert row and above the
+        # WB/AWB row: it is the FIRST stage of the adjustment pipeline (it runs
+        # un-clamped, ahead of White Balance and the look domain), so it reads
+        # top-to-bottom in pipeline order. See spec/channel-levels-pre-clamp.md.
+        # Created here but POPULATED further below, in the strict create_slider()
+        # order that the positional ADJUSTMENT_KEYS zip requires.
+        scroll_layout.addWidget(theme.section_separator())
+        self.od_section = CollapsibleSection("Channel Levels")
+        scroll_layout.addWidget(self.od_section)
+        # Master Gain sits OUTSIDE the collapsible, directly below it, so it is
+        # always visible: it is the app's one gain control (the general-
+        # adjustments "Gain" slider was the same math and is gone) and the stage
+        # Auto Gain rides. Its row is created later, with the rest of the Channel
+        # Levels sliders, to keep the positional ADJUSTMENT_KEYS zip intact — so
+        # reserve its slot here and insert into it below.
+        _master_gain_slot = scroll_layout.count()
+
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
 
@@ -585,7 +608,11 @@ class SlidersPanel(QWidget):
             "Temperature", gradient=theme.TEMP_GRADIENT)
         self.tint_slider_layout = self.create_slider(
             "Tint", gradient=theme.TINT_GRADIENT)
-        self.exposure_slider_layout = self.create_slider("Gain", min_value=-200, max_value=200)
+        # (The general-adjustments "Gain" slider used to be created here. It was
+        # the same math as Channel Levels' Master Gain at a different scale, so it
+        # was removed — Master Gain is the one gain control, and it is also what
+        # Auto Gain rides. The "exposure" pipeline parameter still exists for the
+        # baked auto-exposure and for area layers; it just has no slider.)
         self.brightness_slider_layout = self.create_slider("Brightness")
         # Gamma: a center control point on the composite tone curve that moves
         # diagonally from center (brighten up-left / darken down-right), rendered
@@ -604,7 +631,6 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(self.color_profile_row)
         scroll_layout.addLayout(self.temperature_slider_layout)
         scroll_layout.addLayout(self.tint_slider_layout)
-        scroll_layout.addLayout(self.exposure_slider_layout)
         scroll_layout.addLayout(self.brightness_slider_layout)
         scroll_layout.addLayout(self.gamma_slider_layout)
         scroll_layout.addLayout(self.highlights_slider_layout)
@@ -634,13 +660,14 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(sync_layout)
 
         # --- Collapsible sections ---
-        # Display order (top→bottom): Curves, Subtractive Saturations, Channel
-        # Levels (last). The section WIDGETS are placed here in display order,
-        # but their SLIDERS are created further below in the strict order that
-        # ADJUSTMENT_KEYS requires (Channel Levels before bands). Placement and
-        # population are decoupled because each CollapsibleSection holds its own
-        # content layout, so create_slider() append order is independent of where
-        # the section sits in scroll_layout.
+        # Display order (top→bottom): Channel Levels (placed far above, right
+        # under the Convert row — it is the first pipeline stage), then Curves
+        # and Subtractive Saturations here. The section WIDGETS are placed in
+        # display order, but their SLIDERS are created further below in the
+        # strict order that ADJUSTMENT_KEYS requires (Channel Levels before
+        # bands). Placement and population are decoupled because each
+        # CollapsibleSection holds its own content layout, so create_slider()
+        # append order is independent of where the section sits in scroll_layout.
         def _section_separator():
             return theme.section_separator()
 
@@ -652,11 +679,8 @@ class SlidersPanel(QWidget):
         self.band_section = CollapsibleSection("Subtractive Saturations")
         scroll_layout.addWidget(self.band_section)
 
-        scroll_layout.addWidget(_section_separator())
-        self.od_section = CollapsibleSection("Channel Levels")
-        scroll_layout.addWidget(self.od_section)
-
-        # --- Populate Channel Levels (sliders[10]–[21]) ---
+        # --- Populate Channel Levels (the section widget itself is placed far
+        # above, just under the Convert row) ---
         # MUST be created before the band sliders to keep the ADJUSTMENT_KEYS
         # positional mapping (channel keys precede band keys), regardless of the
         # section's display position above.
@@ -667,7 +691,10 @@ class SlidersPanel(QWidget):
         self.od_section.add_widget(master_label)
         self.od_section.add_layout(self.create_slider("Input Gain"))
         self.od_section.add_layout(self.create_slider("Master Shift"))
-        self.od_section.add_layout(self.create_slider("Master Gain"))
+        # Created HERE (third, so the ADJUSTMENT_KEYS zip is unchanged) but placed
+        # OUTSIDE the collapsible, in the slot reserved above — always visible.
+        self.master_gain_slider_layout = self.create_slider("Master Gain")
+        scroll_layout.insertLayout(_master_gain_slot, self.master_gain_slider_layout)
 
         # R channel group
         r_label = QLabel("R Channel")

@@ -106,6 +106,71 @@ def _initialize_opencl():
             float g = img[idx+1];
             float b = img[idx+2];
 
+            // Channel Levels — the FIRST adjustment stage, ahead of White
+            // Balance and the whole look domain. Three ordered sub-stages:
+            // Input Gain (uniform) -> per-channel Shift/Gain/Blackpoint ->
+            // Master Shift/Gain (uniform, its own stage — NOT summed into the
+            // per-channel values as it used to be).
+            //
+            // Only a NON-windowed base reaches the kernel with these non-zero:
+            // on a windowed base the numpy pre-stage runs them un-clamped before
+            // the window clamp and zeroes them here, so parity is automatic.
+            // Non-windowed paths carry no sub-black data, so this clamps to [0,1].
+            // Divisors mirror CH_SLIDER_DIV / CH_INPUT_GAIN_DIV / CH_MIN_RANGE,
+            // textually substituted at build time so they cannot drift.
+            if (ch_input_gain != 0.0f || ch_master_shift != 0.0f || ch_master_gain != 0.0f ||
+                ch_r_shift != 0.0f || ch_r_gain != 0.0f || ch_r_blackpoint != 0.0f ||
+                ch_g_shift != 0.0f || ch_g_gain != 0.0f || ch_g_blackpoint != 0.0f ||
+                ch_b_shift != 0.0f || ch_b_gain != 0.0f || ch_b_blackpoint != 0.0f) {
+
+                float ig = pow(2.0f, clamp(ch_input_gain, -100.0f, 100.0f) / CH_INPUT_GAIN_DIV);
+                float rs  = clamp(ch_r_shift,      -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float rg  = clamp(ch_r_gain,       -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float rbp = clamp(ch_r_blackpoint, -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float gs  = clamp(ch_g_shift,      -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float gg  = clamp(ch_g_gain,       -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float gbp = clamp(ch_g_blackpoint, -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float bs  = clamp(ch_b_shift,      -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float bg  = clamp(ch_b_gain,       -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float bbp = clamp(ch_b_blackpoint, -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float ms  = clamp(ch_master_shift, -100.0f, 100.0f) / CH_SLIDER_DIV;
+                float mg  = clamp(ch_master_gain,  -100.0f, 100.0f) / CH_SLIDER_DIV;
+
+                float xr = r / 65535.0f;
+                float xg = g / 65535.0f;
+                float xb = b / 65535.0f;
+
+                // 1. Input Gain (uniform, before the per-channel work)
+                if (ig != 1.0f) { xr *= ig; xg *= ig; xb *= ig; }
+
+                // 2. Per channel. Untouched channels are skipped entirely so the
+                //    round-trip can't drift them by 1 LSB.
+                if (rs != 0.0f || rg != 0.0f || rbp != 0.0f) {
+                    float den = fmax((1.0f - rg) - rbp, CH_MIN_RANGE);
+                    if (rs != rbp) { xr += (rs - rbp); }
+                    if (den != 1.0f) { xr /= den; }
+                }
+                if (gs != 0.0f || gg != 0.0f || gbp != 0.0f) {
+                    float den = fmax((1.0f - gg) - gbp, CH_MIN_RANGE);
+                    if (gs != gbp) { xg += (gs - gbp); }
+                    if (den != 1.0f) { xg /= den; }
+                }
+                if (bs != 0.0f || bg != 0.0f || bbp != 0.0f) {
+                    float den = fmax((1.0f - bg) - bbp, CH_MIN_RANGE);
+                    if (bs != bbp) { xb += (bs - bbp); }
+                    if (den != 1.0f) { xb /= den; }
+                }
+
+                // 3. Master shift / gain (uniform, after the per-channel work)
+                if (ms != 0.0f) { xr += ms; xg += ms; xb += ms; }
+                float mden = fmax(1.0f - mg, CH_MIN_RANGE);
+                if (mden != 1.0f) { xr /= mden; xg /= mden; xb /= mden; }
+
+                r = clamp(xr, 0.0f, 1.0f) * 65535.0f;
+                g = clamp(xg, 0.0f, 1.0f) * 65535.0f;
+                b = clamp(xb, 0.0f, 1.0f) * 65535.0f;
+            }
+
             // Temperature and Tint (Lightroom-like perceptual adjustments)
             if (kelvin_shift != 0.0f || tint_shift != 0.0f) {
                 // Calculate luminance for tone-aware masking
@@ -360,44 +425,8 @@ def _initialize_opencl():
                 b = sb * 65535.0f;
             }
 
-            // Per-channel levels controls (linear domain, post-conversion data).
-            // Blackpoint/Gain mirror the regular Black/White Point sliders
-            // (same /300 mapping) per channel; Shift is a uniform additive
-            // offset; Input Gain is a pre-everything exposure multiplier.
-            if (ch_input_gain != 0.0f || ch_master_shift != 0.0f || ch_master_gain != 0.0f ||
-                ch_r_shift != 0.0f || ch_r_gain != 0.0f || ch_r_blackpoint != 0.0f ||
-                ch_g_shift != 0.0f || ch_g_gain != 0.0f || ch_g_blackpoint != 0.0f ||
-                ch_b_shift != 0.0f || ch_b_gain != 0.0f || ch_b_blackpoint != 0.0f) {
-
-                float ig = pow(2.0f, ch_input_gain / 50.0f);
-                float rs  = clamp(ch_master_shift + ch_r_shift, -100.0f, 100.0f) / 300.0f;
-                float rg  = clamp(ch_master_gain + ch_r_gain, -100.0f, 100.0f) / 300.0f;
-                float rbp = clamp(ch_r_blackpoint, -100.0f, 100.0f) / 300.0f;
-                float gs  = clamp(ch_master_shift + ch_g_shift, -100.0f, 100.0f) / 300.0f;
-                float gg  = clamp(ch_master_gain + ch_g_gain, -100.0f, 100.0f) / 300.0f;
-                float gbp = clamp(ch_g_blackpoint, -100.0f, 100.0f) / 300.0f;
-                float bs  = clamp(ch_master_shift + ch_b_shift, -100.0f, 100.0f) / 300.0f;
-                float bg  = clamp(ch_master_gain + ch_b_gain, -100.0f, 100.0f) / 300.0f;
-                float bbp = clamp(ch_b_blackpoint, -100.0f, 100.0f) / 300.0f;
-
-                // Process each channel only when non-neutral, so the normalize
-                // round-trip can't drift untouched channels by 1 LSB.
-                if (ig != 1.0f || rs != 0.0f || rg != 0.0f || rbp != 0.0f) {
-                    float xr = (r / 65535.0f) * ig + rs;
-                    xr = (xr - rbp) / ((1.0f - rg) - rbp);
-                    r = clamp(xr, 0.0f, 1.0f) * 65535.0f;
-                }
-                if (ig != 1.0f || gs != 0.0f || gg != 0.0f || gbp != 0.0f) {
-                    float xg = (g / 65535.0f) * ig + gs;
-                    xg = (xg - gbp) / ((1.0f - gg) - gbp);
-                    g = clamp(xg, 0.0f, 1.0f) * 65535.0f;
-                }
-                if (ig != 1.0f || bs != 0.0f || bg != 0.0f || bbp != 0.0f) {
-                    float xb = (b / 65535.0f) * ig + bs;
-                    xb = (xb - bbp) / ((1.0f - bg) - bbp);
-                    b = clamp(xb, 0.0f, 1.0f) * 65535.0f;
-                }
-            }
+            // (Channel Levels used to run here. It is now the FIRST stage, at
+            // the top of this kernel — see spec/channel-levels-pre-clamp.md.)
 
             // Per-color-band "Subtractive Saturations". Parameter deltas
             // come from a 720-bin hue LUT computed on the CPU with the
@@ -497,6 +526,13 @@ def _initialize_opencl():
             img[idx+2] = b;
         }
         """
+
+        # Substitute the Channel Levels constants textually so the kernel and the
+        # numpy path cannot drift apart (spec/channel-levels-pre-clamp.md §3.3).
+        kernel_code = (kernel_code
+                       .replace("CH_INPUT_GAIN_DIV", f"{CH_INPUT_GAIN_DIV:.6f}f")
+                       .replace("CH_SLIDER_DIV", f"{CH_SLIDER_DIV:.6f}f")
+                       .replace("CH_MIN_RANGE", f"{CH_MIN_RANGE:.6f}f"))
 
         # Compile the program
         program = cl.Program(ctx, kernel_code).build()
@@ -1109,7 +1145,13 @@ def _ws_enabled() -> bool:
 # low in the container, leaving `_WS_LO` display units of shadow margin below
 # black and the remainder (~6 stops at 10-bit) as highlight headroom above white.
 _WS_BITS = int(os.environ.get("FREECCR_WS_BITS", "10"))
-_WS_LO = float(os.environ.get("FREECCR_WS_LO", "0.5"))
+# 1.0 display unit of shadow margin (~4 stops of sub-base density at
+# DEFAULT_DENSITY_SLOPE=0.8). Channel Levels' shift spans +-0.667, so the older
+# 0.5 margin was narrower than the control that reaches into it. Widening it is
+# nearly free: the window WIDTH is unchanged (1024 codes), so display precision
+# is identical and highlight headroom only drops 5.989 -> 5.977 stops.
+# See spec/channel-levels-pre-clamp.md §3.5.
+_WS_LO = float(os.environ.get("FREECCR_WS_LO", "1.0"))
 _WS_WIDTH = float(1 << _WS_BITS)                   # window width in codes (1024)
 WS_B = _WS_LO * _WS_WIDTH                           # code for display-black (d=0)
 WS_W = (1.0 + _WS_LO) * _WS_WIDTH                   # code for display-white (d=1)
@@ -1157,15 +1199,117 @@ def _white_balance_gains(kelvin_shift: float, tint_shift: float,
     return float(gr), float(gg), float(gb)
 
 
+# --- Channel Levels: the FIRST adjustment stage (spec/channel-levels-pre-clamp.md)
+# Slider -> parameter mappings. All three sliders share one divisor so the
+# controls stay predictable relative to each other.
+CH_SLIDER_DIV = 150.0       # shift/gain/blackpoint: slider +-100 -> +-0.667
+CH_INPUT_GAIN_DIV = 25.0    # input gain: slider +-100 -> 2^+-4 (+-4 stops)
+# Floor on the per-channel range (1-gain)-black. At CH_SLIDER_DIV=150 the pair
+# (gain=+100, blackpoint=+100) gives (1-0.667)-0.667 = -0.333, and a NEGATIVE
+# denominator inverts the channel. The old /300 scale bottomed out at +0.333, so
+# it never needed this guard.
+CH_MIN_RANGE = 0.1          # => at most a 10x per-channel gain
+
+
+def _apply_channel_levels(d: np.ndarray,
+                          ch_input_gain: float, ch_master_shift: float,
+                          ch_master_gain: float,
+                          ch_r_shift: float, ch_r_gain: float, ch_r_blackpoint: float,
+                          ch_g_shift: float, ch_g_gain: float, ch_g_blackpoint: float,
+                          ch_b_shift: float, ch_b_gain: float, ch_b_blackpoint: float,
+                          clamp: bool) -> np.ndarray:
+    """Channel Levels, applied to float DISPLAY values `d` (0 = display black,
+    1 = display white). Index 0=R, 1=G, 2=B. Modifies `d` in place.
+
+    Three ordered sub-stages:
+      1. Input Gain  — a uniform multiplier BEFORE the per-channel work.
+      2. Per channel — out = (in + shift - black) / max((1 - gain) - black, MIN).
+      3. Master      — a uniform shift + gain AFTER the per-channel work. Master
+                       is its own stage, NOT summed into the per-channel values.
+
+    `clamp` is the pipeline-position switch:
+      False (windowed base) — no clipping at all, so `d` stays un-clamped for the
+        White Balance / White Point / Gain stages and the single window clamp
+        that follows. This is what lets a shift TRANSLATE the histogram: content
+        below display-black rises into the window instead of being unreachable,
+        and content pushed out the bottom lands in the shadow margin rather than
+        being destroyed.
+      True (full-range base: reference mode, positive mode, area layers) — clip to
+        [0,1] on the way out, as before. There is no sub-black data on those paths
+        and the later pow() stages must not see negatives."""
+    ig = 2.0 ** (float(np.clip(ch_input_gain, -100.0, 100.0)) / CH_INPUT_GAIN_DIV)
+    shifts = (float(np.clip(ch_r_shift, -100.0, 100.0)) / CH_SLIDER_DIV,
+              float(np.clip(ch_g_shift, -100.0, 100.0)) / CH_SLIDER_DIV,
+              float(np.clip(ch_b_shift, -100.0, 100.0)) / CH_SLIDER_DIV)
+    gains = (float(np.clip(ch_r_gain, -100.0, 100.0)) / CH_SLIDER_DIV,
+             float(np.clip(ch_g_gain, -100.0, 100.0)) / CH_SLIDER_DIV,
+             float(np.clip(ch_b_gain, -100.0, 100.0)) / CH_SLIDER_DIV)
+    blacks = (float(np.clip(ch_r_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV,
+              float(np.clip(ch_g_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV,
+              float(np.clip(ch_b_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV)
+    ms = float(np.clip(ch_master_shift, -100.0, 100.0)) / CH_SLIDER_DIV
+    mg = float(np.clip(ch_master_gain, -100.0, 100.0)) / CH_SLIDER_DIV
+
+    # 1. Input Gain (uniform, before everything else)
+    if ig != 1.0:
+        d *= np.float32(ig)
+    # 2. Per-channel shift / gain / blackpoint. Untouched channels are skipped
+    #    entirely so the round-trip can't drift them by 1 LSB.
+    for c in range(3):
+        s, g, bp = shifts[c], gains[c], blacks[c]
+        if s == 0.0 and g == 0.0 and bp == 0.0:
+            continue
+        den = max((1.0 - g) - bp, CH_MIN_RANGE)
+        if s != bp:
+            d[..., c] += np.float32(s - bp)
+        if den != 1.0:
+            d[..., c] /= np.float32(den)
+    # 3. Master shift / gain (uniform, after the per-channel work)
+    if ms != 0.0:
+        d += np.float32(ms)
+    mden = max(1.0 - mg, CH_MIN_RANGE)
+    if mden != 1.0:
+        d /= np.float32(mden)
+
+    if clamp:
+        np.clip(d, 0.0, 1.0, out=d)
+    return d
+
+
+def _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
+                           ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                           ch_b_shift, ch_b_gain, ch_b_blackpoint) -> bool:
+    """True when any Channel Levels slider is off zero (the stage is a no-op
+    otherwise, and skipping it keeps a neutral render bit-exact)."""
+    return any(p != 0.0 for p in (
+        ch_input_gain, ch_master_shift, ch_master_gain,
+        ch_r_shift, ch_r_gain, ch_r_blackpoint,
+        ch_g_shift, ch_g_gain, ch_g_blackpoint,
+        ch_b_shift, ch_b_gain, ch_b_blackpoint))
+
+
 def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                                   white_point: float = 0.0,
                                   kelvin_shift: float = 0.0, tint_shift: float = 0.0,
-                                  tint_balance_factor: float = 1.0) -> np.ndarray:
+                                  tint_balance_factor: float = 1.0,
+                                  ch_input_gain: float = 0.0,
+                                  ch_master_shift: float = 0.0,
+                                  ch_master_gain: float = 0.0,
+                                  ch_r_shift: float = 0.0, ch_r_gain: float = 0.0,
+                                  ch_r_blackpoint: float = 0.0,
+                                  ch_g_shift: float = 0.0, ch_g_gain: float = 0.0,
+                                  ch_g_blackpoint: float = 0.0,
+                                  ch_b_shift: float = 0.0, ch_b_gain: float = 0.0,
+                                  ch_b_blackpoint: float = 0.0) -> np.ndarray:
     """De-window a windowed base, apply the highlight-recovery controls UN-clamped
     (so headroom can be pulled back below white), then clamp to the display window
     and return a normal full-range [0,65535] positive for the look chain. This
     single numpy pre-stage is shared by the CPU and GPU adjustment paths, so
     GPU/CPU parity is automatic — the kernel never sees headroom.
+
+    Channel Levels runs FIRST here (ahead of White Balance and the recovery
+    controls) and un-clamped — see spec/channel-levels-pre-clamp.md.
 
     Two recovery controls, both neutral at 0 (so a neutral edit is byte-identical):
       White Point — the WIDE-range recovery, stops-based across the FULL headroom:
@@ -1177,6 +1321,19 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     d = img16.astype(np.float32)
     d -= np.float32(WS_B)
     d *= np.float32(_WS_INV_WIDTH)
+    # Channel Levels - the FIRST adjustment stage, un-clamped so a shift moves the
+    # whole histogram: sub-black content (film base) rises into the window instead
+    # of being unreachable, and content pushed out the bottom lands in the shadow
+    # margin instead of clipping. See spec/channel-levels-pre-clamp.md.
+    if _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
+                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                              ch_b_shift, ch_b_gain, ch_b_blackpoint):
+        _apply_channel_levels(d, ch_input_gain, ch_master_shift, ch_master_gain,
+                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                              ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                              clamp=False)
     # White balance - flat per-channel gain in the scene-linear working domain
     # (before the window clamp) so a warm/cool shift lands in headroom (recoverable)
     # instead of clipping, and cooling can pull highlights back. Index 0=R,1=G,2=B.
@@ -1221,14 +1378,22 @@ def _default_slope_invert(img_f: np.ndarray, black_point_bgr,
         ch = np.maximum(img_f[..., c], _DENSITY_FLOOR)   # copy; avoids /0 & log(0)
         np.divide(base, ch, out=ch)                      # base / img
         np.log10(ch, out=ch)                             # optical density above base
-        np.maximum(ch, 0.0, out=ch)                      # clamp (img brighter than base)
         ch *= np.float32(slope)                          # slope = contrast (per channel)
         out[..., c] = ch
     if _ws_enabled():
-        # Keep highlight overshoot (density above the 1/SLOPE ceiling) as headroom.
+        # Keep highlight overshoot (density above the 1/SLOPE ceiling) as headroom
+        # AND sub-base density (img brighter than the black point — film base,
+        # rebate, clear film) as shadow margin. Flooring the latter at 0 used to
+        # make the film base numerically identical to a true image shadow, so a
+        # per-channel shift could not lift one without tinting the other.
+        # See spec/channel-levels-pre-clamp.md §3.4.
         if DEFAULT_DENSITY_GAMMA != 1.0:
-            np.power(out, np.float32(1.0 / DEFAULT_DENSITY_GAMMA), out=out)
+            # A display gamma is only defined on [0,1]; a fractional power of a
+            # negative is NaN. Leave the sub-black region linear (continuous at 0).
+            np.power(out, np.float32(1.0 / DEFAULT_DENSITY_GAMMA), out=out,
+                     where=(out > 0.0))
         return encode_window(out)
+    np.maximum(out, 0.0, out=out)                        # legacy: img brighter than base -> 0
     np.clip(out, 0.0, 1.0, out=out)
     if DEFAULT_DENSITY_GAMMA != 1.0:
         np.power(out, np.float32(1.0 / DEFAULT_DENSITY_GAMMA), out=out)
@@ -1291,21 +1456,26 @@ def compute_auto_exposure_gain(img_bgr: np.ndarray, ws_windowed: bool = False) -
 AG_PERCENTILE = 98.0       # top 2% highlight
 AG_TARGET = 0.95           # placed at 95% of the window (display white = 1.0)
 AG_HI = 1.0                # in-bound ceiling = sampled dense point / SLOPE ceiling
-AG_GMIN = 0.6              # Gain stage range: v=-200..+200 → g = 1/(1-v/300) = 0.6..3.0
+# Master Gain range: v=-100..+100 → g = 1/(1 - v/CH_SLIDER_DIV) = 0.6..3.0. The
+# slider spans EXACTLY this gain range, so no achievable gain is clipped away.
+AG_GMIN = 0.6
 AG_GMAX = 3.0
 AG_EPS = 1e-4
 
 
 def compute_auto_gain_offset(base_u16: np.ndarray, ws_windowed: bool = False) -> float:
-    """Return the invisible Gain-slider offset that places the AG_PERCENTILE
+    """Return the invisible MASTER GAIN offset that places the AG_PERCENTILE
     in-bound highlight luminance at AG_TARGET of the working-space window.
 
-    The offset rides the Gain/Exposure stage (g = 1/(1 - v/300)) and is ADDED to
-    the user's Gain value; with the slider at 0 the realized gain is exactly the
-    clamped g, so the measured highlight lands at AG_TARGET. Depends only on the
-    base pixels + window geometry (NOT on any slider), so it is constant across a
-    slider drag. Index 0=R, 1=G, 2=B. Returns 0.0 when there isn't enough in-bound
-    content (mostly headroom/holder). See spec/auto-gain.md."""
+    The offset rides Channel Levels' Master Gain (g = 1/(1 - v/CH_SLIDER_DIV))
+    and is ADDED to the user's Master Gain value; with that slider at 0 the
+    realized gain is exactly the clamped g, so the measured highlight lands at
+    AG_TARGET. Master Gain is the app's one gain control — the old general-
+    adjustments "Gain" slider was the same math at a different scale and is gone.
+
+    Depends only on the base pixels + window geometry (NOT on any slider), so it
+    is constant across a slider drag. Index 0=R, 1=G, 2=B. Returns 0.0 when there
+    isn't enough in-bound content (mostly headroom/holder). See spec/auto-gain.md."""
     d = base_u16.astype(np.float32)
     if ws_windowed:
         d -= np.float32(WS_B)
@@ -1321,8 +1491,11 @@ def compute_auto_gain_offset(base_u16: np.ndarray, ws_windowed: bool = False) ->
     if p <= AG_EPS:
         return 0.0
     g = float(np.clip(AG_TARGET / p, AG_GMIN, AG_GMAX))
-    v = 300.0 * (1.0 - 1.0 / g)                # inverse of g = 1/(1 - v/300)
-    return float(np.clip(v, -200.0, 200.0))
+    # Inverse of the Master Gain curve g = 1/(1 - v/CH_SLIDER_DIV). AG_GMIN/GMAX
+    # are exactly the slider's endpoints, so this never needs clipping — the
+    # clamp is belt-and-braces against a future retune of either constant.
+    v = CH_SLIDER_DIV * (1.0 - 1.0 / g)
+    return float(np.clip(v, -100.0, 100.0))
 
 
 def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
@@ -2483,12 +2656,39 @@ def adjust_image(
     """
     if ws_windowed:
         img16 = _apply_working_space_recovery(img16, exposure, whitepoint,
-                                              kelvin_shift, tint_shift, tint_balance_factor)
+                                              kelvin_shift, tint_shift, tint_balance_factor,
+                                              ch_input_gain, ch_master_shift, ch_master_gain,
+                                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                              ch_b_shift, ch_b_gain, ch_b_blackpoint)
         exposure = 0.0       # consumed by the recovery pre-stage
         whitepoint = 0.0     # White Point is the headroom-recovery control here
         kelvin_shift = 0.0   # White Balance consumed (flat per-channel gain, pre-clamp)
         tint_shift = 0.0
+        # Channel Levels consumed too — it ran FIRST, un-clamped, inside the
+        # recovery (spec/channel-levels-pre-clamp.md). Zero it so the block
+        # below can't apply it a second time.
+        ch_input_gain = ch_master_shift = ch_master_gain = 0.0
+        ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
+        ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
+        ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
     img = img16.astype(np.float32)
+
+    # Channel Levels - the FIRST adjustment stage, ahead of White Balance and the
+    # whole look domain. Only reached on a NON-windowed base (reference mode,
+    # positive mode, area layers); a windowed base consumed it above, un-clamped.
+    # Those paths carry no sub-black data, so this runs clamped, as before.
+    if _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
+                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                              ch_b_shift, ch_b_gain, ch_b_blackpoint):
+        img /= np.float32(65535.0)
+        _apply_channel_levels(img, ch_input_gain, ch_master_shift, ch_master_gain,
+                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                              ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                              clamp=True)
+        img *= np.float32(65535.0)
 
     # White balance - flat per-channel gain (spec/working-space-white-balance.md).
     # ws_windowed consumed it above (pre-clamp, headroom-safe); this covers the
@@ -2606,50 +2806,8 @@ def adjust_image(
                             img_norm)
         img = img_norm * 65535.0
 
-    # Per-channel levels controls (linear domain, post-conversion data).
-    # Runs only when at least one slider is non-zero; otherwise a no-op.
-    #
-    # Blackpoint and Gain are per-channel versions of the regular Black Point
-    # and White Point sliders (same /300 mapping); Shift is a uniform additive
-    # offset that translates the channel's histogram; Input Gain is an
-    # exposure-style multiplier applied before everything else.
-    #     out = ((in * input_gain + shift) - black_val) / (white_val - black_val)
-    # where black_val anchors white and remaps the dark end (regular Black
-    # Point behaviour) and white_val = 1 - gain anchors black and moves the
-    # bright end (regular White Point behaviour).
-    _ch_active = (ch_input_gain, ch_master_shift, ch_master_gain,
-                  ch_r_shift, ch_r_gain, ch_r_blackpoint,
-                  ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                  ch_b_shift, ch_b_gain, ch_b_blackpoint)
-    if any(p != 0.0 for p in _ch_active):
-        ig = 2.0 ** (ch_input_gain / 50.0)      # slider ±100 → ×0.25…×4 (±2 stops)
-        # Master + channel combined, clamped to slider range, then /300 like
-        # the regular Black/White Point sliders.
-        shifts = (np.clip(ch_master_shift + ch_r_shift, -100, 100) / 300.0,
-                  np.clip(ch_master_shift + ch_g_shift, -100, 100) / 300.0,
-                  np.clip(ch_master_shift + ch_b_shift, -100, 100) / 300.0)
-        gains  = (np.clip(ch_master_gain + ch_r_gain, -100, 100) / 300.0,
-                  np.clip(ch_master_gain + ch_g_gain, -100, 100) / 300.0,
-                  np.clip(ch_master_gain + ch_b_gain, -100, 100) / 300.0)
-        blacks = (np.clip(ch_r_blackpoint, -100, 100) / 300.0,
-                  np.clip(ch_g_blackpoint, -100, 100) / 300.0,
-                  np.clip(ch_b_blackpoint, -100, 100) / 300.0)
-
-        for c in range(3):
-            # Skip neutral channels so the normalize round-trip can't introduce
-            # ±1 LSB quantization drift on channels the user didn't touch.
-            if ig == 1.0 and shifts[c] == 0.0 and gains[c] == 0.0 and blacks[c] == 0.0:
-                continue
-            ch = img[..., c] / 65535.0
-            if ig != 1.0:
-                ch = ch * ig
-            if shifts[c] != 0.0:
-                ch = ch + shifts[c]
-            black_val = blacks[c]
-            white_val = 1.0 - gains[c]
-            if black_val != 0.0 or white_val != 1.0:
-                ch = (ch - black_val) / (white_val - black_val)
-            img[..., c] = np.clip(ch, 0.0, 1.0) * 65535.0
+    # (Channel Levels used to run here, post-clamp. It is now the FIRST stage —
+    # see the top of this function and spec/channel-levels-pre-clamp.md.)
 
     if band_settings:
         # Run the band step in float, pre-quantization — the same staging
@@ -2936,12 +3094,24 @@ def adjust_image_opencl(
     # never sees headroom.
     if ws_windowed:
         img16 = _apply_working_space_recovery(img16, exposure, whitepoint,
-                                              kelvin_shift, tint_shift, tint_balance_factor)
+                                              kelvin_shift, tint_shift, tint_balance_factor,
+                                              ch_input_gain, ch_master_shift, ch_master_gain,
+                                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                              ch_b_shift, ch_b_gain, ch_b_blackpoint)
         exposure = 0.0
         whitepoint = 0.0
         ws_windowed = False
         kelvin_shift = 0.0
         tint_shift = 0.0
+        # Channel Levels ran FIRST, un-clamped, inside the pre-stage — zero it so
+        # the kernel (and the CPU fallback below) can't re-apply it. This is what
+        # makes GPU/CPU parity free on the windowed path: the kernel never sees
+        # headroom OR Channel Levels. See spec/channel-levels-pre-clamp.md.
+        ch_input_gain = ch_master_shift = ch_master_gain = 0.0
+        ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
+        ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
+        ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
 
     # White balance - flat per-channel gain done in numpy so the kernel (and the
     # CPU fallback) never apply WB -> automatic CPU/GPU parity. ws consumed above.

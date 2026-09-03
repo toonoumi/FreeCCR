@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests for Auto Gain (spec/auto-gain.md).
 
-Auto Gain is a hidden, live offset on the Gain stage that places the top-2%
+Auto Gain is a hidden, live offset on Channel Levels' MASTER GAIN that places the
+top-2%
 *in-bound* highlight at 95% of the working-space window without moving the Gain
 slider. "In-bound" = a de-windowed display value in [0, 1] (between the sampled
 clear→0 and dense→1 conversion points); over-range/specular (>1) and sub-black
@@ -21,6 +22,7 @@ from core.ccr_processor import (  # noqa: E402
     encode_window,
     adjust_image,
     AG_PERCENTILE, AG_TARGET, AG_HI, AG_GMIN, AG_GMAX,
+    CH_SLIDER_DIV,
 )
 
 
@@ -31,8 +33,13 @@ def _ws_base(d):
 
 
 def _realized_gain(v):
-    """The Gain stage maps slider value v → g = 1/(1 - v/300)."""
-    return 1.0 / (1.0 - np.clip(v, -200.0, 200.0) / 300.0)
+    """Master Gain maps slider value v → g = 1/(1 - v/CH_SLIDER_DIV)."""
+    return 1.0 / (1.0 - np.clip(v, -100.0, 100.0) / CH_SLIDER_DIV)
+
+
+def _render(base, v):
+    """Render a windowed base with the auto-gain offset on its real stage."""
+    return adjust_image(base, ch_master_gain=v, ws_windowed=True)
 
 
 # --- the offset mapping ---------------------------------------------------
@@ -59,10 +66,11 @@ def test_already_at_target_is_noop():
 
 
 def test_dark_frame_clamps_at_max_gain():
-    """A very dark base wants >3× gain; the stage caps at g=3.0 → v=+200."""
+    """A very dark base wants >3× gain; the stage caps at g=3.0 → v=+100 (the
+    Master Gain slider's endpoint IS g=3.0, so the cap and the slider agree)."""
     base = _ws_base(np.full((32, 32, 3), 0.1))
     v = compute_auto_gain_offset(base, ws_windowed=True)
-    assert v == pytest.approx(200.0, abs=1e-6)
+    assert v == pytest.approx(100.0, abs=1e-6)
     assert _realized_gain(v) == pytest.approx(AG_GMAX, abs=1e-6)
 
 
@@ -100,7 +108,7 @@ def test_insufficient_inbound_content_returns_zero():
 # --- round-trip through adjust_image (the real consumer) ------------------
 
 def test_roundtrip_places_highlight_at_target():
-    """Feeding the computed offset as the Gain value through adjust_image puts
+    """Feeding the computed offset as the Master Gain value through adjust_image puts
     the 98th percentile of the output at ≈ AG_TARGET·65535. Pixels are
     near-neutral (shared gray + small channel jitter): with fully independent
     random channels the saturated top-2% pixels get single channels clipped at
@@ -112,7 +120,7 @@ def test_roundtrip_places_highlight_at_target():
                 ).astype(np.float32)
     base = _ws_base(d)
     v = compute_auto_gain_offset(base, ws_windowed=True)
-    out = adjust_image(base, exposure=v, ws_windowed=True).astype(np.float32)
+    out = _render(base, v).astype(np.float32)
     lum = 0.299 * out[..., 0] + 0.587 * out[..., 1] + 0.114 * out[..., 2]
     assert np.percentile(lum, AG_PERCENTILE) == pytest.approx(AG_TARGET * 65535.0,
                                                               rel=0.02)
@@ -126,8 +134,8 @@ def test_at_target_is_near_noop_render():
     base = _ws_base(np.full((16, 16, 3), AG_TARGET))
     v = compute_auto_gain_offset(base, ws_windowed=True)
     assert abs(v) < 1.5                                  # quantization noise only
-    ref = adjust_image(base, exposure=0.0, ws_windowed=True).astype(np.int32)
-    got = adjust_image(base, exposure=v, ws_windowed=True).astype(np.int32)
+    ref = _render(base, 0.0).astype(np.int32)
+    got = _render(base, v).astype(np.int32)
     assert np.abs(ref - got).max() <= 128               # < 0.2% of 65535
 
 
@@ -139,6 +147,82 @@ def test_nonws_full_range_base():
     img = np.full((32, 32, 3), int(0.5 * 65535), dtype=np.uint16)
     v = compute_auto_gain_offset(img, ws_windowed=False)
     assert 0.5 * _realized_gain(v) == pytest.approx(AG_TARGET, abs=2e-3)
+
+
+# --- wiring: Auto Gain rides MASTER GAIN, not the (slider-less) Gain stage ---
+#
+# apply_adjustments is exercised against a STUB self rather than a converted
+# CCRImage: the real conversion path pulls in the backend + OpenCL and destabilizes
+# this module. The stub carries exactly the attributes the method reads, so the
+# thing under test is the routing itself.
+
+class _StubImage:
+    """Minimal stand-in for a converted CCRImage with a windowed base."""
+    def __init__(self, settings):
+        self._ws_windowed = True
+        self.converted = True
+        self.adjustment_settings = settings
+        self.contrast_base = 0
+        self.temperature_base = 0
+        self.brightness_base = 0
+        self.exposure_base = 0.0
+        self.color_profile = "color"
+        self.area_layers = []
+        self.tint_balance_factor = 1.0
+
+    def _apply_dust_removal(self, image, ws_windowed=False):
+        return image
+
+    def _to_grayscale(self, image):
+        return image
+
+
+def _capture_adjust_args(monkeypatch, base, settings, auto_gain):
+    """Run apply_adjustments and return the args it passed to adjust_image_opencl."""
+    from core.ccr_backend import ccr_backend
+    from core.ccr_image import CCRImage
+    import core.ccr_image as ccr_image_mod
+
+    seen = {}
+
+    def _capture(image, *args, **kw):
+        seen["exposure"] = args[2]          # positional: temperature, tint, exposure
+        seen["ch_master_gain"] = kw.get("ch_master_gain")
+        return image
+
+    monkeypatch.setattr(ccr_image_mod, "adjust_image_opencl", _capture)
+    monkeypatch.setattr(ccr_backend, "auto_gain", auto_gain, raising=False)
+    CCRImage.apply_adjustments(_StubImage(settings), base)
+    return seen
+
+
+def test_auto_gain_is_wired_to_master_gain(monkeypatch):
+    """The offset must be ADDED to ch_master_gain and must NOT ride the old
+    (now slider-less) exposure stage."""
+    base = _ws_base(np.full((32, 32, 3), 0.35))
+    seen = _capture_adjust_args(monkeypatch, base, {"ch_master_gain": 12},
+                                auto_gain=True)
+    ag = compute_auto_gain_offset(base, True)
+    assert ag != 0.0, "this frame should produce a non-zero auto gain"
+    assert seen["ch_master_gain"] == pytest.approx(12 + ag)
+    assert seen["exposure"] == pytest.approx(0.0)
+
+
+def test_auto_gain_off_leaves_master_gain_untouched(monkeypatch):
+    base = _ws_base(np.full((32, 32, 3), 0.35))
+    seen = _capture_adjust_args(monkeypatch, base, {"ch_master_gain": 7},
+                                auto_gain=False)
+    assert seen["ch_master_gain"] == pytest.approx(7)
+    assert seen["exposure"] == pytest.approx(0.0)
+
+
+def test_auto_gain_offset_is_in_master_gain_units(monkeypatch):
+    """The routed offset, read back through the Master Gain curve, must place
+    the measured highlight at AG_TARGET."""
+    base = _ws_base(np.full((32, 32, 3), 0.35))
+    seen = _capture_adjust_args(monkeypatch, base, {}, auto_gain=True)
+    assert 0.35 * _realized_gain(seen["ch_master_gain"]) == pytest.approx(
+        AG_TARGET, abs=2e-3)
 
 
 if __name__ == "__main__":

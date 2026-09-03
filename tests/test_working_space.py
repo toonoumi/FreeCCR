@@ -48,9 +48,11 @@ def ws_on(monkeypatch):
 # --- window geometry / encode-decode -------------------------------------
 
 def test_window_constants_are_10bit_default():
-    # default 10-bit window, WS_LO=0.5 → B=512, W=1536, width=1024
-    assert WS_B == 512.0
-    assert WS_W == 1536.0
+    # default 10-bit window, WS_LO=1.0 → B=1024, W=2048, width=1024.
+    # WS_LO widened 0.5 → 1.0 for Channel Levels' shadow margin; the window
+    # WIDTH (display precision) is unchanged. See spec/channel-levels-pre-clamp.md.
+    assert WS_B == 1024.0
+    assert WS_W == 2048.0
     assert WS_W - WS_B == 1024.0
 
 
