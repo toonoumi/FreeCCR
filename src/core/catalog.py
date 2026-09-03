@@ -116,8 +116,11 @@ def _ci_to_json(ci):
     if out.get("ref") is not None:
         out["ref"] = list(out["ref"])
     if out.get("bw") is not None:
+        # Either anchor may be None: no white point = default-slope mode, and
+        # NO black point = the no-anchor direct invert (spec/no-anchor-convert.md).
         black, white = out["bw"]
-        out["bw"] = [list(black), (list(white) if white is not None else None)]
+        out["bw"] = [(list(black) if black is not None else None),
+                     (list(white) if white is not None else None)]
     for key in ("p_lo", "p_hi", "od", "slopes"):
         if out.get(key) is not None:
             out[key] = list(out[key])
@@ -132,7 +135,8 @@ def _ci_from_json(ci):
         out["ref"] = tuple(out["ref"])
     if out.get("bw") is not None:
         black, white = out["bw"]
-        out["bw"] = (tuple(black), (tuple(white) if white is not None else None))
+        out["bw"] = ((tuple(black) if black is not None else None),
+                     (tuple(white) if white is not None else None))
     for key in ("p_lo", "p_hi", "od", "slopes"):
         if out.get(key) is not None:
             out[key] = tuple(out[key])

@@ -1691,8 +1691,9 @@ class SlidersPanel(QWidget):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
         self.set_temporary_hint(
-            "B/W points cleared. Set a <b>Black Point</b> (film base) "
-            "before converting.", duration=6000)
+            "B/W points cleared. Set a <b>Black Point</b> (film base) to anchor "
+            "the conversion, or convert as-is for the fixed density invert.",
+            duration=6000)
 
     def _update_bwp_mode_label(self):
         """Reflect which slope source the next B/W-point conversion will use,
@@ -1703,7 +1704,11 @@ class SlidersPanel(QWidget):
         wp_set = ccr_backend.white_point_bgr is not None
         stock = ccr_backend.film_stock_name
         if not bp_set:
-            text = ""
+            # No anchor sampled: converting is still allowed, and runs the
+            # fixed-constant density inversion (spec/no-anchor-convert.md). Say so
+            # rather than showing nothing, so the panel always states what
+            # Convert will do.
+            text = "Anchor source: none — density invert (fixed constants)"
         elif wp_set:
             text = "Anchor source: white point (two-point)"
         elif stock:
@@ -1714,8 +1719,9 @@ class SlidersPanel(QWidget):
         else:
             text = "Anchor source: default slope (black point only)"
         self.bwp_mode_label.setText(text)
-        # Hide when empty so it reserves no vertical space — keeps the Set-point
-        # row and the Convert row tight together (no gap) until a point is set.
+        # Always has something to say now that the no-anchor state is named, so
+        # it is always visible. (The setVisible stays: it is the one guard if a
+        # future state maps to an empty string.)
         self.bwp_mode_label.setVisible(bool(text))
         # Film-stock controls: a sampled white point overrides any preset (the
         # two-point math uses the pair), so selector + delete are disabled then.
@@ -1870,11 +1876,37 @@ class SlidersPanel(QWidget):
             self.set_temporary_hint(
                 "White Point sampled! Now set the <b>Black Point</b> (film base).", duration=5000)
 
+    def _confirm_no_anchor_convert(self) -> bool:
+        """True when the conversion may proceed. With no black point sampled the
+        conversion is a plain per-channel flip with nothing normalised, so ask
+        first — unless the user switched the warning off in Settings.
+        See spec/no-anchor-convert.md."""
+        if ccr_backend.black_point_bgr is not None:
+            return True
+        if not getattr(ccr_backend, "warn_no_anchor_convert", True):
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Convert without a black point?")
+        box.setText("<b>No film base has been sampled.</b>")
+        box.setInformativeText(
+            "The conversion will use fixed density constants instead of "
+            "measuring your film base, so the frame keeps its own cast and "
+            "placement. Grade it with <b>Channel Levels</b> (Master Gain, and the "
+            "per-channel Shift / Gain / Blackpoint), and enable <b>Cineon Log "
+            "→ Rec.709</b> for the intended display transform.<br><br>"
+            "Set a <b>Black Point</b> first for a conversion anchored to your "
+            "own film base.<br><br>"
+            "<i>This warning can be turned off in Settings → General.</i>")
+        proceed = box.addButton("Convert Anyway", QMessageBox.AcceptRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        # Cancel is the default so a stray Return can't convert a roll unanchored.
+        box.setDefaultButton(cancel)
+        box.exec_()
+        return box.clickedButton() is proceed
+
     def _on_convert_current_bwpoint(self):
-        if ccr_backend.black_point_bgr is None:
-            QMessageBox.warning(self, "Black Point Missing",
-                "Please set a Black Point (film base) before converting. A White "
-                "Point is optional — without it the calibrated default slope is used.")
+        if not self._confirm_no_anchor_convert():
             return
         if self.current_idx is None:
             return
@@ -1885,12 +1917,15 @@ class SlidersPanel(QWidget):
             if img.converted:
                 img.reload_image()
             from core.ccr_processor import ccr_normalize_with_bwpoint
+            black = ccr_backend.black_point_bgr  # may be None → direct invert
             white = ccr_backend.white_point_bgr  # may be None → default slope
-            # Film-stock slopes apply only in black-point-only mode — a
-            # sampled white point wins (spec/film-stock-slopes.md).
-            slopes = ccr_backend.film_stock_slopes if white is None else None
+            # Film-stock slopes apply only in black-point-only mode — a sampled
+            # white point wins, and with no black point there is nothing for a
+            # slope to act on (spec/film-stock-slopes.md).
+            slopes = (ccr_backend.film_stock_slopes
+                      if (white is None and black is not None) else None)
             processed = ccr_normalize_with_bwpoint(
-                img, ccr_backend.black_point_bgr, white,
+                img, black, white,
                 density=ccr_backend.density_bwpoint,
                 slopes_bgr=slopes
             )
@@ -1899,7 +1934,11 @@ class SlidersPanel(QWidget):
             img.converted = True
             img.conversion_inputs = {
                 "mode": "bw",
-                "bw": (tuple(ccr_backend.black_point_bgr),
+                # Either anchor may be None (no white point = default slope; no
+                # black point either = the no-anchor direct invert). Every replay
+                # site passes this pair straight back to the converter, so this
+                # needs no new mode. See spec/no-anchor-convert.md §4.
+                "bw": (tuple(black) if black is not None else None,
                        tuple(white) if white is not None else None),
                 "fine_rot": img.fine_rotation_angle,
                 "density": bool(ccr_backend.density_bwpoint),
@@ -1917,10 +1956,7 @@ class SlidersPanel(QWidget):
             QMessageBox.critical(self, "Conversion Error", str(e))
 
     def _on_convert_all_bwpoint(self):
-        if ccr_backend.black_point_bgr is None:
-            QMessageBox.warning(self, "Black Point Missing",
-                "Please set a Black Point (film base) before converting. A White "
-                "Point is optional — without it the calibrated default slope is used.")
+        if not self._confirm_no_anchor_convert():
             return
         n = len(ccr_backend.images)
         if n == 0:

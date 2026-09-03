@@ -1356,6 +1356,53 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     return d.astype(np.uint16)
 
 
+# --- No-anchor inversion: fixed-constant density inversion -------------------
+# The unanchored conversion inverts in DENSITY (log) space using fixed constants
+# rather than anything measured off the frame:
+#     d = -log10(INPUT_SCALE * p) + BASE_OFFSET
+# INPUT_SCALE sets which transmission counts as zero density; BASE_OFFSET places
+# that zero in the display window. Together they put a film base sitting near
+# half scale at roughly Cineon black (93/1023), which is what makes an
+# unanchored conversion usable without sampling anything.
+UNANCHORED_INPUT_SCALE = 16.0    # transmission scale: 16*p == 1 is density zero
+UNANCHORED_BASE_OFFSET = 1.0     # display offset applied after the density
+
+
+def _unanchored_density_invert(img_f: np.ndarray) -> np.ndarray:
+    """No-anchor inversion in DENSITY (log) space:
+    `d = -log10(16 * p) + 1.0`, with `p = v/65535` the LINEAR scene value.
+
+    Used when NEITHER a black point nor a white point was sampled. Nothing is
+    measured off the frame, so its own cast and placement survive; the user
+    grades them with Channel Levels, which on this base is operating in the same
+    density space the black-point-only conversion produces.
+
+    The negative decode is linear Adobe RGB (`gamma=(1,1)`,
+    `output_color=Adobe`, ccr_image.py:538-551), so no linearisation is needed
+    here — the log is taken on genuinely linear data.
+
+    Being logarithmic is the point: a Channel Levels *shift* on this base is a
+    density offset, i.e. a clean per-channel MULTIPLY in linear light — a
+    tone-independent colour balance move. A linear inversion would make the same
+    slider an additive lift that drags the black end around instead.
+
+    Output leaves [0,1] at both ends, by design: clear film (brighter than the
+    assumed base) goes NEGATIVE into the shadow margin, dense areas well above
+    white into the highlight headroom. Both are recoverable through Channel
+    Levels, which runs un-clamped ahead of the window clamp.
+    See spec/no-anchor-convert.md."""
+    d = np.maximum(img_f, _DENSITY_FLOOR)                        # copy; avoids log10(0)
+    d *= np.float32(UNANCHORED_INPUT_SCALE / 65535.0)            # scale * p
+    np.log10(d, out=d)
+    np.negative(d, out=d)                                        # density above zero
+    d += np.float32(UNANCHORED_BASE_OFFSET)
+    if _ws_enabled():
+        return encode_window(d)
+    np.clip(d, 0.0, 1.0, out=d)
+    d *= np.float32(65535.0)
+    return d.astype(np.uint16)
+
+
 def _default_slope_invert(img_f: np.ndarray, black_point_bgr,
                           slopes_bgr=None) -> np.ndarray:
     """Density-space inversion for the black-point-only mode. `img_f` is a
@@ -1577,7 +1624,7 @@ def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,
     return (65535.0 - norm).clip(0, 65535).astype(np.uint16)
 
 
-def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
+def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr=None, white_point_bgr=None,
                                output_path=None, jpg_out=False,
                                jpg_quality=95, max_long_side=None,
                                output_colorspace="srgb", density=False,
@@ -1588,6 +1635,10 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
 
     black_point_bgr: (B,G,R) scan values of transparent/clear film area (HIGH values).
                      Transparent areas → output black (0) after inversion.
+                     If None (and white_point_bgr is None too) NO anchor was
+                     sampled: the conversion is a plain per-channel flip and the
+                     user grades it with Channel Levels. See
+                     spec/no-anchor-convert.md.
     white_point_bgr: (B,G,R) scan values of dense/exposed film area (LOW values).
                      Dense areas → output white (65535) after inversion.
                      If None, the default-slope mode is used: a density-space
@@ -1637,7 +1688,13 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr, white_point_bgr=None,
     # With no_auto_bright=True in rawpy, film base and dense-area values are identical in every
     # frame. The sampled B/W points are applied directly as fixed per-channel anchors.
     img_f = img.astype(np.float32)
-    if white_point_bgr is None:
+    if black_point_bgr is None:
+        # --- No-anchor mode: fixed-constant density inversion, nothing measured ---
+        rgb_inverted = _unanchored_density_invert(img_f)
+        del img_f
+        print(f"BWPN (no anchor, density invert): "
+              f"{time.time() - total_start_time:.3f}s")
+    elif white_point_bgr is None:
         # --- Default-slope mode (black point only): density-space inversion ---
         rgb_inverted = _default_slope_invert(img_f, black_point_bgr, slopes_bgr)
         del img_f
@@ -2138,6 +2195,11 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
     are global constants, so no rescaling is needed). Used for the zoom hi-res
     replay and slice/reset, so it MUST match the entry pipeline exactly.
 
+    When black_point_bgr is ALSO None, no anchor was sampled at all and the
+    conversion is a fixed-constant density inversion (see
+    _unanchored_density_invert); Channel Levels does the grading, in the same
+    density space that produces. See spec/no-anchor-convert.md.
+
     When white_point_bgr is None, the default-slope mode is used: a density-space
     inversion applied to the black point alone (see _default_slope_invert), with
     `slopes_bgr` (a film-stock preset's per-channel density slopes, snapshotted
@@ -2151,6 +2213,10 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
     The post-invert "look" stays DISABLED so the hi-res replay matches the
     look-less preview/export path."""
     img_f = img.astype(np.float32)
+    if black_point_bgr is None:
+        # No anchors at all: fixed-constant density inversion
+        # (spec/no-anchor-convert.md).
+        return _unanchored_density_invert(img_f)
     if white_point_bgr is None:
         # Default-slope mode (black point only): density-space inversion.
         return _default_slope_invert(img_f, black_point_bgr, slopes_bgr)

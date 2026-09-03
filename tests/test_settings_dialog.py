@@ -289,9 +289,20 @@ class _StubMW(QWidget):
         ccr_backend.gamma_luminance = bool(c)
 
 
+# The dialogs are built with a non-QWidget stub "main window", so they have no
+# Qt parent and are owned by Python alone. Letting them be garbage-collected
+# mid-run corrupts the heap during pytest's teardown gc_collect_harder() once
+# the General page grows past a certain widget count (Windows fatal exception
+# 0xc0000374, after every test has already passed). Keeping them alive until the
+# process exits sidesteps the collection entirely.
+_LIVE_DIALOGS = []
+
+
 def _dialog():
     from widgets.settings_dialog import SettingsDialog
-    return SettingsDialog(_StubMW())
+    d = SettingsDialog(_StubMW())
+    _LIVE_DIALOGS.append(d)
+    return d
 
 
 class TestSettingsDialog:

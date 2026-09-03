@@ -63,7 +63,10 @@ def test_default_only_combo_and_gating(panel):
     assert panel.film_stock_combo.isEnabled()          # selectable pre-sampling
     assert not panel.save_film_stock_btn.isEnabled()   # needs BOTH points
     assert not panel.delete_film_stock_btn.isEnabled() # Default not deletable
-    assert panel.bwp_mode_label.text() == ""           # no black point yet
+    # With no black point the label now names the no-anchor state rather than
+    # showing nothing — converting unanchored is allowed (fixed-constant density
+    # invert). See spec/no-anchor-convert.md.
+    assert "density invert" in panel.bwp_mode_label.text().lower()
 
 
 def test_black_only_states_and_label(panel):
