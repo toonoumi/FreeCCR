@@ -77,6 +77,11 @@ class CCRBackend:
         # slider is never moved). Supersedes the legacy baked auto-exposure while
         # on. Global, persisted by MainWindow. See spec/auto-gain.md.
         self.auto_gain: bool = True
+        # Confirm before a NO-ANCHOR conversion (no black point sampled → a plain
+        # per-channel flip, graded afterwards with Channel Levels). On by default
+        # so a forgotten black point can't silently convert a whole roll
+        # unanchored. Global, persisted by MainWindow. See spec/no-anchor-convert.md.
+        self.warn_no_anchor_convert: bool = True
         # Gamma slider application mode: False = per-channel (default filmic look,
         # shifts hue), True = apply to luminance and scale RGB together
         # (hue-preserving). Global display mode, persisted by MainWindow. See
@@ -2274,8 +2279,9 @@ class CCRBackend:
         pipeline as ccr_normalize_with_reference, but with user-specified B/W points
         instead of auto-detected percentiles.  Always converts from original scan data.
         """
-        if self.black_point_bgr is None:
-            raise ValueError("A black point (film base) must be set before applying.")
+        # No black point is allowed: that is the no-anchor direct invert, a plain
+        # per-channel flip graded afterwards with Channel Levels. The UI confirms
+        # it first (spec/no-anchor-convert.md); the backend just converts.
         # Calibration: when both points are set, log the linear + density slopes
         # they imply so a fixed default slope can be measured and baked in. With
         # only a black point, conversion uses the baked default slope.
@@ -2284,7 +2290,11 @@ class CCRBackend:
         # Film-stock slopes apply only in black-point-only mode — a sampled
         # white point wins. Snapshot once so every image in the batch converts
         # (and records) the same recipe.
-        slopes = self.film_stock_slopes if self.white_point_bgr is None else None
+        # Film-stock slopes are anchor-relative: a sampled white point wins, and
+        # with NO black point there is nothing for a slope to act on either.
+        slopes = (self.film_stock_slopes
+                  if (self.white_point_bgr is None
+                      and self.black_point_bgr is not None) else None)
         total = len(self.images)
         if progress_callback:
             progress_callback(0, total)
@@ -2302,8 +2312,14 @@ class CCRBackend:
                 img.converted = True
                 img.conversion_inputs = {
                     "mode": "bw",
-                    "bw": (tuple(self.black_point_bgr),
-                           tuple(self.white_point_bgr) if self.white_point_bgr is not None else None),
+                    # Either anchor may be None: no white point = default slope,
+                    # no black point either = the no-anchor direct invert. Every
+                    # replay site hands this pair straight back to the converter,
+                    # so no new mode is needed (spec/no-anchor-convert.md §4).
+                    "bw": (tuple(self.black_point_bgr)
+                           if self.black_point_bgr is not None else None,
+                           tuple(self.white_point_bgr)
+                           if self.white_point_bgr is not None else None),
                     "fine_rot": img.fine_rotation_angle,
                     "density": bool(self.density_bwpoint),
                     "slopes": slopes,

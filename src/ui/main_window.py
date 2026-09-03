@@ -242,6 +242,9 @@ class MainWindow(QMainWindow):
         # spec/auto-gain.md.
         ccr_backend.auto_gain = self._settings.value(
             "adjust/auto_gain", True, type=bool)
+        # Confirm before a no-anchor conversion (spec/no-anchor-convert.md).
+        ccr_backend.warn_no_anchor_convert = self._settings.value(
+            "convert/warn_no_anchor", True, type=bool)
         # Restore the Gamma application mode (default OFF = per-channel). When on,
         # the Gamma slider is applied to luminance and RGB is scaled together, so
         # midtone moves don't shift hue. See spec/gamma-luminance-mode.md.
@@ -881,7 +884,7 @@ class MainWindow(QMainWindow):
     # --- Auto Gain (global, persistent) ----------------------------------
     def on_auto_gain_toggled(self, checked: bool):
         """Flip the global Auto Gain flag, persist it, and re-render all loaded
-        images. Auto Gain is a hidden, live offset on the Gain stage (it never
+        images. Auto Gain is a hidden, live offset on Master Gain (it never
         moves the slider) and is NOT baked per image, so this only re-renders —
         no re-conversion and no catalog write. See spec/auto-gain.md."""
         ccr_backend.auto_gain = bool(checked)
@@ -889,7 +892,22 @@ class MainWindow(QMainWindow):
         self._rerender_all_for_global_mode(
             "Auto gain on — highlights auto-placed at the top of the window."
             if checked else
-            "Auto gain off — the Gain slider alone controls exposure.")
+            "Auto gain off — Master Gain alone controls exposure.")
+
+    # --- No-anchor convert warning (global, persistent) ------------------
+    def on_warn_no_anchor_toggled(self, checked: bool):
+        """Flip the confirm-before-unanchored-conversion flag and persist it.
+        Pure UI gating — nothing is baked, rendered or re-converted, so unlike
+        on_auto_gain_toggled there is no re-render pass.
+        See spec/no-anchor-convert.md."""
+        ccr_backend.warn_no_anchor_convert = bool(checked)
+        self._settings.setValue("convert/warn_no_anchor", bool(checked))
+        self.sliders_panel.set_temporary_hint(
+            "Converting without a black point will ask for confirmation."
+            if checked else
+            "Converting without a black point will no longer ask — it does a "
+            "direct invert; grade it with Channel Levels.",
+            duration=5000)
 
     def _rerender_all_for_global_mode(self, hint: str):
         """Re-render every loaded image after a global DISPLAY-mode change (Auto

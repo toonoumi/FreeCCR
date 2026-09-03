@@ -103,11 +103,24 @@ class SettingsDialog(QDialog):
         g.addWidget(self._cb_auto_gain)
         g.addWidget(self._muted(
             "Automatically place the brightest highlights at the top of the "
-            "working range without moving the Gain slider — the top 0.1% of the "
-            "in-range highlights are set to 99.8% of full. Pixels outside the "
-            "sampled clear/dense film range are ignored. Turn off to control "
-            "exposure with the Gain slider alone."))
+            "working range without moving the Master Gain slider — the top 0.1% "
+            "of the in-range highlights are set to 99.8% of full. Pixels outside "
+            "the sampled clear/dense film range are ignored. Turn off to control "
+            "exposure with Master Gain alone."))
         lay.addWidget(grp)
+
+        grp_conv = QGroupBox("Conversion")
+        gc = QVBoxLayout(grp_conv)
+        gc.setSpacing(theme.GAP_ROW)
+        self._cb_warn_no_anchor = QCheckBox(
+            "Warn when converting without a black point")
+        gc.addWidget(self._cb_warn_no_anchor)
+        gc.addWidget(self._muted(
+            "Converting with no sampled film base inverts each channel with no "
+            "colour or density normalisation — expect a strong cast, and grade "
+            "it with Channel Levels. Turn this off to skip the confirmation and "
+            "convert straight away."))
+        lay.addWidget(grp_conv)
 
         grp_gamma = QGroupBox("Gamma")
         gg = QVBoxLayout(grp_gamma)
@@ -399,6 +412,8 @@ class SettingsDialog(QDialog):
                          getattr(ccr_backend, "rgb_merge_replace", False)),
                         (self._cb_density, ccr_backend.density_bwpoint),
                         (self._cb_auto_gain, ccr_backend.auto_gain),
+                        (self._cb_warn_no_anchor,
+                         getattr(ccr_backend, "warn_no_anchor_convert", True)),
                         (self._cb_auto_awb, ccr_backend.auto_awb),
                         (self._cb_gamma_lum, ccr_backend.gamma_luminance),
                         (self._cb_sprocket, ccr_backend.sprocket_mask_white)):
@@ -437,6 +452,10 @@ class SettingsDialog(QDialog):
             self._mw.on_density_bwpoint_toggled(bool(self._cb_density.isChecked()))
         if bool(self._cb_auto_gain.isChecked()) != bool(ccr_backend.auto_gain):
             self._mw.on_auto_gain_toggled(bool(self._cb_auto_gain.isChecked()))
+        if (bool(self._cb_warn_no_anchor.isChecked())
+                != bool(getattr(ccr_backend, "warn_no_anchor_convert", True))):
+            self._mw.on_warn_no_anchor_toggled(
+                bool(self._cb_warn_no_anchor.isChecked()))
         if bool(self._cb_auto_awb.isChecked()) != bool(ccr_backend.auto_awb):
             self._mw.on_auto_awb_toggled(bool(self._cb_auto_awb.isChecked()))
         staged_algo = self._combo_awb_algo.currentData()
