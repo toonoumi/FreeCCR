@@ -64,9 +64,9 @@ def test_default_only_combo_and_gating(panel):
     assert not panel.save_film_stock_btn.isEnabled()   # needs BOTH points
     assert not panel.delete_film_stock_btn.isEnabled() # Default not deletable
     # With no black point the label now names the no-anchor state rather than
-    # showing nothing — converting unanchored is allowed (direct invert).
-    # See spec/no-anchor-convert.md.
-    assert "direct invert" in panel.bwp_mode_label.text().lower()
+    # showing nothing — converting unanchored is allowed (NamiColor density
+    # invert). See spec/no-anchor-convert.md.
+    assert "density invert" in panel.bwp_mode_label.text().lower()
 
 
 def test_black_only_states_and_label(panel):

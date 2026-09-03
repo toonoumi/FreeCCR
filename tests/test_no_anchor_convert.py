@@ -1,11 +1,19 @@
-"""No-anchor conversion / Direct Invert (spec/no-anchor-convert.md).
+"""No-anchor conversion (spec/no-anchor-convert.md).
 
-Converting with NO black point and NO white point is allowed: the conversion is a
-plain per-channel flip (`d = 1 - v/65535`) with nothing normalised, and the user
-grades it with Channel Levels afterwards. It is modelled as the existing
-`mode: "bw"` recipe with `bw = (None, None)`, so every replay site keeps working
-unchanged — these tests pin that.
+Converting with NO black point and NO white point is allowed: the conversion is
+NamiColor's negative transform in DENSITY space, `d = -log10(16 * p) + 1.0`, with
+its fixed constants and nothing measured off the frame. The user grades it with
+Channel Levels afterwards — which on this base works in the same density space
+NamiColor's own sliders do.
+
+Ported from github.com/Wavechaser/NamiColor -> NamiColor_dev/NamiColor_dev.c
+(3.1, GPL-3.0). `_dctl_neg` below is a literal transcription of that source's
+`neg` branch and is the reference every math test checks against.
+
+The recipe is modelled as the existing `mode: "bw"` with `bw = (None, None)`, so
+every replay site keeps working unchanged — these tests pin that too.
 """
+import math
 import os
 import sys
 
@@ -18,8 +26,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from core.ccr_processor import (  # noqa: E402
     WS_B,
     WS_W,
+    NAMI_BASE_OFFSET,
+    NAMI_INPUT_SCALE,
     _default_slope_invert,
-    _flip_invert,
+    _namicolor_invert,
     _twopoint_invert,
     _ws_enabled,
     apply_bwpoint_normalization,
@@ -32,54 +42,102 @@ def _decode(base_u16):
     return (np.asarray(base_u16, dtype=np.float32) - WS_B) / (WS_W - WS_B)
 
 
-# --- the flip itself --------------------------------------------------------
+def _dctl_neg(p, input_gain=1.0):
+    """Literal transcription of NamiColor_dev.c's `neg` branch:
+        inputScale = 16.0 ; invScale = -1.0
+        init = invScale * log10(inputScale * p)
+        init = init * inputGain + 1.0
+    `p` is the LINEAR scene value in [0,1]."""
+    return -math.log10(16.0 * p) * input_gain + 1.0
 
-def test_flip_maps_the_endpoints():
-    """Scan black (0) → display white; scan white (65535) → display black."""
+
+# One window code is 1/1024 in display units — the quantisation floor for any
+# comparison against the float reference.
+WINDOW_QUANTUM = 1.5 / (WS_W - WS_B)
+
+
+# --- the inversion matches the DCTL --------------------------------------
+
+def test_matches_the_dctl_across_the_range():
+    """Every sample must reproduce the upstream formula to within window
+    quantisation. This is the test that says "exactly like NamiColor"."""
     assert _ws_enabled()
-    img = np.asarray([[[0, 0, 0], [65535, 65535, 65535]]], dtype=np.float32)
-    d = _decode(_flip_invert(img))
-    assert d[0, 0] == pytest.approx([1.0, 1.0, 1.0], abs=1e-3)
-    assert d[0, 1] == pytest.approx([0.0, 0.0, 0.0], abs=1e-3)
+    vals = [1, 100, 1000, 4096, 8192, 32768, 50000, 65535]
+    out = _namicolor_invert(np.asarray([[[v] * 3 for v in vals]], dtype=np.float32))
+    got = _decode(out)
+    for i, v in enumerate(vals):
+        ref = _dctl_neg(v / 65535.0)
+        assert got[0, i, 0] == pytest.approx(ref, abs=WINDOW_QUANTUM), v
 
 
-def test_flip_endpoints_land_exactly_on_the_window():
-    out = _flip_invert(np.asarray([[[0, 0, 0], [65535, 65535, 65535]]],
-                                  dtype=np.float32))
-    assert int(out[0, 0, 0]) == int(WS_W)      # scan black → display white
-    assert int(out[0, 1, 0]) == int(WS_B)      # scan white → display black
+def test_upstream_constants():
+    assert NAMI_INPUT_SCALE == 16.0     # DCTL inputScale for negatives
+    assert NAMI_BASE_OFFSET == 1.0      # DCTL "+ 1.0f" for negatives
 
 
-def test_flip_is_linear_through_the_midpoint():
-    mid = np.full((1, 1, 3), 65535.0 / 2.0, dtype=np.float32)
-    assert _decode(_flip_invert(mid))[0, 0] == pytest.approx([0.5] * 3, abs=2e-3)
+def test_zero_density_lands_at_one():
+    """`16*p == 1` is the DCTL's density zero, and the +1.0 puts it at d = 1.0."""
+    d = _decode(_namicolor_invert(np.full((1, 1, 3), 65535.0 / 16.0, np.float32)))
+    assert d[0, 0] == pytest.approx([1.0] * 3, abs=WINDOW_QUANTUM)
 
 
-def test_flip_treats_each_channel_independently():
-    """No cross-channel normalisation: a channel-varying scan flips per channel,
-    so the cast survives the conversion (Channel Levels is what removes it)."""
+def test_half_scale_base_lands_near_cineon_black():
+    """The fixed constants are chosen so a film base sitting near half scale
+    maps to roughly Cineon black (93/1023) — that is what makes the unanchored
+    conversion usable without measuring anything."""
+    d = _decode(_namicolor_invert(np.full((1, 1, 3), 0.5 * 65535.0, np.float32)))
+    assert d[0, 0, 0] == pytest.approx(93.0 / 1023.0, abs=0.01)
+
+
+def test_it_is_log_not_linear():
+    """A DECADE of transmission must be a constant density step — the property
+    that makes a Channel Levels shift a clean per-channel multiply in linear
+    light. A linear flip would fail this."""
+    v = np.asarray([[[6553.5] * 3, [655.35] * 3, [65.535] * 3]], dtype=np.float32)
+    d = _decode(_namicolor_invert(v))[0, :, 0]
+    assert (d[1] - d[0]) == pytest.approx(1.0, abs=2 * WINDOW_QUANTUM)
+    assert (d[2] - d[1]) == pytest.approx(1.0, abs=2 * WINDOW_QUANTUM)
+
+
+def test_clear_film_goes_below_black_into_the_shadow_margin():
+    """Brighter than the assumed base → negative density → sub-black, which the
+    widened shadow margin holds and Channel Levels can lift."""
+    out = _namicolor_invert(np.full((1, 1, 3), 65535.0, np.float32))
+    assert out[0, 0, 0] < WS_B                     # below display black
+    assert out[0, 0, 0] > 0                        # but inside the container
+    assert _decode(out)[0, 0, 0] == pytest.approx(_dctl_neg(1.0),
+                                                  abs=WINDOW_QUANTUM)
+
+
+def test_dense_areas_go_into_the_highlight_headroom():
+    out = _namicolor_invert(np.full((1, 1, 3), 1.0, np.float32))
+    assert out[0, 0, 0] > WS_W                     # above display white
+    assert out[0, 0, 0] <= 65535                   # still inside the container
+
+
+def test_treats_each_channel_independently():
+    """No cross-channel normalisation: the frame's cast survives the conversion
+    (Channel Levels is what removes it)."""
     img = np.asarray([[[10000.0, 30000.0, 50000.0]]], dtype=np.float32)
-    d = _decode(_flip_invert(img))[0, 0]
-    assert d == pytest.approx([1 - 10000 / 65535, 1 - 30000 / 65535,
-                               1 - 50000 / 65535], abs=2e-3)
-    assert d[0] > d[1] > d[2]                   # the cast is preserved, not equalised
+    d = _decode(_namicolor_invert(img))[0, 0]
+    for c, v in enumerate((10000.0, 30000.0, 50000.0)):
+        assert d[c] == pytest.approx(_dctl_neg(v / 65535.0), abs=WINDOW_QUANTUM)
+    assert d[0] > d[1] > d[2]
 
 
-def test_flip_uses_no_headroom_or_shadow_margin():
-    """uint16 in → d exactly in [0,1]; nothing lands outside the window."""
-    rng = np.random.default_rng(4)
-    img = rng.integers(0, 65536, size=(24, 24, 3)).astype(np.float32)
-    out = _flip_invert(img)
-    assert out.min() >= WS_B
-    assert out.max() <= WS_W
+def test_no_nan_at_zero():
+    """log10(0) is -inf; the density floor must keep the output finite."""
+    out = _namicolor_invert(np.zeros((2, 2, 3), dtype=np.float32))
+    assert np.all(np.isfinite(out))
 
 
-def test_flip_legacy_full_range_when_working_space_off(monkeypatch):
+def test_legacy_full_range_when_working_space_off(monkeypatch):
     monkeypatch.setenv("FREECCR_WORKING_SPACE", "0")
-    out = _flip_invert(np.asarray([[[0, 65535, 32768]]], dtype=np.float32))
-    assert int(out[0, 0, 0]) == 65535
-    assert int(out[0, 0, 1]) == 0
-    assert abs(int(out[0, 0, 2]) - 32767) <= 2
+    out = _namicolor_invert(np.asarray(
+        [[[65535.0, 65535.0 / 16.0, 6553.5]]], dtype=np.float32))
+    assert int(out[0, 0, 0]) == 0                       # negative density clipped
+    assert abs(int(out[0, 0, 1]) - 65535) <= 2          # d = 1.0 -> white
+    assert abs(int(out[0, 0, 2]) - int(_dctl_neg(0.1) * 65535)) <= 4
 
 
 # --- dispatch ---------------------------------------------------------------
@@ -88,7 +146,7 @@ def test_replay_dispatches_to_the_flip_with_no_anchors():
     rng = np.random.default_rng(5)
     img = rng.integers(0, 65536, size=(8, 8, 3), dtype=np.uint16)
     got = apply_bwpoint_normalization(img, None, None)
-    assert np.array_equal(got, _flip_invert(img.astype(np.float32)))
+    assert np.array_equal(got, _namicolor_invert(img.astype(np.float32)))
 
 
 def test_black_point_only_still_routes_to_default_slope():

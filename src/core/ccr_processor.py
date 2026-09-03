@@ -1356,21 +1356,51 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     return d.astype(np.uint16)
 
 
-def _flip_invert(img_f: np.ndarray) -> np.ndarray:
-    """No-anchor inversion: flip each channel across the container, `d = 1 - v/65535`.
+# --- No-anchor inversion: a faithful port of NamiColor's negative transform ---
+# Source: github.com/Wavechaser/NamiColor -> NamiColor_dev/NamiColor_dev.c (3.1,
+# GPL-3.0), the `neg` branch of transform():
+#     inputScale = 16.0 ; invScale = -1.0
+#     init = invScale * log10(inputScale * p)      // transmission -> density
+#     init = init * inputGain + 1.0
+# inputGain is NamiColor's own slider (default 1.0); FreeCCR leaves it at the
+# default here because Channel Levels carries its own Input Gain downstream.
+# Everything NamiColor does after `init` (channel/master shift, gain, blackpoint)
+# is what Channel Levels already does, so the conversion stops here.
+NAMI_INPUT_SCALE = 16.0    # DCTL `inputScale` for negatives
+NAMI_BASE_OFFSET = 1.0     # DCTL `+ 1.0f` for negatives (reversals use 0.8)
+
+
+def _namicolor_invert(img_f: np.ndarray) -> np.ndarray:
+    """No-anchor inversion in DENSITY (log) space, per NamiColor's negative
+    transform: `d = -log10(16 * p) + 1.0`, with `p = v/65535` the LINEAR scene
+    value.
 
     Used when NEITHER a black point nor a white point was sampled. Nothing is
-    normalised — no film base, no density, no per-channel balance — so the result
-    carries the scan's full cast and the user grades it with Channel Levels
-    (which now runs first, un-clamped, and can place both ends per channel).
-    See spec/no-anchor-convert.md.
+    measured off the frame: the `16` and `+1.0` are NamiColor's fixed constants,
+    which place a film base sitting near half scale at roughly Cineon black
+    (93/1023). The frame's own cast and placement survive, and the user grades
+    them with Channel Levels — which, on this base, is operating in the same
+    density space NamiColor's sliders do.
 
-    `read_image` already scales the scan to the full 16-bit container
-    (* 65535/white_level), so the flip needs no further normalisation. uint16 in
-    means `d` lands exactly in [0,1]: this mode populates neither the highlight
-    headroom nor the shadow margin, and does not need to."""
-    d = img_f * np.float32(-1.0 / 65535.0)
-    d += np.float32(1.0)
+    The negative decode is linear Adobe RGB (`gamma=(1,1)`,
+    `output_color=Adobe`, ccr_image.py:538-551), which is exactly the input the
+    DCTL expects, so no linearisation is needed here.
+
+    Output leaves [0,1] at both ends, by design: clear film (brighter than the
+    assumed base) goes NEGATIVE into the shadow margin, dense areas well above
+    white into the highlight headroom. Both are recoverable through Channel
+    Levels. See spec/no-anchor-convert.md.
+
+    NOT ported: NamiColor's Adobe->Rec.2020 matrix (it is applied in-place
+    sequentially in the DCTL, so the G and B rows consume already-overwritten
+    values — a genuine bug that is baked into that look; FreeCCR is colour
+    managed and must not reintroduce it), and the optional "Fit to Cineon Base"
+    lift (`postLift`, default OFF upstream)."""
+    d = np.maximum(img_f, _DENSITY_FLOOR)                    # copy; avoids log10(0)
+    d *= np.float32(NAMI_INPUT_SCALE / 65535.0)              # 16 * p
+    np.log10(d, out=d)
+    np.negative(d, out=d)                                    # density above 1/16 scale
+    d += np.float32(NAMI_BASE_OFFSET)
     if _ws_enabled():
         return encode_window(d)
     np.clip(d, 0.0, 1.0, out=d)
@@ -1664,10 +1694,10 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr=None, white_point_bgr=
     # frame. The sampled B/W points are applied directly as fixed per-channel anchors.
     img_f = img.astype(np.float32)
     if black_point_bgr is None:
-        # --- No-anchor mode: a plain per-channel flip, nothing normalised ---
-        rgb_inverted = _flip_invert(img_f)
+        # --- No-anchor mode: NamiColor's density inversion, nothing measured ---
+        rgb_inverted = _namicolor_invert(img_f)
         del img_f
-        print(f"BWPN (no anchor, direct invert): "
+        print(f"BWPN (no anchor, NamiColor density invert): "
               f"{time.time() - total_start_time:.3f}s")
     elif white_point_bgr is None:
         # --- Default-slope mode (black point only): density-space inversion ---
@@ -2171,8 +2201,9 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
     replay and slice/reset, so it MUST match the entry pipeline exactly.
 
     When black_point_bgr is ALSO None, no anchor was sampled at all and the
-    conversion is a plain per-channel flip (see _flip_invert); Channel Levels
-    does the grading. See spec/no-anchor-convert.md.
+    conversion is NamiColor's density inversion with its fixed constants (see
+    _namicolor_invert); Channel Levels does the grading, in the same density
+    space NamiColor's own sliders work in. See spec/no-anchor-convert.md.
 
     When white_point_bgr is None, the default-slope mode is used: a density-space
     inversion applied to the black point alone (see _default_slope_invert), with
@@ -2188,8 +2219,8 @@ def apply_bwpoint_normalization(img: np.ndarray, black_point_bgr, white_point_bg
     look-less preview/export path."""
     img_f = img.astype(np.float32)
     if black_point_bgr is None:
-        # No anchors at all: a plain per-channel flip (spec/no-anchor-convert.md).
-        return _flip_invert(img_f)
+        # No anchors at all: NamiColor's density inversion (spec/no-anchor-convert.md).
+        return _namicolor_invert(img_f)
     if white_point_bgr is None:
         # Default-slope mode (black point only): density-space inversion.
         return _default_slope_invert(img_f, black_point_bgr, slopes_bgr)

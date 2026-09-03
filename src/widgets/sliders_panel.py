@@ -1691,8 +1691,8 @@ class SlidersPanel(QWidget):
             mw.persist_bwpoint()
         self._update_bwp_mode_label()
         self.set_temporary_hint(
-            "B/W points cleared. Set a <b>Black Point</b> (film base) for a "
-            "normalised conversion, or convert as-is for a direct invert.",
+            "B/W points cleared. Set a <b>Black Point</b> (film base) to anchor "
+            "the conversion, or convert as-is for the NamiColor density invert.",
             duration=6000)
 
     def _update_bwp_mode_label(self):
@@ -1704,10 +1704,11 @@ class SlidersPanel(QWidget):
         wp_set = ccr_backend.white_point_bgr is not None
         stock = ccr_backend.film_stock_name
         if not bp_set:
-            # No anchor sampled: converting is still allowed, and does a plain
-            # per-channel flip (spec/no-anchor-convert.md). Say so rather than
-            # showing nothing, so the panel always states what Convert will do.
-            text = "Anchor source: none — direct invert, grade with Channel Levels"
+            # No anchor sampled: converting is still allowed, and runs
+            # NamiColor's density inversion with its fixed constants
+            # (spec/no-anchor-convert.md). Say so rather than showing nothing, so
+            # the panel always states what Convert will do.
+            text = "Anchor source: none — NamiColor density invert"
         elif wp_set:
             text = "Anchor source: white point (two-point)"
         elif stock:
@@ -1889,11 +1890,14 @@ class SlidersPanel(QWidget):
         box.setWindowTitle("Convert without a black point?")
         box.setText("<b>No film base has been sampled.</b>")
         box.setInformativeText(
-            "The conversion will simply invert each channel, with no colour or "
-            "density normalisation. Expect a strong cast — use <b>Channel "
-            "Levels</b> (Master Gain, and the per-channel Shift / Gain / "
-            "Blackpoint) to grade it.<br><br>"
-            "Set a <b>Black Point</b> first for a normalised conversion.<br><br>"
+            "The conversion will use NamiColor's fixed density constants instead "
+            "of measuring your film base, so the frame keeps its own cast and "
+            "placement. Grade it with <b>Channel Levels</b> (Master Gain, and the "
+            "per-channel Shift / Gain / Blackpoint), which works in the same "
+            "density space NamiColor's sliders do — and enable <b>Cineon Log "
+            "→ Rec.709</b> for the intended display transform.<br><br>"
+            "Set a <b>Black Point</b> first for a conversion anchored to your "
+            "own film base.<br><br>"
             "<i>This warning can be turned off in Settings → General.</i>")
         proceed = box.addButton("Convert Anyway", QMessageBox.AcceptRole)
         cancel = box.addButton(QMessageBox.Cancel)
