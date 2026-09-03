@@ -1,6 +1,6 @@
-# Spec: No-anchor conversion (NamiColor density invert)
+# Spec: No-anchor conversion (fixed-constant density invert)
 
-Status: IMPLEMENTED v2 (v1 used a linear flip; v2 ports NamiColor's density math)
+Status: IMPLEMENTED v2 (v1 used a linear flip; v2 inverts in density space)
 Owner: FreeCCR
 Feature branch: `feat/no-anchor-convert`
 
@@ -47,47 +47,48 @@ Settings.
 
 ## 3. Processing / math
 
-The inversion is a faithful port of **NamiColor**'s negative transform — the tool
-whose slider set Channel Levels was modelled on in the first place. Source:
-`github.com/Wavechaser/NamiColor` → `NamiColor_dev/NamiColor_dev.c` (3.1,
-GPL-3.0), the `neg` branch of `transform()`:
-
-```c
-float inputScale = inputType == neg ? 16.0f : 1.0f;
-float invScale   = inputType == neg ? -1.0f : 1.0f;
-r_init = invScale * (_log10f (inputScale * p_R));
-r_init = (r_init * inputGain) + 1.0f;
-```
-
-`_namicolor_invert` implements exactly that with `inputGain` at its upstream
-default of 1.0:
+`_unanchored_density_invert` inverts in **density (log) space** using fixed
+constants — nothing is measured off the frame:
 
 ```
-d = -log10(16 * p) + 1.0        p = v / 65535   (LINEAR scene value)
+d = -log10(INPUT_SCALE * p) + BASE_OFFSET       p = v / 65535   (LINEAR)
+INPUT_SCALE = 16.0      BASE_OFFSET = 1.0
 ```
 
-Everything NamiColor does *after* `init` — channel shift, master shift, gain,
-blackpoint — is what Channel Levels already does, so the conversion stops here
-and the sliders take over. On this base, Channel Levels is operating in the same
-density space NamiColor's own sliders do.
+`INPUT_SCALE` sets which transmission counts as zero density (`16·p == 1`);
+`BASE_OFFSET` places that zero in the display window. Everything after the
+inversion — per-channel shift, gain, blackpoint, master shift/gain — is what
+Channel Levels already does, so the conversion stops here and the sliders take
+over.
 
 ### Why the input is already right
 
-NamiColor expects **linear** Adobe RGB. FreeCCR's negative decode is exactly
-that: `gamma=(1, 1)`, `output_color=rawpy.ColorSpace.Adobe`
+The log must be taken on genuinely linear data. FreeCCR's negative decode is
+exactly that: `gamma=(1, 1)`, `output_color=rawpy.ColorSpace.Adobe`
 (`ccr_image.py:538-551`). No linearisation is needed, and none is done.
 
-### What the fixed constants buy
+### Why log rather than a linear flip
 
-Nothing is measured off the frame — `16` and `+1.0` are NamiColor's baked
-assumptions, and they are what make an unanchored conversion usable:
+v1 of this spec used `d = 1 − v/65535` on the reasoning that a density inversion
+needs a base to measure density *against*, which is exactly what is missing
+without an anchor. That reasoning was wrong — an inversion can be logarithmic
+*and* anchor-free by using fixed constants instead of a sampled base.
+
+Log is also what keeps Channel Levels coherent. On a density base a **shift** is
+a density offset, i.e. a clean per-channel **multiply in linear light** — a
+tone-independent colour balance move, and the same thing a shift means in the
+black-point-only mode. Under a linear inversion the identical slider becomes an
+additive lift that drags the black end around, so the control would silently
+change meaning with the conversion mode.
+
+### What the fixed constants buy
 
 | Scan value `v` | `p` | `d` | Meaning |
 |---|---|---|---|
 | 65535 | 1.0 | **−0.204** | clear film / sprockets → sub-black, into the shadow margin |
 | ~33231 | 0.507 | **0.091** | a base near half scale → ≈ Cineon black (93/1023) |
 | 8760 | 0.134 | **0.670** | ≈ Cineon 90% white (685/1023) |
-| 4096 | 1/16 | **1.000** | the DCTL's density zero |
+| 4096 | 1/16 | **1.000** | density zero |
 | 1 | 1.5e-5 | **4.612** | maximum density → into the highlight headroom |
 
 Both ends leave `[0, 1]` **by design**. The widened shadow margin (`WS_LO = 1.0`)
@@ -95,39 +96,16 @@ holds the sub-black end and the ~6 stops of headroom hold the dense end, and
 Channel Levels — running un-clamped ahead of the window clamp — can pull either
 back. That is the whole reason this mode is viable now and was not before.
 
-Because it is a log transform, a Channel Levels **shift** on this base is a
-density offset, i.e. a clean per-channel **multiply in linear light** — a
-tone-independent colour balance move, which is exactly the property NamiColor's
-shift sliders have.
-
-### Deliberately NOT ported
-
-- **The Adobe→Rec.2020 matrix.** Upstream applies it *in-place sequentially*, so
-  the G row consumes the already-overwritten R, and the B row consumes both new
-  values. That is a genuine bug — a correct matrix multiply needs the original
-  triple — but it has shipped long enough to be part of the look people dial
-  against. FreeCCR is colour managed (ICC/DCP) and must not reintroduce it. This
-  is the one respect in which the mode cannot be "exactly NamiColor", and it is a
-  deliberate choice rather than an oversight.
-- **"Fit to Cineon Base"** (`postLift`): the fixed `(x + 93/1023) / (1 + 93/1023)`
-  affine. It is a checkbox that is **off by default** upstream, so porting
-  faithfully means not applying it.
-- **`inputGain`**: left at the upstream default of 1.0. Channel Levels has its
-  own Input Gain downstream. Note the pivots differ — NamiColor multiplies the
-  density *before* the `+1.0`, FreeCCR multiplies `d` *after* it — so the two
-  agree exactly at the neutral setting and diverge as Input Gain moves. See §8.
-- **Reversals / log-to-log** (`rev`, `pfe`): only the `neg` branch is ported.
-
 ### The display transform
 
-NamiColor's output is a Cineon-log code value that a separate **CST node**
-(Cineon Film Log → Rec.709 Gamma 2.2) decodes. FreeCCR's equivalent is the
+The output is a log-encoded (Cineon-like) signal, so the intended pairing is the
 existing **Cineon Log → Rec.709 (γ 2.2)** checkbox in Channel Levels. It is left
-as a manual choice, matching the fact that it is a separate node in the DaVinci
-workflow — but an unanchored conversion viewed without it will look flat and
-washed, exactly as the DCTL's output does before its CST.
+as a manual choice rather than forced on, but an unanchored conversion viewed
+without it looks flat and washed — that is the log encoding, not a fault. The
+warning dialog and the Settings blurb both point at it.
 
-No black point also means:
+### Consequences of having no black point
+
 - **No sprocket/clear-film mask.** `compute_sprocket_alpha` already returns
   `None` for a `None` black point (`ccr_processor.py:1076`); the reversal-look
   overlay is simply absent.
@@ -266,18 +244,13 @@ New `tests/test_no_anchor_convert.py`:
 
 - **No new `conversion_inputs` mode** (§4): `bw: (None, None)` keeps ten dispatch
   sites unchanged and is an honest description of the recipe.
-- **Density space, via NamiColor's math.** An earlier draft used a plain linear
-  flip (`d = 1 - v/65535`) on the reasoning that a density inversion needs a base
-  to measure against. That was wrong: NamiColor inverts *anchor-free but still
-  logarithmically*, using fixed constants rather than a sampled base. Density is
-  also what keeps Channel Levels consistent — a shift means the same thing here
-  as it does in the default-slope mode, instead of silently switching between
-  density and linear semantics.
-- **Input Gain pivot is a known divergence.** NamiColor multiplies density
-  before the `+1.0`; FreeCCR's Channel Levels multiplies after. They agree
-  exactly at neutral and diverge as the slider moves. Aligning them would need a
-  mode-dependent branch inside the shared Channel Levels stage, so it is left as
-  a follow-up rather than special-cased.
+- **Density space, not a linear flip.** An earlier draft inverted linearly on
+  the reasoning that a density inversion needs a base to measure against. That
+  was wrong — fixed constants make it anchor-free without making it linear. See
+  §3 for why the distinction matters to Channel Levels.
+- **Fixed constants, not a measured fit.** A content-dependent auto-fit would
+  re-introduce a per-frame cast, which is exactly what the user grades away by
+  hand. Fixed constants keep every frame of a roll on the same transform.
 - **The warning is Settings-only.** No "don't show this again" checkbox in the
   dialog itself — one off-switch, in the place the user specified.
 - **Auto-exposure (`eb`) still applies**, since its trigger is

@@ -116,9 +116,9 @@ class SettingsDialog(QDialog):
             "Warn when converting without a black point")
         gc.addWidget(self._cb_warn_no_anchor)
         gc.addWidget(self._muted(
-            "Converting with no sampled film base uses NamiColor's fixed density "
-            "constants instead of measuring your film — the frame keeps its own "
-            "cast, and you grade it with Channel Levels. Turn this off to skip the "
+            "Converting with no sampled film base uses fixed density constants "
+            "instead of measuring your film — the frame keeps its own cast, and "
+            "you grade it with Channel Levels. Turn this off to skip the "
             "confirmation and convert straight away."))
         lay.addWidget(grp_conv)
 

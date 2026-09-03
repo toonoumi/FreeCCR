@@ -119,7 +119,7 @@ def test_label_names_the_no_anchor_state(panel):
     ccr_backend.white_point_bgr = None
     panel._update_bwp_mode_label()
     text = panel.bwp_mode_label.text()
-    assert "none" in text and "namicolor density invert" in text.lower()
+    assert "none" in text and "density invert" in text.lower()
     assert panel.bwp_mode_label.isVisibleTo(panel)
 
 
