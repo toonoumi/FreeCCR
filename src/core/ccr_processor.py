@@ -1214,18 +1214,35 @@ def _white_balance_gains(kelvin_shift: float, tint_shift: float,
 # interpolator the Curves editor and the Gamma slider use, so a Balance move is
 # exactly what dragging that node by hand in Curves would give.
 BALANCE_NODE_X = 0.125       # node position (1/8) in the normalised display domain
-BALANCE_MAX_OFFSET = 0.10    # vertical travel at slider +-100
-# Invariant: MAX_OFFSET < NODE_X and NODE_X + MAX_OFFSET < 1, so the node can
-# never cross either pinned endpoint. Re-check both when retuning NODE_X.
+BALANCE_MAX_STOPS = 1.5      # node gamma at slider +-100 is 2**+-1.5
+
 _BALANCE_LUT_N = 1024
 _BALANCE_LUT_X = np.linspace(0.0, 1.0, _BALANCE_LUT_N, dtype=np.float32)
 
 
 def balance_curve_points(value: float):
     """The three control points [(x, y)] for a Balance slider value, in the
-    NORMALISED [0,1] display domain. value=0 -> the identity diagonal."""
-    off = (float(np.clip(value, -100.0, 100.0)) / 100.0) * BALANCE_MAX_OFFSET
-    return [(0.0, 0.0), (BALANCE_NODE_X, BALANCE_NODE_X + off), (1.0, 1.0)]
+    NORMALISED [0,1] display domain. value=0 -> the identity diagonal.
+
+    The node moves in GAMMA, not by a linear offset: `y = X0 ** (1/2**stops)`.
+    That is what lets the slider be strong without a range cap — a linear offset
+    has to stay below X0 or the node crosses the pinned (0,0) endpoint and
+    breaks monotonicity, which capped the downward travel at 0.125 and (for
+    symmetry) the upward travel with it. A gamma move approaches 0 and 1
+    asymptotically instead, so **no endpoint-crossing invariant exists to
+    violate** and the upward side is free of the downward side's geometric
+    limit. At +-100 the peak deviation from identity is about +0.41 / -0.22,
+    roughly 3x / 1.6x the old linear scheme; the correction that used to need
+    the full slider now sits near 30.
+
+    Note the asymmetry is real, not a bug: a node at x=1/8 moving vertically can
+    rise most of the way to 1 but can never fall further than 1/8, so the
+    downward side saturates near -0.24 peak deviation whatever the scaling. A
+    cast needing more than that wants Channel Levels or the Curves editor as
+    well."""
+    stops = (float(np.clip(value, -100.0, 100.0)) / 100.0) * BALANCE_MAX_STOPS
+    y = BALANCE_NODE_X ** (1.0 / (2.0 ** stops))
+    return [(0.0, 0.0), (BALANCE_NODE_X, y), (1.0, 1.0)]
 
 
 def _balance_curve(value: float, xq):

@@ -19,7 +19,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from core.ccr_processor import (  # noqa: E402
-    BALANCE_MAX_OFFSET,
+    BALANCE_MAX_STOPS,
     BALANCE_NODE_X,
     WS_B,
     WS_W,
@@ -58,17 +58,39 @@ def ws_on():
 
 # --- The curve itself -------------------------------------------------------
 
-def test_node_travel_cannot_cross_either_endpoint():
-    """The invariant a future retune of BALANCE_NODE_X must preserve: at full
-    travel the node stays strictly inside (0,1). At NODE_X=1/8 an offset of 0.20
-    would put it at y=-0.075 — below the pinned (0,0) — which would break both
-    monotonicity and the pinning."""
-    assert BALANCE_MAX_OFFSET < BALANCE_NODE_X
-    assert BALANCE_NODE_X + BALANCE_MAX_OFFSET < 1.0
-    for s in (-100, 100):
+def test_node_stays_inside_the_endpoints_at_any_value():
+    """The node moves in gamma, so it approaches 0 and 1 asymptotically and can
+    never reach either pinned endpoint — there is no range cap to violate. A
+    linear offset had to stay below NODE_X or it would cross (0,0)."""
+    for s in (-100, -100.0, -37, 0, 42, 100, 1e6, -1e6):
         (_, _), (nx, ny), (_, _) = balance_curve_points(s)
         assert nx == BALANCE_NODE_X
         assert 0.0 < ny < 1.0
+
+
+def test_node_gamma_is_reciprocal_about_zero():
+    """+s and -s are equal and opposite in GAMMA (the slider's natural unit),
+    which is what keeps the control symmetric to use even though the resulting
+    y-offsets are not symmetric."""
+    for mag in (25, 60, 100):
+        _, (_, up), _ = balance_curve_points(mag)
+        _, (_, down), _ = balance_curve_points(-mag)
+        g_up = np.log(BALANCE_NODE_X) / np.log(up)
+        g_down = np.log(BALANCE_NODE_X) / np.log(down)
+        assert g_up * g_down == pytest.approx(1.0, rel=1e-9)
+    _, (_, full), _ = balance_curve_points(100)
+    assert full == pytest.approx(BALANCE_NODE_X ** (1.0 / 2.0 ** BALANCE_MAX_STOPS))
+
+
+def test_travel_is_stronger_than_the_old_linear_scheme():
+    """The point of the gamma move: a max correction reaches much further. The
+    old linear scheme peaked at +0.13 / -0.14 deviation and could not fully
+    correct a heavy cast."""
+    x = np.linspace(0.0, 1.0, 401)
+    up = np.asarray(_balance_curve(100, x)) - x
+    down = np.asarray(_balance_curve(-100, x)) - x
+    assert up.max() > 0.35
+    assert down.min() < -0.20
 
 
 def test_identity_at_zero():
@@ -105,12 +127,13 @@ def test_effect_is_tone_weighted_toward_the_low_end():
     assert at_hi < peak / 5.0                    # faded by the highlights
 
 
-def test_sign_symmetry():
-    """+s raises the channel, -s lowers it by the same amount at the node."""
+def test_sign_direction():
+    """+s raises the channel at the node, -s lowers it. The magnitudes are NOT
+    equal — a node at x=1/8 has far more room above it than below — so only the
+    direction is asserted here; the gamma symmetry is checked above."""
     up = float(_balance_curve(40, BALANCE_NODE_X)) - BALANCE_NODE_X
     down = float(_balance_curve(-40, BALANCE_NODE_X)) - BALANCE_NODE_X
     assert up > 0 and down < 0
-    assert up == pytest.approx(-down, rel=1e-6)
 
 
 # --- The stage --------------------------------------------------------------
@@ -255,11 +278,18 @@ def test_cpu_gpu_parity_windowed(ws_on):
     (0.60, 0.58, 0.62),
 ])
 def test_inverse_neutralizes_at_the_sampled_tone(trip):
-    """The solve must bring the three channels together AT the sampled tone."""
+    """The solve must bring the three channels together AT the sampled tone.
+
+    The residual is bounded by INTEGER SLIDER QUANTIZATION, not by the solve, so
+    the tolerance is derived from what one slider step is worth at this tone
+    rather than hardcoded — otherwise it silently becomes a strength test and
+    breaks whenever BALANCE_MAX_STOPS is retuned."""
     vals = compute_neutral_balance(*trip)
     assert all(-100 <= v <= 100 for v in vals)
     got = [float(_balance_curve(s, v)) for s, v in zip(vals, trip)]
-    assert max(got) - min(got) < 0.002
+    step = max(abs(float(_balance_curve(s + 1, v)) - float(_balance_curve(s, v)))
+               for s, v in zip(vals, trip))
+    assert max(got) - min(got) <= 2.0 * step
 
 
 def test_inverse_is_neutral_for_a_neutral_sample():

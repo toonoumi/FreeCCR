@@ -93,7 +93,7 @@ Shift (offset) and Gain (slope).
 - No change to Channel Levels, film-stock slopes, or the Curves editor.
 - No new OpenCL kernel code — the stage is a per-channel LUT applied in numpy
   on both paths, so GPU/CPU parity is free (the Channel Levels pattern).
-- No user-configurable node position in this iteration (BALANCE_NODE_X is a constant, subject to the bound in §4.1).
+- No user-configurable node position or strength in this iteration (`BALANCE_NODE_X` and `BALANCE_MAX_STOPS` are constants).
 
 ## 3. UX
 
@@ -182,8 +182,9 @@ Per channel, three control points in the normalised display domain:
 with
 
 ```
-X0  = 0.125                                 # BALANCE_NODE_X  (1/8)
-off = (slider / 100) * 0.10                 # BALANCE_MAX_OFFSET
+X0    = 0.125                               # BALANCE_NODE_X  (1/8)
+stops = (slider / 100) * 1.5                # BALANCE_MAX_STOPS
+y     = X0 ** (1 / 2**stops)                # the node moves in GAMMA
 ```
 
 `X0 = 1/8` is the node position the maintainer settles on in practice — well
@@ -192,14 +193,24 @@ midpoint control: the correction concentrates in the deep shadows and has faded
 to almost nothing by the midtones, which is exactly why it fixes casts that
 Temperature/Tint (and any tone-uniform offset) cannot.
 
-**The travel is bounded by the node position.** At `X0 = 0.125` an offset of
-±0.20 would drive the node to `y = -0.075` at slider −100 — below the pinned
-`(0,0)` endpoint, which breaks monotonicity and the pinning invariant together.
-`BALANCE_MAX_OFFSET = 0.10` keeps `y ∈ [0.025, 0.225]`, still nearly a halving
-or doubling of the node at full travel, with both extremes safely inside `(0,1)`.
-Anyone retuning `BALANCE_NODE_X` must re-check this bound: the invariant is
-`BALANCE_MAX_OFFSET < BALANCE_NODE_X` and
-`BALANCE_NODE_X + BALANCE_MAX_OFFSET < 1`.
+**The node moves in gamma, not by a linear offset.** A linear offset has to stay
+below `X0` or the node crosses the pinned `(0,0)` endpoint and breaks
+monotonicity — which capped downward travel at 0.125 and, for symmetry, capped
+upward travel with it. That cap is why a heavily yellow frame could not be fully
+corrected at the slider ends. A gamma move approaches 0 and 1 asymptotically, so
+**no endpoint-crossing invariant exists to violate at any slider value**, and
+the upward side is freed from the downward side's geometric limit.
+
+At `±100` the peak deviation from identity is about **+0.41 / −0.22**, roughly
+**3× / 1.6×** the old linear scheme. The correction that used to need the whole
+slider now sits near 30, leaving real headroom above it.
+
+The asymmetry is inherent, not a defect: a node at `x = 1/8` moving vertically
+can rise most of the way to 1 but can never fall further than 1/8, so the
+downward side saturates near −0.24 peak deviation whatever the scaling.
+`BALANCE_MAX_STOPS = 1.5` already sits within a hair of that limit, so raising
+the constant further buys upward range only. A cast needing more downward travel
+wants Channel Levels or the Curves editor as well.
 
 The Fritsch–Carlson tangent limiter keeps the result monotone at both extremes
 regardless, so the curve can never invert local contrast.
@@ -387,7 +398,7 @@ value is still never clobbered.
 | file | change |
 | --- | --- |
 | `src/ui/theme.py` | drop `TEMP_GRADIENT`/`TINT_GRADIENT`, add the three balance gradients |
-| `src/core/ccr_processor.py` | `BALANCE_NODE_X`, `BALANCE_MAX_OFFSET`, `balance_curve_points()`, `_balance_lut()`, `_apply_channel_balance()`, `compute_neutral_balance()`; wire into `_apply_working_space_recovery`, `adjust_image`, `adjust_image_opencl` |
+| `src/core/ccr_processor.py` | `BALANCE_NODE_X`, `BALANCE_MAX_STOPS`, `balance_curve_points()`, `_balance_lut()`, `_apply_channel_balance()`, `compute_neutral_balance()`; wire into `_apply_working_space_recovery`, `adjust_image`, `adjust_image_opencl` |
 | `src/core/ccr_image.py` | pass `balance_r/g/b` in both `apply_adjustments` and `_adjust_for_area` |
 | `src/core/awb.py` | `compute_awb_balance()` replaces `compute_awb_temp_tint()`; `estimate_neutral_rgb` unchanged |
 | `src/core/ccr_backend.py` | `maybe_auto_awb` writes/guards the balance keys (§5.2) |
