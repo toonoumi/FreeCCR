@@ -143,12 +143,13 @@ class TestCopy:
         ccr_backend.file_paths = [img.file_path]
         panel = _panel()
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _set(panel, "contrast", 25)
 
         _copy(panel, monkeypatch, {"wb": True})
 
-        assert panel.copied_adjustment == {"temperature": 40, "tint": 0}
+        assert panel.copied_adjustment == {"balance_r": 40, "balance_g": 0,
+                                           "balance_b": 0}
         assert "contrast" not in panel.copied_adjustment
         assert panel.copied_profile is None and panel.copied_crop is None
 
@@ -158,11 +159,11 @@ class TestCopy:
         ccr_backend.file_paths = [img.file_path]
         panel = _panel()
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _copy(panel, monkeypatch, {"wb": True})
         first = dict(panel.copied_adjustment)
 
-        _set(panel, "temperature", -40)
+        _set(panel, "balance_r", -40)
         _copy(panel, monkeypatch, {"tone": True}, accepted=False)
 
         assert panel.copied_adjustment == first
@@ -227,23 +228,23 @@ class TestPasteMerge:
         panel = _panel()
 
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _set(panel, "contrast", 25)
         _copy(panel, monkeypatch, {"wb": True})
 
         panel.current_idx = 1
-        _set(panel, "temperature", -10)
+        _set(panel, "balance_r", -10)
         _set(panel, "contrast", -30)
         panel.paste_adjustment_settings()
 
-        assert _val(tgt, "temperature") == 40      # copied group followed
+        assert _val(tgt, "balance_r") == 40      # copied group followed
         assert _val(tgt, "contrast") == -30        # un-copied group untouched
 
     def test_pasted_dict_carries_every_key(self, tmp_path, monkeypatch):
         src, tgt = self._two_images(tmp_path)
         panel = _panel()
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _copy(panel, monkeypatch, {"wb": True})
 
         panel.current_idx = 1
@@ -258,7 +259,7 @@ class TestPasteMerge:
         src, tgt = self._two_images(tmp_path)
         panel = _panel()
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _set(panel, "contrast", 25)
         _copy(panel, monkeypatch, {"wb": True})
 
@@ -266,14 +267,14 @@ class TestPasteMerge:
         _set(panel, "contrast", -30)
         panel.paste_adjustment_settings()
 
-        assert panel.sliders[panel.adjustment_keys.index("temperature")].value() == 40
+        assert panel.sliders[panel.adjustment_keys.index("balance_r")].value() == 40
         assert panel.sliders[panel.adjustment_keys.index("contrast")].value() == -30
 
     def test_paste_pushes_one_undo_state(self, tmp_path, monkeypatch):
         src, tgt = self._two_images(tmp_path)
         panel = _panel()
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _copy(panel, monkeypatch, {"wb": True})
 
         panel.current_idx = 1
@@ -332,7 +333,7 @@ class TestPasteCurves:
         panel, src, tgt = self._panel_with(tmp_path)
         panel.current_idx = 0
         panel.curve_editor.set_curves(self.CURVE)
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _copy(panel, monkeypatch, {"wb": True})       # curves NOT copied
 
         panel.current_idx = 1
@@ -340,7 +341,7 @@ class TestPasteCurves:
         panel.paste_adjustment_settings()
 
         assert tgt.adjustment_settings["curves"] == self.OTHER
-        assert _val(tgt, "temperature") == 40
+        assert _val(tgt, "balance_r") == 40
 
 
 class TestPasteWholeImageGroups:
@@ -486,7 +487,7 @@ class TestPasteCineonFlag:
         src, tgt = self._pair(tmp_path)
         panel = _panel()
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _copy(panel, monkeypatch, {"wb": True})
 
         panel.current_idx = 1

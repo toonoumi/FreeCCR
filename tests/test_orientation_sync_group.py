@@ -195,14 +195,14 @@ class TestPaste:
         panel = _panel()
 
         panel.current_idx = 0
-        _set(panel, "temperature", 40)
+        _set(panel, "balance_r", 40)
         _copy(panel, monkeypatch, {"wb": True})
 
         panel.current_idx = 1
         panel.paste_adjustment_settings()
 
         assert _orient(tgt) == (90, False, True)
-        assert tgt.adjustment_settings["temperature"] == 40   # the copied group did land
+        assert tgt.adjustment_settings["balance_r"] == 40   # the copied group did land
 
     def test_paste_resets_the_zoom_when_the_view_re_orients(self, tmp_path, monkeypatch):
         """The paste target IS the displayed image, so a kept zoom would strand
@@ -262,10 +262,10 @@ class TestSyncToAll:
         _set_orient(src, 90)
         src.color_profile = "bw"
         src.crop_rect = (0.1, 0.1, 0.9, 0.9)
-        src.adjustment_settings = {"temperature": 40}
+        src.adjustment_settings = {"balance_r": 40}
         tgt.color_profile = "color"
         tgt.crop_rect = None
-        tgt.adjustment_settings = {"temperature": -25}
+        tgt.adjustment_settings = {"balance_r": -25}
 
         panel = _panel()
         panel.current_idx = 0
@@ -275,7 +275,7 @@ class TestSyncToAll:
         assert _orient(tgt) == (90, False, False)
         assert tgt.color_profile == "color"
         assert tgt.crop_rect is None
-        assert tgt.adjustment_settings["temperature"] == -25
+        assert tgt.adjustment_settings["balance_r"] == -25
 
     def test_orientation_only_sync_does_not_reprocess(self, tmp_path):
         """Rotation/mirroring are display-level transforms applied at paint

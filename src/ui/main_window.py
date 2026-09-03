@@ -251,8 +251,8 @@ class MainWindow(QMainWindow):
         ccr_backend.gamma_luminance = self._settings.value(
             "adjust/gamma_luminance", False, type=bool)
         # Restore the Auto WB toggle + algorithm (defaults OFF / Gray World).
-        # When on, a fresh conversion writes AWB-estimated temperature/tint into
-        # the image's sliders — only when neither is already set. Affects only
+        # When on, a fresh conversion writes the AWB-estimated R/G/B Balance into
+        # the image's sliders — only when none is already set. Affects only
         # FUTURE conversions and the AWB button. See spec/auto-white-balance.md.
         from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
         ccr_backend.auto_awb = self._settings.value(
@@ -339,6 +339,20 @@ class MainWindow(QMainWindow):
         self.dust_shortcut.activated.connect(self._shortcut_toggle_dust)
         self.wb_pick_shortcut = QShortcut(QKeySequence("W"), self)
         self.wb_pick_shortcut.activated.connect(self._shortcut_wb_pick)
+
+        # Channel Balance nudge keys: U/I/O raise R/G/B, J/K/L lower them —
+        # top row adds, home row subtracts. Same WindowShortcut context as the
+        # mode keys above, so they fire whichever panel has focus; modal dialogs
+        # are separate windows, so they never reach text entry there.
+        # See spec/channel-balance.md.
+        self._balance_shortcuts = []
+        for key, channel, direction in (("U", "r", +1), ("I", "g", +1),
+                                        ("O", "b", +1), ("J", "r", -1),
+                                        ("K", "g", -1), ("L", "b", -1)):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.activated.connect(
+                lambda c=channel, d=direction: self._shortcut_nudge_balance(c, d))
+            self._balance_shortcuts.append(sc)
 
 
         # Non-blocking startup update check (2s network timeout, off-thread)
@@ -504,6 +518,17 @@ class MainWindow(QMainWindow):
         if not self.sliders_panel.wb_picker_btn.isEnabled():
             return
         self.sliders_panel._on_pick_neutral_point()
+
+    def _shortcut_nudge_balance(self, channel, direction):
+        """U/I/O and J/K/L: nudge one R/G/B Balance slider. Gated like the other
+        mode keys — needs a current image, and never fires while crop or dust
+        mode owns the canvas (those modes have their own keyboard semantics).
+        The panel itself no-ops when its sliders are disabled."""
+        if self.image_preview.current_idx is None:
+            return
+        if self.image_preview.dust_mode or self.image_preview.crop_mode:
+            return
+        self.sliders_panel.nudge_balance(channel, direction)
 
     def _sync_dust_action(self, checked: bool):
         action = getattr(self.image_preview, "dust_action", None)
@@ -934,13 +959,13 @@ class MainWindow(QMainWindow):
     # --- Gamma application mode (global, persistent) ----------------------
     def on_auto_awb_toggled(self, checked: bool):
         """Flip the global Auto WB flag and persist it. No re-render: the flag
-        only affects FUTURE conversions (and never images with a saved
-        temperature/tint). See spec/auto-white-balance.md."""
+        only affects FUTURE conversions (and never images with a saved R/G/B
+        Balance). See spec/auto-white-balance.md."""
         ccr_backend.auto_awb = bool(checked)
         self._settings.setValue("adjust/auto_awb", bool(checked))
         self.sliders_panel.set_temporary_hint(
             "Auto white balance on — new conversions get an automatic "
-            "Temperature/Tint estimate." if checked else
+            "R/G/B Balance estimate." if checked else
             "Auto white balance off.", duration=4000)
 
     def on_awb_algorithm_changed(self, algorithm: str):

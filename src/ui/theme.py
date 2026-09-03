@@ -44,8 +44,14 @@ CH_R = "#d06666"
 CH_G = "#66aa66"
 CH_B = "#6688d0"
 # Slider track gradients (groove) — map the axis to its colour meaning.
-TEMP_GRADIENT = ("#3d7fd1", "#e6c34d")   # Temperature: cool blue (low) -> warm amber (high)
-TINT_GRADIENT = ("#5cb85c", "#c264c2")   # Tint: green (low) -> magenta (high)
+# Channel Balance (spec/channel-balance.md): each channel runs from its
+# complement (low) to the channel colour itself (high), so the direction of a
+# move reads without a label. The high ends are CH_R/CH_G/CH_B so the sliders
+# match the Channel Levels group headings. These replace the old
+# TEMP_GRADIENT/TINT_GRADIENT, which went with the removed Temperature/Tint.
+BALANCE_R_GRADIENT = ("#4fb3b3", CH_R)   # R Balance: cyan (low)    -> red (high)
+BALANCE_G_GRADIENT = ("#c264c2", CH_G)   # G Balance: magenta (low) -> green (high)
+BALANCE_B_GRADIENT = ("#c9b452", CH_B)   # B Balance: yellow (low)  -> blue (high)
 SUCCESS = "#3a8f5a"
 SUCCESS_HOVER = "#46a368"
 SUCCESS_PRESSED = "#2f7449"

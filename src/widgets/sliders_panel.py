@@ -27,7 +27,10 @@ FILM_STOCK_DEFAULT_LABEL = "Default"
 # rotation/mirror flags, instead of adjustment keys.
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
-    ("wb", "White Balance / Tint", ("temperature", "tint")),
+    # Channel Balance — the tone-WEIGHTED per-channel control that replaced
+    # Temperature/Tint. The group id stays "wb" so a remembered {gid: bool}
+    # selection from an earlier session still applies. See spec/channel-balance.md.
+    ("wb", "Channel Balance (R/G/B)", ("balance_r", "balance_g", "balance_b")),
     # Gain is no longer here: it lives in Channel Levels as Master Gain, and
     # syncs with the "channels" group below rather than splitting one stage
     # across two groups.
@@ -239,7 +242,8 @@ class ResettableSlider(QSlider):
 
 class GradientSlider(ResettableSlider):
     """A horizontal slider whose groove is a left->right colour gradient
-    (Temperature blue->amber, Tint green->magenta) so the axis reads at a glance.
+    (R Balance cyan->red, G Balance magenta->green, B Balance yellow->blue) so
+    the axis reads at a glance.
 
     The groove + knob are painted directly rather than via QSS: a global
     ``QSlider`` stylesheet rule, matching this widget through subclassing, would
@@ -292,7 +296,9 @@ class SlidersPanel(QWidget):
         # "exposure" is deliberately absent: the Gain slider was removed (Master
         # Gain replaces it). The pipeline parameter still exists for the baked
         # auto-exposure and for area layers — it just has no slider to zip to.
-        "temperature", "tint", "brightness", "gamma", "highlights",
+        # Channel Balance replaced Temperature/Tint in the same panel slot: one
+        # low-anchored curve node per channel (spec/channel-balance.md).
+        "balance_r", "balance_g", "balance_b", "brightness", "gamma", "highlights",
         "white_point", "shadows", "black_point", "contrast", "saturation",
         "sub_saturation",
         # Per-channel levels controls (collapsible section)
@@ -564,13 +570,13 @@ class SlidersPanel(QWidget):
         self.wb_picker_btn = QPushButton("WB Picker")
         self.wb_picker_btn.setToolTip(
             "Click, then pick a neutral gray/white point on the image "
-            "to auto-set Temperature and Tint.")
+            "to auto-set the R/G/B Balance sliders.")
         # Fully automatic white balance: no picking — estimates the neutral
         # from the whole image and sets the Temperature/Tint sliders.
         self.auto_wb_btn = QPushButton("AWB")
         self.auto_wb_btn.setToolTip(
             "Automatic white balance — estimates the neutral color from the "
-            "whole image and sets Temperature and Tint. The algorithm is "
+            "whole image and sets the R/G/B Balance sliders. The algorithm is "
             "chosen in Settings → General.")
         # Crop: non-destructive crop of the preview/export (same gating).
         self.crop_btn = QPushButton("Crop")
@@ -604,10 +610,17 @@ class SlidersPanel(QWidget):
         # luminance channel (preview and export). Per-image, like the sliders.
         self.color_profile_row = self._create_color_profile_row()
 
-        self.temperature_slider_layout = self.create_slider(
-            "Temperature", gradient=theme.TEMP_GRADIENT)
-        self.tint_slider_layout = self.create_slider(
-            "Tint", gradient=theme.TINT_GRADIENT)
+        # Channel Balance: three low-anchored curve nodes, one per channel, in
+        # the slot Temperature/Tint used to occupy. Labels stay "<C> Balance" so
+        # they never read as Channel Levels' "<C> Shift / Gain / Blackpoint" —
+        # Levels is the tone-uniform control, Balance the tone-weighted one.
+        # See spec/channel-balance.md.
+        self.balance_r_slider_layout = self.create_slider(
+            "R Balance", gradient=theme.BALANCE_R_GRADIENT)
+        self.balance_g_slider_layout = self.create_slider(
+            "G Balance", gradient=theme.BALANCE_G_GRADIENT)
+        self.balance_b_slider_layout = self.create_slider(
+            "B Balance", gradient=theme.BALANCE_B_GRADIENT)
         # (The general-adjustments "Gain" slider used to be created here. It was
         # the same math as Channel Levels' Master Gain at a different scale, so it
         # was removed — Master Gain is the one gain control, and it is also what
@@ -629,8 +642,9 @@ class SlidersPanel(QWidget):
         self.sub_saturation_slider_layout = self.create_slider("Subtracted Sat")
 
         scroll_layout.addLayout(self.color_profile_row)
-        scroll_layout.addLayout(self.temperature_slider_layout)
-        scroll_layout.addLayout(self.tint_slider_layout)
+        scroll_layout.addLayout(self.balance_r_slider_layout)
+        scroll_layout.addLayout(self.balance_g_slider_layout)
+        scroll_layout.addLayout(self.balance_b_slider_layout)
         scroll_layout.addLayout(self.brightness_slider_layout)
         scroll_layout.addLayout(self.gamma_slider_layout)
         scroll_layout.addLayout(self.highlights_slider_layout)
@@ -1643,21 +1657,21 @@ class SlidersPanel(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None or not img.converted:
             return
-        from core.awb import compute_awb_temp_tint
-        res = compute_awb_temp_tint(img)
+        from core.awb import compute_awb_balance
+        res = compute_awb_balance(img)
         if res is None:
             self.set_temporary_hint(
                 "<b>AWB:</b> not enough usable image content.", duration=5000)
             return
         self.on_wb_sampled(*res)
 
-    def on_wb_sampled(self, temp_value, tint_value):
-        """Apply the auto-computed temperature/tint from the WB eyedropper."""
+    def on_wb_sampled(self, r_value, g_value, b_value):
+        """Apply the auto-computed R/G/B Balance from the WB eyedropper or AWB."""
         # The WB pick is its own undo step — don't merge it into a slider burst
         self.end_undo_burst()
-        temp_idx = self.adjustment_keys.index("temperature")
-        tint_idx = self.adjustment_keys.index("tint")
-        for idx, val in ((temp_idx, temp_value), (tint_idx, tint_value)):
+        for key, val in (("balance_r", r_value), ("balance_g", g_value),
+                         ("balance_b", b_value)):
+            idx = self.adjustment_keys.index(key)
             self.sliders[idx].blockSignals(True)
             self.sliders[idx].setValue(val)
             self.sliders[idx].blockSignals(False)
@@ -1667,7 +1681,37 @@ class SlidersPanel(QWidget):
         # of leaving the canvas one render behind until the next interaction.
         self._settle_preview()
         self.set_temporary_hint(
-            f"Auto WB applied — Temperature: {temp_value}, Tint: {tint_value}.", duration=5000)
+            f"Auto WB applied — R: {r_value}, G: {g_value}, B: {b_value}.",
+            duration=5000)
+
+    # Step for the Channel Balance nudge hotkeys (U/I/O raise R/G/B, J/K/L
+    # lower). 5 gives 20 presses of full travel — the "nudge" feel of the
+    # rotate keys, rather than a jump. See spec/channel-balance.md.
+    BALANCE_HOTKEY_STEP = 5
+
+    def nudge_balance(self, channel, direction):
+        """Nudge one Channel Balance slider by BALANCE_HOTKEY_STEP.
+
+        `channel` is "r"/"g"/"b" and `direction` is +1 or -1; MainWindow binds
+        U/I/O to +1 and J/K/L to -1. Goes through the ordinary setValue path, so
+        the change debounces, repaints and merges into the in-progress undo
+        burst exactly like a drag — holding a key down is one undo step, not
+        twenty. No-op with no current image or while the sliders are disabled
+        (an unconverted image), mirroring the other shortcut handlers."""
+        if self.current_idx is None:
+            return
+        try:
+            idx = self.adjustment_keys.index(f"balance_{channel}")
+        except ValueError:
+            return
+        slider = self.sliders[idx]
+        if not slider.isEnabled():
+            return
+        target = max(slider.minimum(),
+                     min(slider.maximum(),
+                         slider.value() + direction * self.BALANCE_HOTKEY_STEP))
+        if target != slider.value():
+            slider.setValue(target)     # valueChanged -> on_slider_changed
 
     def _on_set_white_point(self):
         if hasattr(self, 'image_preview') and self.image_preview:
