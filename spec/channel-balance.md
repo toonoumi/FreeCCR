@@ -348,9 +348,44 @@ the rest stranded.
 so no Balance value changes the spread. The solver detects the unresponsive
 channel and leaves it at 0 instead of driving it to an endpoint.
 
-**AWB** shares the loop: `estimate_neutral_rgb` produces a display triple, which
-`compute_awb_balance` encodes back into the base domain as a one-pixel sample
-area and hands to the same solver.
+**AWB is a regression over the WHOLE frame**, not a solve at one estimated
+pixel. `compute_awb_balance` downscales the (cropped) frame to a 256px long
+side, and the loop renders *that* every iteration and drives the illuminant
+estimator's reading of the **rendered** result to grey. A downscale rather than
+a scattered pixel sample because `gray_edge` needs spatial neighbours. Cost is
+~350–450 ms.
+
+Solving at a single estimated pixel was fragile: the estimate is measured on the
+base, but the tone it lands on after Channel Levels and Auto Gain may be up
+where a low-anchored node has almost no authority, so the solve produced tiny or
+zero values and the button looked dead.
+
+Two scale/direction bugs in the shared loop also made AWB silently do nothing,
+and both are worth remembering when writing a new `combine`:
+
+* **`combine` must report in the render's 0–65535 scale.** `estimate_neutral_rgb`
+  returns normalised `[0,1]`; feeding that in unscaled made the flat-response
+  guard (`|hi−lo| < 8` counts) fire for every channel, so every channel was
+  declared unresponsive and left at 0. The guard and the convergence tolerance
+  are now both **relative**, so a scale mistake degrades instead of silently
+  zeroing.
+* **The measured response need not be rising.** The bisection detects direction
+  from its two endpoint probes. `gray_edge` reports gradient ENERGY, which
+  *falls* as a channel is lifted (the curve compresses above its node);
+  assuming a rising response drove it backwards, and the keep-best net then
+  discarded the result as "no change".
+
+`gray_edge` needs one further adaptation: gradient energy is not a per-channel
+*value* statistic, so driving the three energies to equality moves colour the
+wrong way regardless of direction handling. Under the closed loop it is used for
+what it actually asserts — *these* pixels carry the illuminant —
+`gray_edge_pixel_mask` selects the strongest-edge pixels once on the base (fixed,
+so the objective does not move between iterations) and the loop neutralises
+their rendered mean.
+
+Measured on a frame with a 27.6% cast: gray_world 0.4%, white_patch 1.6%,
+shades_of_gray 0.4%, gray_edge 0.4%. Through later stages (Channel Levels,
+Master Gain, Cineon) all stay under 1%.
 
 Note the correction is exact only **at the sampled tone** — inherent to a
 tone-dependent control. A picked midtone and a picked shadow legitimately give

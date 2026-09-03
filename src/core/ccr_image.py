@@ -1142,11 +1142,21 @@ class CCRImage:
     # render the sampled AREA through the real pipeline, look at what came out,
     # correct, repeat.
     NEUTRAL_SOLVE_PASSES = 8        # outer passes over (blue, green)
-    NEUTRAL_SOLVE_TOL = 0.002       # stop once the spread is under 0.2% of full scale
-    _NEUTRAL_FLAT_EPS = 8.0         # counts: below this a channel is unresponsive
+    # Convergence tolerance, RELATIVE to the measured level. Everything in this
+    # loop has to be scale-relative because `combine` may report in any
+    # magnitude — gray_edge reduces the frame to gradient energies ~50x smaller
+    # than a pixel mean, and an absolute tolerance was already satisfied at the
+    # first measurement, so AWB exited instantly with no correction at all.
+    NEUTRAL_SOLVE_TOL = 0.002       # 0.2% spread
+    # A channel is "unresponsive" when the full slider sweep moves its measured
+    # value by essentially nothing (Black & White profile). The test is RELATIVE
+    # so it holds whatever scale `combine` reports in — an absolute count
+    # threshold silently declared everything flat when a combiner returned
+    # normalised [0,1] values, which is how AWB came to do nothing at all.
+    _NEUTRAL_FLAT_REL = 1e-4
 
     def solve_neutral_balance(self, sample_patch, settings=None,
-                              passes=None) -> tuple:
+                              passes=None, combine=None) -> tuple:
         """Balance slider ints that drive the RENDERED `sample_patch` to grey.
 
         `sample_patch` is a patch of the BASE (the same neighbourhood the
@@ -1165,6 +1175,12 @@ class CCRImage:
         monotone in that channel's slider, so no model of the pipeline is
         involved. A channel whose output does not respond at all (Black & White
         profile, say) is left alone rather than driven to an endpoint.
+
+        `combine` optionally replaces "mean of the area" with another reduction
+        of the rendered sample to one RGB triple — AWB passes the illuminant
+        estimator so the loop optimises the WHOLE frame's cast instead of one
+        spot. It MUST report in the render's own 0–65535 scale (the loop's
+        tolerance is in those units). Returning None falls back to the mean.
 
         Returns (balance_r, balance_g, balance_b); balance_r is always 0."""
         from core.ccr_processor import compute_auto_gain_offset
@@ -1191,26 +1207,41 @@ class CCRImage:
             out = self.apply_adjustments(patch.copy(), settings=st,
                                          areas_override=[], ws_windowed=ws,
                                          auto_gain_override=ag, skip_dust=True)
+            if combine is not None:
+                reduced = combine(out)
+                if reduced is not None:
+                    return np.asarray(reduced, dtype=np.float64)
             return out.reshape(-1, 3).mean(axis=0).astype(np.float64)
 
         def solve_channel(idx, bal, target):
-            """Integer bisection on the MEASURED output of channel `idx`."""
+            """Integer bisection on the MEASURED output of channel `idx`.
+
+            The measurement is assumed monotone in the slider but NOT
+            necessarily increasing: gray_edge reduces the frame to gradient
+            energy, which FALLS as a channel is lifted (the curve compresses
+            above its node), so the direction is detected from the two endpoint
+            probes rather than assumed. Assuming "increasing" drove that
+            estimator the wrong way, and the keep-best net then discarded the
+            result — which is what made AWB look like it did nothing."""
             probe = list(bal)
             probe[idx] = -100
             lo_val = measure(probe)[idx]
             probe[idx] = 100
             hi_val = measure(probe)[idx]
-            if abs(hi_val - lo_val) < self._NEUTRAL_FLAT_EPS:
+            span = abs(hi_val - lo_val)
+            scale = max(abs(lo_val), abs(hi_val), 1.0)
+            if span <= self._NEUTRAL_FLAT_REL * scale:
                 return bal[idx]              # unresponsive — don't peg it
-            if lo_val >= target:
+            rising = hi_val > lo_val
+            if (lo_val >= target) if rising else (lo_val <= target):
                 return -100
-            if hi_val <= target:
+            if (hi_val <= target) if rising else (hi_val >= target):
                 return 100
             lo, hi = -100, 100
             while hi - lo > 1:
                 mid = (lo + hi) // 2
                 probe[idx] = mid
-                if measure(probe)[idx] < target:
+                if (measure(probe)[idx] < target) == rising:
                     lo = mid
                 else:
                     hi = mid
@@ -1220,23 +1251,30 @@ class CCRImage:
             d_hi = abs(measure(probe)[idx] - target)
             return lo if d_lo <= d_hi else hi
 
+        def rel_spread(m):
+            """Channel spread as a FRACTION of the measured level — see
+            NEUTRAL_SOLVE_TOL on why this must not be absolute."""
+            return float(m.max() - m.min()) / max(float(abs(m).max()), 1e-9)
+
         bal = [0, int(base_settings.get("balance_g", 0)),
                int(base_settings.get("balance_b", 0))]
         best, best_spread = list(bal), float("inf")
-        tol = self.NEUTRAL_SOLVE_TOL * 65535.0
+        tol = self.NEUTRAL_SOLVE_TOL
         for _ in range(self.NEUTRAL_SOLVE_PASSES if passes is None else passes):
             m = measure(bal)
-            spread = float(m.max() - m.min())
+            spread = rel_spread(m)
             if spread < best_spread:
                 best, best_spread = list(bal), spread
             if spread <= tol:
                 break
+            before = list(bal)
             for idx in (2, 1):               # blue first, then green
                 m = measure(bal)
                 target = float(sum(m[j] for j in range(3) if j != idx) / 2.0)
                 bal[idx] = solve_channel(idx, bal, target)
-        m = measure(bal)
-        if float(m.max() - m.min()) < best_spread:
+            if bal == before:
+                break                        # settled — further passes cannot move it
+        if rel_spread(measure(bal)) < best_spread:
             best = list(bal)
         return (0, int(best[1]), int(best[2]))
 

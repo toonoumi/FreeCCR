@@ -266,9 +266,14 @@ def test_rotated_crop_black_fill_is_masked(tmp_path):
         _real_image(tmp_path, _u16(d), crop=(0.1, 0.1, 0.9, 0.9), angle=8.0,
                     name="ang.png"),
         algorithm="gray_world")
-    # same scene statistics → within a slider unit of the straight crop
-    assert abs(angled[0] - straight[0]) <= 1
-    assert abs(angled[1] - straight[1]) <= 1
+    # Same scene statistics, so the angled crop must land essentially where the
+    # straight one did. Not bit-identical any more: the solve is a closed loop
+    # resolving to INTEGER sliders, and rotation resamples the content, so a few
+    # units of drift is expected — a skew from unmasked black fill would be a
+    # collapse toward zero, not a nudge.
+    assert abs(angled[1] - straight[1]) <= 5
+    assert abs(angled[2] - straight[2]) <= 5
+    assert any(abs(v) > 5 for v in angled), "black fill collapsed the correction"
 
 
 def test_image_without_crop_attrs_still_works(tmp_path):
@@ -428,6 +433,112 @@ def test_auto_wb_button_applies_and_shows(wb_panel, backend):
     assert img.adjustment_settings["balance_g"] > 0
     assert img.adjustment_settings["balance_b"] > 0
     assert "render" in log and log[-1] == "show"
+
+
+# --- AWB as a whole-frame regression -----------------------------------------
+#
+# AWB no longer solves at one estimated pixel; it renders a downscaled copy of
+# the frame through the real pipeline every iteration and drives the estimator's
+# reading of THAT to grey. Two scale/direction bugs made the button silently
+# dead, and both are pinned here.
+
+def _frame(tmp_path, cast=(1.0, 0.93, 0.78), name="f.png"):
+    import cv2
+    from core.ccr_processor import encode_window
+    rng = np.random.default_rng(5)
+    lum = cv2.GaussianBlur(rng.normal(0.42, 0.16, size=(240, 360)).astype(np.float32),
+                           (0, 0), 4)
+    lum[:, -30:] = 0.92                                   # a highlight region
+    lum = np.clip(lum, 0.03, 0.98)
+    disp = np.clip(np.stack([lum * c for c in cast], axis=-1), 0, 1.2)
+    img = _real_image(tmp_path, encode_window(disp), ws=True, name=name)
+    return img
+
+
+def _render_cast(img, settings):
+    """In-gate midtone cast of the RENDER, as a percentage."""
+    out = img.apply_adjustments(img.resized_raw.copy(), settings=settings)
+    d = out.reshape(-1, 3).astype(np.float32) / 65535.0
+    lum = d @ np.float32([0.299, 0.587, 0.114])
+    m = (np.all((d >= AWB_LO) & (d <= AWB_HI), axis=1)
+         & (lum >= AWB_TONE_LO) & (lum <= AWB_TONE_HI))
+    assert m.sum() > 50
+    e = d[m].mean(axis=0)
+    return float((e.max() - e.min()) / e.max() * 100.0)
+
+
+@pytest.mark.parametrize("algorithm", [a for a, _ in AWB_ALGORITHMS])
+def test_every_algorithm_actually_corrects(tmp_path, algorithm):
+    """The regression that mattered: the button must not silently do nothing.
+
+    gray_edge got there two ways — its estimate is ~50x smaller than a pixel
+    mean (an absolute convergence tolerance was already satisfied at the first
+    measurement) and it reports gradient ENERGY, which FALLS as a channel is
+    lifted, so a bisection assuming a rising response drove it backwards."""
+    img = _frame(tmp_path, name=f"{algorithm}.png")
+    res = compute_awb_balance(img, algorithm=algorithm)
+    assert res is not None
+    assert res != (0, 0, 0), f"{algorithm} did nothing"
+    before = _render_cast(img, {})
+    after = _render_cast(img, dict(balance_r=res[0], balance_g=res[1],
+                                   balance_b=res[2]))
+    assert before > 15.0
+    assert after < 3.0, f"{algorithm}: {before:.1f}% -> {after:.1f}%"
+
+
+@pytest.mark.parametrize("preset", [
+    {},
+    {"ch_r_shift": 15, "ch_g_gain": 12},
+    {"ch_master_gain": 30},
+    {"cineon_log": True},
+])
+def test_regression_holds_through_later_stages(tmp_path, preset):
+    """It optimises the RENDER, so stages after Balance are accounted for."""
+    img = _frame(tmp_path, name=f"p{abs(hash(str(preset))) % 9999}.png")
+    img.adjustment_settings = dict(preset)
+    res = compute_awb_balance(img, algorithm="gray_world")
+    after = _render_cast(img, dict(preset, balance_r=res[0], balance_g=res[1],
+                                   balance_b=res[2]))
+    assert after < 3.0
+
+
+def test_red_is_never_moved(tmp_path):
+    img = _frame(tmp_path, name="red.png")
+    assert compute_awb_balance(img, algorithm="gray_world")[0] == 0
+
+
+def test_solve_sample_is_downscaled_but_spatially_intact(tmp_path):
+    """gray_edge needs neighbours, so the whole-frame stand-in is a DOWNSCALE,
+    not a scattered pixel sample."""
+    from core.awb import downscale_for_solve, AWB_SOLVE_LONG_SIDE
+    img = _frame(tmp_path, name="ds.png")
+    small = downscale_for_solve(img.resized_raw)
+    assert small.ndim == 3 and small.shape[2] == 3
+    assert max(small.shape[:2]) == AWB_SOLVE_LONG_SIDE
+    assert min(small.shape[:2]) > 1              # still a 2-D image, not a strip
+
+
+def test_gray_edge_mask_selects_a_minority_of_pixels(tmp_path):
+    """gray_edge is used as a pixel SELECTOR under the closed loop: its raw
+    output is gradient energy, which is not a per-channel value statistic and
+    cannot be driven to grey."""
+    from core.awb import downscale_for_solve, gray_edge_pixel_mask
+    img = _frame(tmp_path, name="ge.png")
+    mask = gray_edge_pixel_mask(downscale_for_solve(img.resized_raw), True)
+    assert mask is not None
+    frac = mask.sum() / mask.size
+    assert 0.01 < frac < 0.5
+
+
+def test_result_is_idempotent(tmp_path):
+    """The estimate runs on the base, so re-running AWB on an already-corrected
+    image returns the same answer rather than compounding."""
+    img = _frame(tmp_path, name="idem.png")
+    first = compute_awb_balance(img, algorithm="gray_world")
+    img.adjustment_settings = dict(balance_r=first[0], balance_g=first[1],
+                                   balance_b=first[2])
+    second = compute_awb_balance(img, algorithm="gray_world")
+    assert second == pytest.approx(first, abs=2)
 
 
 if __name__ == "__main__":
