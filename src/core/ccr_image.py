@@ -222,8 +222,9 @@ class CCRImage:
         # of the film-NEGATIVE look; positives go straight to user adjustments
         # from a neutral baseline (no darkening), so 0 there. See spec/positive-mode.md.
         self.brightness_base: int = 0 if self._positive_mode_active() else -8
-        # Non-destructive auto-exposure (default-slope mode), in ch_input_gain
-        # units → applied as a uniform gain. See spec/auto-exposure-default-slope.md.
+        # Non-destructive auto-exposure (default-slope mode). Rides the Gain/
+        # Exposure argument (NOT ch_input_gain, despite what this comment used
+        # to say) → applied as a uniform gain. See spec/auto-exposure-default-slope.md.
         self.exposure_base: float = 0.0
         # True when the current converted base is a WINDOWED working-space buffer
         # (highlight headroom preserved); apply_adjustments de-windows it. Set by

@@ -533,6 +533,16 @@ class SlidersPanel(QWidget):
         convert_row.addWidget(self.convert_all_bwp_btn)
         scroll_layout.addLayout(convert_row)
 
+        # Channel Levels sits directly under the Convert row and above the
+        # WB/AWB row: it is the FIRST stage of the adjustment pipeline (it runs
+        # un-clamped, ahead of White Balance and the look domain), so it reads
+        # top-to-bottom in pipeline order. See spec/channel-levels-pre-clamp.md.
+        # Created here but POPULATED further below, in the strict create_slider()
+        # order that the positional ADJUSTMENT_KEYS zip requires.
+        scroll_layout.addWidget(theme.section_separator())
+        self.od_section = CollapsibleSection("Channel Levels")
+        scroll_layout.addWidget(self.od_section)
+
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
 
@@ -634,13 +644,14 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(sync_layout)
 
         # --- Collapsible sections ---
-        # Display order (top→bottom): Curves, Subtractive Saturations, Channel
-        # Levels (last). The section WIDGETS are placed here in display order,
-        # but their SLIDERS are created further below in the strict order that
-        # ADJUSTMENT_KEYS requires (Channel Levels before bands). Placement and
-        # population are decoupled because each CollapsibleSection holds its own
-        # content layout, so create_slider() append order is independent of where
-        # the section sits in scroll_layout.
+        # Display order (top→bottom): Channel Levels (placed far above, right
+        # under the Convert row — it is the first pipeline stage), then Curves
+        # and Subtractive Saturations here. The section WIDGETS are placed in
+        # display order, but their SLIDERS are created further below in the
+        # strict order that ADJUSTMENT_KEYS requires (Channel Levels before
+        # bands). Placement and population are decoupled because each
+        # CollapsibleSection holds its own content layout, so create_slider()
+        # append order is independent of where the section sits in scroll_layout.
         def _section_separator():
             return theme.section_separator()
 
@@ -652,11 +663,8 @@ class SlidersPanel(QWidget):
         self.band_section = CollapsibleSection("Subtractive Saturations")
         scroll_layout.addWidget(self.band_section)
 
-        scroll_layout.addWidget(_section_separator())
-        self.od_section = CollapsibleSection("Channel Levels")
-        scroll_layout.addWidget(self.od_section)
-
-        # --- Populate Channel Levels (sliders[10]–[21]) ---
+        # --- Populate Channel Levels (the section widget itself is placed far
+        # above, just under the Convert row) ---
         # MUST be created before the band sliders to keep the ADJUSTMENT_KEYS
         # positional mapping (channel keys precede band keys), regardless of the
         # section's display position above.
