@@ -129,7 +129,7 @@ def test_effect_is_tone_weighted_toward_the_low_end():
 
 def test_sign_direction():
     """+s raises the channel at the node, -s lowers it. The magnitudes are NOT
-    equal — a node at x=1/8 has far more room above it than below — so only the
+    equal — a node low on the curve has far more room above it than below — so only the
     direction is asserted here; the gamma symmetry is checked above."""
     up = float(_balance_curve(40, BALANCE_NODE_X)) - BALANCE_NODE_X
     down = float(_balance_curve(-40, BALANCE_NODE_X)) - BALANCE_NODE_X

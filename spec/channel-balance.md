@@ -182,32 +182,38 @@ Per channel, three control points in the normalised display domain:
 with
 
 ```
-X0    = 0.125                               # BALANCE_NODE_X  (1/8)
+X0    = 0.1875                              # BALANCE_NODE_X  (3/16)
 stops = (slider / 100) * 1.5                # BALANCE_MAX_STOPS
 y     = X0 ** (1 / 2**stops)                # the node moves in GAMMA
 ```
 
-`X0 = 1/8` is the node position the maintainer settles on in practice — well
-down in the toe, where crossover actually lives. It is materially lower than a
-midpoint control: the correction concentrates in the deep shadows and has faded
-to almost nothing by the midtones, which is exactly why it fixes casts that
-Temperature/Tint (and any tone-uniform offset) cannot.
+`X0 = 3/16` sits between 1/8 and 1/4 — low in the toe, where crossover actually
+lives, but not so low that it wrenches the darkest tones. It is materially lower
+than a midpoint control: the correction concentrates in the shadows and low
+midtones and has faded to almost nothing by the highlights, which is exactly why
+it fixes casts that Temperature/Tint (and any tone-uniform offset) cannot.
+
+**Why not 1/8.** At `X0 = 1/8` the curve bit too hard in the deep shadows — a
+full `+100` moved `x = 0.05` by `+0.167`. At 3/16 that drops to `+0.111`, a third
+less, while the PEAK deviation is essentially unchanged (`+0.40` vs `+0.41`): the
+control keeps its reach and loses only the deep-shadow harshness. Moving the node
+up also buys downward range, since it can fall further before hitting 0.
 
 **The node moves in gamma, not by a linear offset.** A linear offset has to stay
 below `X0` or the node crosses the pinned `(0,0)` endpoint and breaks
-monotonicity — which capped downward travel at 0.125 and, for symmetry, capped
+monotonicity — which capped downward travel at `X0` and, for symmetry, capped
 upward travel with it. That cap is why a heavily yellow frame could not be fully
 corrected at the slider ends. A gamma move approaches 0 and 1 asymptotically, so
 **no endpoint-crossing invariant exists to violate at any slider value**, and
 the upward side is freed from the downward side's geometric limit.
 
-At `±100` the peak deviation from identity is about **+0.41 / −0.22**, roughly
-**3× / 1.6×** the old linear scheme. The correction that used to need the whole
+At `±100` the peak deviation from identity is about **+0.40 / −0.26**, roughly
+**3× / 1.8×** the old linear scheme. The correction that used to need the whole
 slider now sits near 30, leaving real headroom above it.
 
-The asymmetry is inherent, not a defect: a node at `x = 1/8` moving vertically
-can rise most of the way to 1 but can never fall further than 1/8, so the
-downward side saturates near −0.24 peak deviation whatever the scaling.
+The asymmetry is inherent, not a defect: a node at `x = 3/16` moving vertically
+can rise most of the way to 1 but can never fall further than 3/16, so the
+downward side saturates near −0.26 peak deviation whatever the scaling.
 `BALANCE_MAX_STOPS = 1.5` already sits within a hair of that limit, so raising
 the constant further buys upward range only. A cast needing more downward travel
 wants Channel Levels or the Curves editor as well.
@@ -424,7 +430,7 @@ No change to: the OpenCL kernel, `catalog.py`, `dcp_profile.py`,
    untouched; `-50` lowers it.
 5. **Tone weighting** — the deviation from identity is 0 at both endpoints,
    peaks in the lower half (measured: max near `d ≈ 0.30` for a node at
-   `X0 = 0.125`), and has decayed to under a fifth of its peak by `d = 0.9`.
+   `X0 = 3/16`), and has decayed to under a fifth of its peak by `d = 0.9`.
    This is the property that distinguishes Balance from Channel Levels Shift,
    which is uniform across every tone. Note the peak sits ABOVE `X0`: a
    3-point monotone cubic spreads a low node's influence through the low

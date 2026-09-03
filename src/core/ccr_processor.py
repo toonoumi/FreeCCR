@@ -1213,7 +1213,7 @@ def _white_balance_gains(kelvin_shift: float, tint_shift: float,
 # _monotone_cubic lives in the Curves section further down — the same
 # interpolator the Curves editor and the Gamma slider use, so a Balance move is
 # exactly what dragging that node by hand in Curves would give.
-BALANCE_NODE_X = 0.125       # node position (1/8) in the normalised display domain
+BALANCE_NODE_X = 0.1875      # node position (3/16) in the normalised display domain
 BALANCE_MAX_STOPS = 1.5      # node gamma at slider +-100 is 2**+-1.5
 
 _BALANCE_LUT_N = 1024
@@ -1235,9 +1235,16 @@ def balance_curve_points(value: float):
     roughly 3x / 1.6x the old linear scheme; the correction that used to need
     the full slider now sits near 30.
 
-    Note the asymmetry is real, not a bug: a node at x=1/8 moving vertically can
-    rise most of the way to 1 but can never fall further than 1/8, so the
-    downward side saturates near -0.24 peak deviation whatever the scaling. A
+    Node position is 3/16 - between 1/8 and 1/4. At 1/8 the curve bit too hard
+    in the deep shadows (at x=0.05 a full +100 moved +0.167); 3/16 cuts that to
+    +0.111 while leaving the PEAK deviation essentially unchanged (+0.40 vs
+    +0.41), so the control keeps its reach but stops wrenching the darkest tones.
+    Moving the node up also buys downward range, because the node can then fall
+    further before hitting 0.
+
+    Note the asymmetry is real, not a bug: a node at x=3/16 moving vertically can
+    rise most of the way to 1 but can never fall further than 3/16, so the
+    downward side saturates near -0.26 peak deviation whatever the scaling. A
     cast needing more than that wants Channel Levels or the Curves editor as
     well."""
     stops = (float(np.clip(value, -100.0, 100.0)) / 100.0) * BALANCE_MAX_STOPS
