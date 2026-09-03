@@ -2,9 +2,9 @@
 """Tests for Auto White Balance (spec/auto-white-balance.md).
 
 AWB estimates the neutral (cast) color of the converted base with a classical,
-learning-free algorithm and feeds it through compute_neutral_temp_tint — the
-same inverse the WB eyedropper uses — so the result lands on the
-Temperature/Tint sliders. Pure numpy core, runs headless.
+learning-free algorithm and feeds it through compute_neutral_balance — the same
+inverse the WB eyedropper uses — so the result lands on the R/G/B Balance
+sliders (spec/channel-balance.md). Pure numpy core, runs headless.
 """
 import os
 import sys
@@ -19,10 +19,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from core.awb import (  # noqa: E402
     AWB_ALGORITHMS, AWB_DEFAULT, AWB_LO, AWB_HI, AWB_TONE_LO, AWB_TONE_HI,
-    estimate_neutral_rgb, compute_awb_temp_tint,
+    estimate_neutral_rgb, compute_awb_balance,
 )
 from core.ccr_processor import (  # noqa: E402
-    _white_balance_gains, compute_neutral_temp_tint, encode_window,
+    _balance_curve, compute_neutral_balance, encode_window,
 )
 
 CAST = (1.25, 1.0, 0.8)          # warm illuminant (R high, B low)
@@ -175,27 +175,29 @@ def test_windowed_and_full_range_agree():
 # --- estimate → sliders → gains round-trip -----------------------------------
 
 def test_roundtrip_neutralizes_the_cast():
-    """Applying the AWB-computed temp/tint through the real WB gain stage makes
-    the scene's channel means meet (within int-slider quantization)."""
+    """Applying the AWB-computed Balance through the real Balance curve makes
+    the estimated channel values meet (within int-slider quantization).
+
+    The check is AT the estimated tone, which is what a tone-weighted control
+    can neutralize — unlike the old flat WB gain, a Balance move does not
+    neutralize every tone at once, by design."""
     d = _cast_scene(np.random.default_rng(4))
     est = estimate_neutral_rgb(_u16(d), algorithm="gray_world")
-    temp, tint = compute_neutral_temp_tint(*est)
-    gr, gg, gb = _white_balance_gains(temp, tint)
-    means = d.reshape(-1, 3).mean(axis=0) * (gr, gg, gb)
-    # one temp slider unit moves R/B by 0.4% each → ~1.6% worst-case spread
-    assert means.max() / means.min() == pytest.approx(1.0, abs=0.02)
+    vals = compute_neutral_balance(*est)
+    got = [float(_balance_curve(s, v)) for s, v in zip(vals, est)]
+    assert max(got) - min(got) < 0.005
 
 
-def test_estimate_is_scale_invariant():
-    """compute_neutral_temp_tint sees ratios only — the estimate's scale (0-1
-    vs 0-65535 domain) must not change the slider result."""
-    est = (0.55, 0.47, 0.40)
-    a = compute_neutral_temp_tint(*est)
-    b = compute_neutral_temp_tint(*(v * 65535.0 for v in est))
-    assert a == b
+def test_estimate_domain_is_normalised():
+    """estimate_neutral_rgb must hand compute_neutral_balance NORMALISED [0,1]
+    display units. Balance is tone-DEPENDENT, so (unlike the old ratio-only
+    temp/tint inverse) the absolute scale is part of the answer."""
+    est = estimate_neutral_rgb(_u16(_cast_scene(np.random.default_rng(5))),
+                               algorithm="gray_world")
+    assert all(0.0 <= v <= 1.0 for v in est)
 
 
-# --- compute_awb_temp_tint on an image-like object ---------------------------
+# --- compute_awb_balance on an image-like object -----------------------------
 
 class _StubImage:
     def __init__(self, base, ws=False, converted=True, crop=None, angle=0.0):
@@ -208,17 +210,18 @@ class _StubImage:
         self.crop_angle = angle
 
 
-def test_compute_awb_temp_tint_stub_image():
+def test_compute_awb_balance_stub_image():
     d = _cast_scene(np.random.default_rng(5))
-    res = compute_awb_temp_tint(_StubImage(_u16(d)), algorithm="gray_world")
+    res = compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world")
     assert res is not None
-    temp, tint = res
-    assert temp < -20            # warm cast → cool correction, well off zero
-    assert -100 <= temp <= 100 and -100 <= tint <= 100
+    br, bg, bb = res
+    # Warm cast (R high, B low) → pull R down and push B up.
+    assert br < 0 and bb > 0
+    assert all(-100 <= v <= 100 for v in res)
 
 
-def test_compute_awb_temp_tint_no_base():
-    assert compute_awb_temp_tint(_StubImage(None), algorithm="gray_world") is None
+def test_compute_awb_balance_no_base():
+    assert compute_awb_balance(_StubImage(None), algorithm="gray_world") is None
 
 
 # --- crop awareness -----------------------------------------------------------
@@ -231,11 +234,11 @@ def test_crop_region_drives_the_estimate():
     d = _cast_scene(rng, cast=(0.7, 1.0, 1.3), shape=(128, 128))   # cool junk
     d[32:96, 32:96, :] = inside                                     # centered 50%
     crop = (0.25, 0.25, 0.75, 0.75)
-    cropped = compute_awb_temp_tint(
+    cropped = compute_awb_balance(
         _StubImage(_u16(d), crop=crop), algorithm="gray_world")
-    interior_only = compute_awb_temp_tint(
+    interior_only = compute_awb_balance(
         _StubImage(_u16(inside)), algorithm="gray_world")
-    full = compute_awb_temp_tint(_StubImage(_u16(d)), algorithm="gray_world")
+    full = compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world")
     assert cropped == interior_only
     assert cropped != full
 
@@ -244,9 +247,9 @@ def test_rotated_crop_black_fill_is_masked():
     """An angled crop samples outside the source (black fill); those pixels
     sit below AWB_LO and must not skew the estimate toward neutral-dark."""
     d = _cast_scene(np.random.default_rng(11), shape=(96, 96))
-    straight = compute_awb_temp_tint(
+    straight = compute_awb_balance(
         _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9)), algorithm="gray_world")
-    angled = compute_awb_temp_tint(
+    angled = compute_awb_balance(
         _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9), angle=8.0),
         algorithm="gray_world")
     # same scene statistics → within a slider unit of the straight crop
@@ -258,7 +261,7 @@ def test_stub_without_crop_attrs_still_works():
     """The hook may see images predating the crop feature — getattr defaults."""
     img = _StubImage(_u16(_cast_scene(np.random.default_rng(12))))
     del img.crop_rect, img.crop_angle
-    assert compute_awb_temp_tint(img, algorithm="gray_world") is not None
+    assert compute_awb_balance(img, algorithm="gray_world") is not None
 
 
 # --- the post-conversion hook (backend policy) --------------------------------
@@ -276,12 +279,13 @@ def test_hook_writes_when_unset(backend):
     backend.awb_algorithm = "gray_world"
     img = _StubImage(_u16(_cast_scene(np.random.default_rng(6))))
     backend.maybe_auto_awb(img)
-    assert img.adjustment_settings.get("temperature", 0) != 0
-    assert "tint" in img.adjustment_settings
+    assert any(img.adjustment_settings.get(k, 0)
+               for k in ("balance_r", "balance_g", "balance_b"))
+    assert "balance_g" in img.adjustment_settings
 
 
-@pytest.mark.parametrize("preset", [{"temperature": 5}, {"tint": -3},
-                                    {"temperature": 2, "tint": 1}])
+@pytest.mark.parametrize("preset", [{"balance_r": 5}, {"balance_g": -3},
+                                    {"balance_b": 2, "balance_r": 1}])
 def test_hook_never_clobbers_saved_wb(backend, preset):
     backend.auto_awb = True
     img = _StubImage(_u16(_cast_scene(np.random.default_rng(7))))
@@ -379,12 +383,13 @@ def wb_panel(tmp_path):
 
 
 def test_wb_result_is_rendered_before_it_is_shown(wb_panel):
-    """The eyedropper/AWB apply path: the new temp/tint reach the settings AND
-    the canvas is repainted from a fresh render, in that order."""
+    """The eyedropper/AWB apply path: the new Balance values reach the settings
+    AND the canvas is repainted from a fresh render, in that order."""
     panel, img, log = wb_panel
-    panel.on_wb_sampled(-30, 12)
-    assert img.adjustment_settings["temperature"] == -30
-    assert img.adjustment_settings["tint"] == 12
+    panel.on_wb_sampled(-30, 12, 7)
+    assert img.adjustment_settings["balance_r"] == -30
+    assert img.adjustment_settings["balance_g"] == 12
+    assert img.adjustment_settings["balance_b"] == 7
     assert "render" in log            # not just the stale cached preview
     assert log[-1] == "show"          # ...and the fresh render is what's shown
 
@@ -393,7 +398,7 @@ def test_wb_apply_leaves_no_pending_reprocess(wb_panel):
     """The debounced reprocess is cancelled — the final state was rendered now,
     so nothing is left queued to redo it."""
     panel, _img, _log = wb_panel
-    panel.on_wb_sampled(-30, 12)
+    panel.on_wb_sampled(-30, 12, 7)
     assert panel._pending_adjustment is None
     assert not panel._debounce_timer.isActive()
 
@@ -404,7 +409,9 @@ def test_auto_wb_button_applies_and_shows(wb_panel, backend):
     panel, img, log = wb_panel
     backend.awb_algorithm = "gray_world"
     panel._on_auto_wb()
-    assert img.adjustment_settings["temperature"] < 0      # warm cast → cooled
+    # Warm cast (R high, B low) → R pulled down, B pushed up.
+    assert img.adjustment_settings["balance_r"] < 0
+    assert img.adjustment_settings["balance_b"] > 0
     assert "render" in log and log[-1] == "show"
 
 

@@ -142,8 +142,8 @@ class SettingsDialog(QDialog):
         gw.addWidget(self._cb_auto_awb)
         gw.addWidget(self._muted(
             "When a negative is converted, automatically estimate the color "
-            "cast and set the Temperature/Tint sliders — only for images with "
-            "no white balance already set. The AWB button applies the same "
+            "cast and set the R/G/B Balance sliders — only for images with "
+            "no balance already set. The AWB button applies the same "
             "estimate on demand."))
         algo_row = QHBoxLayout()
         algo_row.setSpacing(theme.GAP_ROW)

@@ -393,7 +393,7 @@ class GraphicsImageView(QGraphicsView):
 
     def _sample_wb_point(self, scene_pos):
         """Sample a small neighborhood at the clicked point and auto-set the
-        temperature/tint sliders so that point becomes neutral."""
+        R/G/B Balance sliders so that point becomes neutral."""
         pw = self.parent_widget
         display_transform = self._display_transform()
         if not display_transform.isInvertible():
@@ -419,16 +419,19 @@ class GraphicsImageView(QGraphicsView):
         # A windowed working-space base is in container codes, not display values;
         # de-window (+ window-clamp) the sample so the neutral pick matches the
         # displayed positive (a no-op when the feature is off / base is full-range).
+        # Channel Balance is TONE-weighted, so the inverse needs the sample in
+        # NORMALISED [0,1] display units, not the 0-65535 scale the old
+        # temperature/tint inverse took (it used channel ratios only).
         if getattr(img_obj, '_ws_windowed', False):
             from core.ccr_processor import WS_B, WS_W
-            means = np.clip((means - WS_B) / (WS_W - WS_B), 0.0, 1.0) * 65535.0
+            means = np.clip((means - WS_B) / (WS_W - WS_B), 0.0, 1.0)
+        else:
+            means = np.clip(means / 65535.0, 0.0, 1.0)
 
-        from core.ccr_processor import compute_neutral_temp_tint
-        temp, tint = compute_neutral_temp_tint(
-            means[0], means[1], means[2],
-            getattr(img_obj, 'tint_balance_factor', 1.0))
+        from core.ccr_processor import compute_neutral_balance
+        balance = compute_neutral_balance(means[0], means[1], means[2])
         try:
-            pw.parent().parent().sliders_panel.on_wb_sampled(temp, tint)
+            pw.parent().parent().sliders_panel.on_wb_sampled(*balance)
         except AttributeError:
             pass
 
@@ -1560,7 +1563,7 @@ class ImagePreview(QWidget):
 
     def set_wb_pick_mode(self, enabled):
         """Eyedropper mode: next click on the image picks a neutral point
-        for automatic temperature/tint adjustment."""
+        for automatic R/G/B Balance adjustment."""
         if enabled and self.crop_mode:
             self.cancel_crop_mode()
         if enabled and self.slice_mode:

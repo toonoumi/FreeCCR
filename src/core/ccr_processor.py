@@ -1199,6 +1199,115 @@ def _white_balance_gains(kelvin_shift: float, tint_shift: float,
     return float(gr), float(gg), float(gb)
 
 
+# --- Channel Balance: per-channel low-anchored curve node -------------------
+# See spec/channel-balance.md. One control point per channel, low on that
+# channel's tone curve, moved vertically with both endpoints pinned. It corrects
+# CROSSOVER — a cast that varies with tone — which no tone-uniform control can
+# reach: Channel Levels' Shift is a density OFFSET and its Gain a per-channel
+# SLOPE, and neither can make the shadows a different colour from the highlights.
+#
+# This is also why Temperature/Tint reads wrong on a negative: on a bw or
+# no-anchor conversion the display value IS optical density, so WB's flat
+# multiply is a per-channel gamma change, not a colour shift.
+#
+# _monotone_cubic lives in the Curves section further down — the same
+# interpolator the Curves editor and the Gamma slider use, so a Balance move is
+# exactly what dragging that node by hand in Curves would give.
+BALANCE_NODE_X = 0.125       # node position (1/8) in the normalised display domain
+BALANCE_MAX_OFFSET = 0.10    # vertical travel at slider +-100
+# Invariant: MAX_OFFSET < NODE_X and NODE_X + MAX_OFFSET < 1, so the node can
+# never cross either pinned endpoint. Re-check both when retuning NODE_X.
+_BALANCE_LUT_N = 1024
+_BALANCE_LUT_X = np.linspace(0.0, 1.0, _BALANCE_LUT_N, dtype=np.float32)
+
+
+def balance_curve_points(value: float):
+    """The three control points [(x, y)] for a Balance slider value, in the
+    NORMALISED [0,1] display domain. value=0 -> the identity diagonal."""
+    off = (float(np.clip(value, -100.0, 100.0)) / 100.0) * BALANCE_MAX_OFFSET
+    return [(0.0, 0.0), (BALANCE_NODE_X, BALANCE_NODE_X + off), (1.0, 1.0)]
+
+
+def _balance_curve(value: float, xq):
+    """Evaluate the Balance curve for `value` at `xq` (scalar or array)."""
+    pts = balance_curve_points(value)
+    return _monotone_cubic([p[0] for p in pts], [p[1] for p in pts], xq)
+
+
+def _balance_lut(value: float) -> np.ndarray:
+    """_BALANCE_LUT_N-entry float32 LUT of the Balance curve over [0,1]."""
+    return _balance_curve(value, _BALANCE_LUT_X).astype(np.float32)
+
+
+def _channel_balance_active(balance_r, balance_g, balance_b) -> bool:
+    """True when any Balance slider is off zero (the stage is a no-op otherwise,
+    and skipping it keeps a neutral render bit-exact)."""
+    return balance_r != 0.0 or balance_g != 0.0 or balance_b != 0.0
+
+
+def _apply_channel_balance(d: np.ndarray, balance_r: float, balance_g: float,
+                           balance_b: float) -> np.ndarray:
+    """Channel Balance on float DISPLAY values `d` (0 = display black, 1 =
+    display white). Index 0=R, 1=G, 2=B. Modifies `d` in place.
+
+    Values OUTSIDE [0,1] pass through UNCHANGED. The curve pins both endpoints,
+    so identity-outside is continuous at 0 and at 1 — and it is what preserves
+    the shadow margin (sub-base film density) and the highlight headroom that
+    the un-clamped windowed path carries. Clamping into the LUT instead would
+    flatten the whole shadow margin onto 0 and destroy exactly the film-base
+    separation spec/channel-levels-pre-clamp.md §3.4 exists to protect.
+
+    The same function serves the windowed and non-windowed paths (the latter on
+    `img/65535`), which is what makes CPU/GPU parity exact rather than merely
+    within tolerance."""
+    for c, v in enumerate((balance_r, balance_g, balance_b)):
+        if v == 0.0:
+            continue
+        ch = d[..., c]                        # view — writes land in `d`
+        inside = (ch >= 0.0) & (ch <= 1.0)
+        ch[inside] = np.interp(ch[inside], _BALANCE_LUT_X,
+                               _balance_lut(v)).astype(np.float32)
+    return d
+
+
+def compute_neutral_balance(r: float, g: float, b: float) -> tuple:
+    """Balance slider ints [-100, 100] that neutralize a sampled cast.
+
+    `r`, `g`, `b` are NORMALISED display values in [0,1] — the domain the
+    Balance curve operates on. (compute_neutral_temp_tint took 0–65535 and used
+    ratios only; a tone-DEPENDENT control needs the absolute tone, not the
+    ratio, so both callers now pass normalised values.)
+
+    Targets the mean of the three, so the overall level is preserved and only
+    the cast moves. curve_s(v) is monotone in the slider value s for a fixed v,
+    so each channel is an independent bisection; there is no closed form because
+    the Fritsch-Carlson tangent limiter makes curve_s(v) piecewise in s. Targets
+    out of reach clamp to the endpoint instead of raising.
+
+    The correction is exact only AT the sampled tone — inherent to a
+    tone-weighted control, and the reason a picked shadow and a picked midtone
+    legitimately give different answers."""
+    vals = [float(np.clip(v, 0.0, 1.0)) for v in (r, g, b)]
+    target = sum(vals) / 3.0
+    out = []
+    for v in vals:
+        lo, hi = -100.0, 100.0
+        if float(_balance_curve(hi, v)) <= target:
+            out.append(100)
+            continue
+        if float(_balance_curve(lo, v)) >= target:
+            out.append(-100)
+            continue
+        for _ in range(24):                   # ~1e-5 slider units — far below 1 step
+            mid = 0.5 * (lo + hi)
+            if float(_balance_curve(mid, v)) < target:
+                lo = mid
+            else:
+                hi = mid
+        out.append(int(round(0.5 * (lo + hi))))
+    return tuple(out)
+
+
 # --- Channel Levels: the FIRST adjustment stage (spec/channel-levels-pre-clamp.md)
 # Slider -> parameter mappings. All three sliders share one divisor so the
 # controls stay predictable relative to each other.
@@ -1301,7 +1410,9 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                                   ch_g_shift: float = 0.0, ch_g_gain: float = 0.0,
                                   ch_g_blackpoint: float = 0.0,
                                   ch_b_shift: float = 0.0, ch_b_gain: float = 0.0,
-                                  ch_b_blackpoint: float = 0.0) -> np.ndarray:
+                                  ch_b_blackpoint: float = 0.0,
+                                  balance_r: float = 0.0, balance_g: float = 0.0,
+                                  balance_b: float = 0.0) -> np.ndarray:
     """De-window a windowed base, apply the highlight-recovery controls UN-clamped
     (so headroom can be pulled back below white), then clamp to the display window
     and return a normal full-range [0,65535] positive for the look chain. This
@@ -1334,6 +1445,15 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
                               clamp=False)
+    # Channel Balance - the tone-WEIGHTED per-channel control, right after the
+    # tone-uniform one and in the slot Temperature/Tint used to occupy. It runs
+    # AFTER Channel Levels deliberately: on a windowed base much of the data
+    # still sits outside [0,1] (film base below black, headroom above white),
+    # where the node is identity, so Levels must place the histogram in the
+    # window first for the node to bite where the user actually sees it.
+    # Un-clamped like everything else here. See spec/channel-balance.md §4.2.
+    if _channel_balance_active(balance_r, balance_g, balance_b):
+        _apply_channel_balance(d, balance_r, balance_g, balance_b)
     # White balance - flat per-channel gain in the scene-linear working domain
     # (before the window clamp) so a warm/cool shift lands in headroom (recoverable)
     # instead of clipping, and cooling can pull highlights back. Index 0=R,1=G,2=B.
@@ -2708,6 +2828,14 @@ def adjust_image(
     sub_saturation: float = 0.0,
     band_settings: dict = None,
     ws_windowed: bool = False,
+    # Channel Balance (spec/channel-balance.md). Appended at the END of the
+    # signature, NOT next to kelvin_shift/tint_shift where it belongs
+    # conceptually: adjust_image is called positionally in several places
+    # (e.g. tests/test_channel_levels.py:78, tests/test_opencl_accuracy.py:98),
+    # so inserting mid-signature would silently shift every argument after it.
+    balance_r: float = 0.0,
+    balance_g: float = 0.0,
+    balance_b: float = 0.0,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -2726,11 +2854,15 @@ def adjust_image(
                                               ch_input_gain, ch_master_shift, ch_master_gain,
                                               ch_r_shift, ch_r_gain, ch_r_blackpoint,
                                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                                              ch_b_shift, ch_b_gain, ch_b_blackpoint)
+                                              ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                                              balance_r, balance_g, balance_b)
         exposure = 0.0       # consumed by the recovery pre-stage
         whitepoint = 0.0     # White Point is the headroom-recovery control here
         kelvin_shift = 0.0   # White Balance consumed (flat per-channel gain, pre-clamp)
         tint_shift = 0.0
+        # Channel Balance consumed too — it ran inside the recovery, un-clamped,
+        # right after Channel Levels. Zero it so the block below can't re-apply it.
+        balance_r = balance_g = balance_b = 0.0
         # Channel Levels consumed too — it ran FIRST, un-clamped, inside the
         # recovery (spec/channel-levels-pre-clamp.md). Zero it so the block
         # below can't apply it a second time.
@@ -2754,6 +2886,17 @@ def adjust_image(
                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
                               clamp=True)
+        img *= np.float32(65535.0)
+
+    # Channel Balance - the tone-weighted per-channel control, after Channel
+    # Levels and before White Balance, mirroring the windowed order. Only
+    # reached on a NON-windowed base (reference mode, positive mode, area
+    # layers); a windowed base consumed it above. uint16 input means every value
+    # is already inside [0,1] here, so the identity-outside rule is a no-op.
+    # See spec/channel-balance.md.
+    if _channel_balance_active(balance_r, balance_g, balance_b):
+        img /= np.float32(65535.0)
+        _apply_channel_balance(img, balance_r, balance_g, balance_b)
         img *= np.float32(65535.0)
 
     # White balance - flat per-channel gain (spec/working-space-white-balance.md).
@@ -3146,6 +3289,11 @@ def adjust_image_opencl(
     sub_saturation: float = 0.0,
     band_settings: dict = None,
     ws_windowed: bool = False,
+    # Channel Balance — appended at the END of the signature for the same
+    # positional-compatibility reason as adjust_image. See spec/channel-balance.md.
+    balance_r: float = 0.0,
+    balance_g: float = 0.0,
+    balance_b: float = 0.0,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -3164,12 +3312,17 @@ def adjust_image_opencl(
                                               ch_input_gain, ch_master_shift, ch_master_gain,
                                               ch_r_shift, ch_r_gain, ch_r_blackpoint,
                                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                                              ch_b_shift, ch_b_gain, ch_b_blackpoint)
+                                              ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                                              balance_r, balance_g, balance_b)
         exposure = 0.0
         whitepoint = 0.0
         ws_windowed = False
         kelvin_shift = 0.0
         tint_shift = 0.0
+        # Channel Balance ran inside the pre-stage too (after Channel Levels,
+        # un-clamped) — zero it so neither the kernel path nor the CPU fallback
+        # below can apply it twice. See spec/channel-balance.md.
+        balance_r = balance_g = balance_b = 0.0
         # Channel Levels ran FIRST, un-clamped, inside the pre-stage — zero it so
         # the kernel (and the CPU fallback below) can't re-apply it. This is what
         # makes GPU/CPU parity free on the windowed path: the kernel never sees
@@ -3178,6 +3331,36 @@ def adjust_image_opencl(
         ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
         ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
         ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
+
+    # Channel Balance - done in numpy so the kernel (and the CPU fallback) never
+    # apply it -> exact CPU/GPU parity, and no kernel change at all. ws consumed
+    # above; this covers the non-windowed bases. Placed immediately before the
+    # WB block so the Balance -> White Balance order matches adjust_image.
+    if _channel_balance_active(balance_r, balance_g, balance_b):
+        img16 = img16.astype(np.float32)
+        img16 /= np.float32(65535.0)
+        # Channel Levels runs BEFORE Balance (adjust_image's order, and the
+        # windowed pre-stage's). The KERNEL applies Levels internally, which
+        # would land it AFTER this numpy block and break CPU/GPU parity — so
+        # when both stages are active, consume Levels in numpy here too and zero
+        # it for the kernel, the same trick the windowed path uses. Reached only
+        # when Balance is non-zero, so no existing render changes.
+        if _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
+                                  ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                  ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                  ch_b_shift, ch_b_gain, ch_b_blackpoint):
+            _apply_channel_levels(img16, ch_input_gain, ch_master_shift, ch_master_gain,
+                                  ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                  ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                  ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                                  clamp=True)
+            ch_input_gain = ch_master_shift = ch_master_gain = 0.0
+            ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
+            ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
+            ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
+        _apply_channel_balance(img16, balance_r, balance_g, balance_b)
+        img16 *= np.float32(65535.0)
+        balance_r = balance_g = balance_b = 0.0
 
     # White balance - flat per-channel gain done in numpy so the kernel (and the
     # CPU fallback) never apply WB -> automatic CPU/GPU parity. ws consumed above.
@@ -3206,7 +3389,11 @@ def adjust_image_opencl(
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
                           sub_saturation=sub_saturation,
-                          band_settings=band_settings)
+                          band_settings=band_settings,
+                          # Consumed in numpy above (zeroed); passed explicitly
+                          # so the fallback stays correct if that block moves.
+                          balance_r=balance_r, balance_g=balance_g,
+                          balance_b=balance_b)
 
     try:
       # Serialize GPU submissions: the hi-res zoom worker may run this
@@ -3272,7 +3459,11 @@ def adjust_image_opencl(
                           ch_g_shift, ch_g_gain, ch_g_blackpoint,
                           ch_b_shift, ch_b_gain, ch_b_blackpoint,
                           sub_saturation=sub_saturation,
-                          band_settings=band_settings)
+                          band_settings=band_settings,
+                          # Consumed in numpy above (zeroed); passed explicitly
+                          # so the fallback stays correct if that block moves.
+                          balance_r=balance_r, balance_g=balance_g,
+                          balance_b=balance_b)
 
 
 

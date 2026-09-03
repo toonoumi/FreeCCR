@@ -3,14 +3,14 @@
 Learning-free estimators over the converted base (spec/auto-white-balance.md).
 Each algorithm returns the RGB triple that *should* be neutral — exactly what a
 perfect grey-spot pick would sample — so the result feeds
-compute_neutral_temp_tint unchanged and lands on the Temperature/Tint sliders
-through the same inverse the WB eyedropper uses.
+compute_neutral_balance unchanged and lands on the R/G/B Balance sliders
+through the same inverse the WB eyedropper uses. See spec/channel-balance.md.
 """
 
 import numpy as np
 
 from core.ccr_processor import (MIN_CONTENT_FRACTION, WS_B, _WS_INV_WIDTH,
-                                apply_crop_to_image, compute_neutral_temp_tint)
+                                apply_crop_to_image, compute_neutral_balance)
 
 # (id, UI label) — ordered as shown in the Settings dropdown.
 AWB_ALGORITHMS = [
@@ -69,7 +69,9 @@ def _gray_edge_estimate(d, valid_mask):
 def estimate_neutral_rgb(base_u16, ws_windowed=False, algorithm=AWB_DEFAULT):
     """Estimated neutral (cast) RGB triple of a converted base, or None when
     there is not enough usable content. The scale is arbitrary —
-    compute_neutral_temp_tint only uses channel ratios. Index 0=R, 1=G, 2=B.
+    Values are NORMALISED display units in [0,1] — the domain
+    compute_neutral_balance needs (a tone-weighted control needs the absolute
+    tone, not just the ratio). Index 0=R, 1=G, 2=B.
     Only midtone pixels vote (AWB_LO/AWB_HI + AWB_TONE_LO/AWB_TONE_HI), so the
     pure black and pure white an uncropped film scan always carries — clear
     film base, sprocket holes, the holder surround — cannot reach any
@@ -102,13 +104,18 @@ def estimate_neutral_rgb(base_u16, ws_windowed=False, algorithm=AWB_DEFAULT):
     return float(est[0]), float(est[1]), float(est[2])
 
 
-def compute_awb_temp_tint(ccr_image, algorithm=None):
-    """(temperature, tint) slider ints that neutralize the image's estimated
-    cast, or None. Runs on the converted base (resized_raw), so the result is
-    independent of the current slider values (idempotent). Crop-aware: with a
-    crop set, only the kept region drives the estimate (a rotated crop's black
-    corner fill sits below AWB_LO, so the mask discards it). Uses the
-    backend-selected algorithm when none is given."""
+def compute_awb_balance(ccr_image, algorithm=None):
+    """(balance_r, balance_g, balance_b) slider ints that neutralize the image's
+    estimated cast, or None. Runs on the converted base (resized_raw), so the
+    result is independent of the current slider values (idempotent). Crop-aware:
+    with a crop set, only the kept region drives the estimate (a rotated crop's
+    black corner fill sits below AWB_LO, so the mask discards it). Uses the
+    backend-selected algorithm when none is given.
+
+    The estimate is a MIDTONE average (AWB_TONE_LO..AWB_TONE_HI), so the Balance
+    solve neutralizes at that tone. Balance is tone-weighted by design, so a
+    deep-shadow cast may still want a manual nudge afterwards - that is the
+    control working as intended, not a failure of the estimate."""
     if ccr_image is None or getattr(ccr_image, "resized_raw", None) is None:
         return None
     if algorithm is None:
@@ -122,6 +129,6 @@ def compute_awb_temp_tint(ccr_image, algorithm=None):
                                algorithm)
     if est is None:
         return None
-    return compute_neutral_temp_tint(
-        est[0], est[1], est[2],
-        getattr(ccr_image, "tint_balance_factor", 1.0))
+    # tint_balance_factor was a Temperature/Tint-only perceptual weighting; the
+    # Balance curve has no such term, so the estimate feeds the inverse directly.
+    return compute_neutral_balance(est[0], est[1], est[2])
