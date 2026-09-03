@@ -676,12 +676,20 @@ class MainWindow(QMainWindow):
         optionally make it the active profile."""
         from widgets.it8_profile_dialog import IT8ProfileDialog
         current_path = None
+        current_merge = None
         idx = self.image_preview.current_idx
         if idx is not None:
             img = ccr_backend.get_image_by_index(idx)
             if img is not None:
                 current_path = img.file_path
-        dlg = IT8ProfileDialog(self, current_path=current_path)
+                # A trichrome capture is its own device space, so the wizard has
+                # to profile the MERGE, not one source frame. Hand it the triplet
+                # so "Use current image" works on a loaded 3-way merge.
+                if getattr(img, "is_merged", False) and img.merge_sources:
+                    current_merge = (list(img.merge_sources),
+                                     getattr(img, "merge_demosaic", True))
+        dlg = IT8ProfileDialog(self, current_path=current_path,
+                               current_merge=current_merge)
         if dlg.exec() != QDialog.Accepted or not dlg.saved_path:
             return
         base = os.path.basename(dlg.saved_path)

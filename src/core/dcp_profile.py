@@ -33,6 +33,11 @@ ILLUMINANT_CCT: Dict[int, float] = {
 _T_COLORMATRIX1 = 50721; _T_COLORMATRIX2 = 50722
 _T_CAMERACALIB1 = 50723; _T_CAMERACALIB2 = 50724
 _T_ANALOGBAL = 50727; _T_ASSHOTNEUTRAL = 50728
+# Private tag (TIFF private range) marking a profile built from a TRICHROME
+# (3-way merge) capture — a different device space from a normal Bayer shot, so
+# the two must not be swapped silently. Absent means "normal", so every existing
+# profile stays valid. See spec/trichrome-camera-profile.md §6.
+_T_CCR_TRICHROME = 52525
 _T_ILLUM1 = 50778; _T_ILLUM2 = 50779
 _T_PROFILENAME = 50936
 _T_HSMDIMS = 50937; _T_HSMDATA1 = 50938; _T_HSMDATA2 = 50939
@@ -70,6 +75,8 @@ class DcpProfile:
     # WB is a property of the profile, not of each frame's metadata; third-party
     # DCPs carry no such tag and keep the per-frame path. See apply_dcp.
     as_shot_neutral: Optional[np.ndarray] = None
+    # Built from a trichrome (3-way merge) capture? (private tag 52525)
+    is_trichrome: bool = False
 
     @property
     def has_forward(self) -> bool:
@@ -172,6 +179,7 @@ def parse_dcp_bytes(data: bytes) -> DcpProfile:
     ab = vec(_T_ANALOGBAL, 3)
     p.analog_balance = ab[:3] if ab is not None else np.ones(3)
     p.as_shot_neutral = cm.green_normalised(vec(_T_ASSHOTNEUTRAL, 3))
+    p.is_trichrome = bool(e.get(_T_CCR_TRICHROME))
     if e.get(_T_ILLUM1):                              # truthy guards count-0 tags ([] is falsy)
         p.illuminant_1 = int(e[_T_ILLUM1][0])
     if e.get(_T_ILLUM2):
@@ -446,6 +454,9 @@ def _write_ifd(tags: Dict[int, Tuple[str, object]]) -> bytes:
         elif kind == 'srational':
             tcode, cnt = 10, len(val)
             raw = b''.join(struct.pack('<ii', *_to_srational(v)) for v in val)
+        elif kind == 'long':
+            tcode, cnt = 4, len(val)
+            raw = b''.join(struct.pack('<I', int(v)) for v in val)
         elif kind == 'rational':
             tcode, cnt = 5, len(val)
             raw = b''.join(struct.pack('<II', *_to_rational(v)) for v in val)
@@ -465,7 +476,8 @@ def _write_ifd(tags: Dict[int, Tuple[str, object]]) -> bytes:
 
 
 def build_camera_dcp(fit, name: str, *, illuminant: int = 23,
-                     bake_neutral: bool = True) -> bytes:
+                     bake_neutral: bool = True,
+                     trichrome: bool = False) -> bytes:
     """Synthesise a minimal single-illuminant matrix DCP from the IT8 fit.
 
     The fit's matrix M maps WHITE-BALANCED camera RGB -> XYZ D50 with M@(1,1,1)=D50,
@@ -495,4 +507,6 @@ def build_camera_dcp(fit, name: str, *, illuminant: int = 23,
     }
     if bake_neutral:
         tags[_T_ASSHOTNEUTRAL] = ('rational', list(1.0 / wb))
+    if trichrome:
+        tags[_T_CCR_TRICHROME] = ('long', [1])
     return _write_ifd(tags)

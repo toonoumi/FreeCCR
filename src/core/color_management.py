@@ -285,6 +285,30 @@ def _text_type(text: str) -> bytes:
 # See spec/camera-profile-calibration-wb.md §3.2.
 _CCR_NEUTRAL_SIG = b'CCRn'
 
+# Private ICC tag marking a profile built from a TRICHROME (3-way merge) capture.
+# That is a different device space from a normal Bayer shot — each channel's
+# sensitivity is the sensor's response times its own light — so the two kinds must
+# not be swapped silently. Absent means "normal", so every existing profile stays
+# valid. Payload reuses XYZType (x=1) like _CCR_NEUTRAL_SIG.
+# See spec/trichrome-camera-profile.md §6.
+_CCR_KIND_SIG = b'CCRk'
+
+
+def _append_ccr_tags(tags: dict, order: list, neutral=None,
+                     trichrome: bool = False) -> None:
+    """Attach FreeCCR's private tags to a profile under construction. Both reuse
+    the XYZType container so the tag table stays well-formed for any CMM, which
+    then ignores the unknown signatures."""
+    nv = green_normalised(neutral)
+    if nv is not None:
+        sig = _CCR_NEUTRAL_SIG.decode('ascii')
+        tags[sig] = _xyz_type(*nv)
+        order.append(sig)
+    if trichrome:
+        sig = _CCR_KIND_SIG.decode('ascii')
+        tags[sig] = _xyz_type(1.0, 0.0, 0.0)
+        order.append(sig)
+
 
 def build_matrix_shaper_icc(desc: str,
                             r_xyz: Tuple[float, float, float],
@@ -293,12 +317,13 @@ def build_matrix_shaper_icc(desc: str,
                             trc_para: Tuple[float, float, float, float, float],
                             wtpt: Tuple[float, float, float] = D50_XYZ,
                             copyright_text: str = "Public Domain. No rights reserved.",
-                            neutral=None) -> bytes:
+                            neutral=None, trichrome: bool = False) -> bytes:
     """Build a valid ICC v2.4 RGB matrix-shaper profile from D50 colorants and a
     shared parametric (type-3) TRC. Returns the raw profile bytes.
 
     neutral: optional camera-native calibration neutral (3 values) recorded in the
-    private 'CCRn' tag — see resolve_wb_gains."""
+    private 'CCRn' tag — see resolve_wb_gains. trichrome marks the profile as built
+    from a 3-way merge capture ('CCRk') — see spec/trichrome-camera-profile.md."""
     tags = {
         'desc': _desc_type(desc),
         'wtpt': _xyz_type(*wtpt),
@@ -313,10 +338,7 @@ def build_matrix_shaper_icc(desc: str,
     tags['bTRC'] = trc
 
     order = ['desc', 'rXYZ', 'gXYZ', 'bXYZ', 'wtpt', 'rTRC', 'gTRC', 'bTRC', 'cprt']
-    nv = green_normalised(neutral)
-    if nv is not None:
-        tags[_CCR_NEUTRAL_SIG.decode('ascii')] = _xyz_type(*nv)
-        order.append(_CCR_NEUTRAL_SIG.decode('ascii'))
+    _append_ccr_tags(tags, order, neutral, trichrome)
     n = len(order)
     header_size = 128
     table_size = 4 + n * 12
@@ -522,6 +544,9 @@ class InputProfile:
         # Camera-native neutral this profile was calibrated on ('CCRn'), or None
         # for a profile that carries none. When set it OWNS the white balance.
         self.calibration_neutral: Optional[np.ndarray] = None
+        # Built from a TRICHROME (3-way merge) capture ('CCRk')? A different
+        # device space — see spec/trichrome-camera-profile.md.
+        self.is_trichrome: bool = False
 
     @classmethod
     def _from_clut(cls, clut: "_CLUT", desc: str) -> "InputProfile":
@@ -534,6 +559,7 @@ class InputProfile:
         self._clut = clut
         self.description = desc
         self.calibration_neutral = None
+        self.is_trichrome = False
         return self
 
     @staticmethod
@@ -547,6 +573,12 @@ class InputProfile:
             return green_normalised(_parse_xyz(icc, tags[_CCR_NEUTRAL_SIG][0]))
         except Exception:
             return None
+
+    @staticmethod
+    def _read_is_trichrome(tags: dict) -> bool:
+        """Whether the profile carries the private 'CCRk' device-kind tag. Its
+        presence is the signal; the payload is not inspected."""
+        return _CCR_KIND_SIG in tags
 
     @classmethod
     def from_bytes(cls, icc: bytes) -> "InputProfile":
@@ -565,6 +597,7 @@ class InputProfile:
                     for t in (b'rTRC', b'gTRC', b'bTRC')]
             prof = cls(combined, luts, cls._read_desc(icc, tags))
             prof.calibration_neutral = cls._read_calibration_neutral(icc, tags)
+            prof.is_trichrome = cls._read_is_trichrome(tags)
             return prof
         # LUT-based: an A2B0 (fall back A2B1) device->PCS cLUT in mft1/mft2/mAB.
         a2b = next((t for t in (b'A2B0', b'A2B1') if t in tags), None)
@@ -576,6 +609,7 @@ class InputProfile:
             clut = _parse_a2b(icc, tags[a2b][0], pcs, is_v4)
             prof = cls._from_clut(clut, cls._read_desc(icc, tags))
             prof.calibration_neutral = cls._read_calibration_neutral(icc, tags)
+            prof.is_trichrome = cls._read_is_trichrome(tags)
             return prof
         raise UnsupportedICCError(
             "only RGB matrix-shaper or A2B cLUT ICC profiles are supported "
@@ -916,12 +950,12 @@ def _lut16_type(clut_xyz: np.ndarray, grid: int) -> bytes:
 def build_clut_icc(desc: str, clut_xyz: np.ndarray, grid: int,
                    wtpt: Tuple[float, float, float] = D50_XYZ,
                    copyright_text: str = "Public Domain. No rights reserved.",
-                   neutral=None) -> bytes:
+                   neutral=None, trichrome: bool = False) -> bytes:
     """Build a valid ICC v2.4 RGB->XYZ cLUT (lut16) profile. `clut_xyz` is a
     (grid,grid,grid,3) XYZ D50 (Y=1) table indexed [R][G][B]. Parses back via
     InputProfile.from_bytes (cLUT path).
 
-    neutral: optional camera-native calibration neutral recorded in 'CCRn', as in
+    neutral / trichrome: recorded in the private 'CCRn' / 'CCRk' tags, as in
     build_matrix_shaper_icc."""
     desc = str(desc).encode('ascii', 'replace').decode('ascii')
     copyright_text = str(copyright_text).encode('ascii', 'replace').decode('ascii')
@@ -932,10 +966,7 @@ def build_clut_icc(desc: str, clut_xyz: np.ndarray, grid: int,
         'cprt': _text_type(copyright_text),
     }
     order = ['desc', 'A2B0', 'wtpt', 'cprt']
-    nv = green_normalised(neutral)
-    if nv is not None:
-        tags[_CCR_NEUTRAL_SIG.decode('ascii')] = _xyz_type(*nv)
-        order.append(_CCR_NEUTRAL_SIG.decode('ascii'))
+    _append_ccr_tags(tags, order, neutral, trichrome)
     n = len(order)
     base = 128 + 4 + n * 12
     data = b''
