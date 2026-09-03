@@ -1212,14 +1212,18 @@ class MainWindow(QMainWindow):
             "Images (*.dng *.tif *.tiff *.arw *.nef *.cr2 *.cr3 *.raf *.png *.jpg *.jpeg *.rw2 *.3fr *.fff);;All Files (*)"
         )
         if files:
+            # Remember where the user BROWSED to (survives restarts). Set here
+            # rather than in _import_file_list so a command-line import never
+            # moves it: those paths come from a shell, are often relative, and
+            # `os.path.dirname("a.nef")` is "" — which would silently wipe the
+            # setting and drop both dialogs back to the process cwd.
+            self._settings.setValue("files/last_open_dir", os.path.dirname(files[0]))
             self._import_file_list(files)
 
     def _import_file_list(self, files):
         """Replace the current batch with `files`: Unicode validation, 3-way
         merge validation, then the loader. The post-dialog tail of open_files,
         shared with the command-line import (spec/cli-file-args.md)."""
-        # Remember where the user browses to (survives restarts)
-        self._settings.setValue("files/last_open_dir", os.path.dirname(files[0]))
         # Validate and normalize Unicode paths
         valid_files = []
         invalid_files = []
@@ -1274,14 +1278,15 @@ class MainWindow(QMainWindow):
             start_dir
         )
         if folder:
+            # Dialog-only, like open_files above: `freeccr .` would otherwise
+            # persist the literal "." as the browse location.
+            self._settings.setValue("files/last_open_dir", folder)
             self._import_folder(folder)
 
     def _import_folder(self, folder):
         """Replace the current batch with every supported image in `folder`.
         The post-dialog tail of open_folder, shared with the command-line
         import (spec/cli-file-args.md)."""
-        # Remember where the user browses to (survives restarts)
-        self._settings.setValue("files/last_open_dir", folder)
         # Validate and normalize Unicode path
         normalized_folder = normalize_unicode_path(folder)
         if not validate_unicode_path(normalized_folder):

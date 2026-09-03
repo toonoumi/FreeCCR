@@ -80,8 +80,12 @@ OpenPlan(folder: str | None,      # set only for the single-folder case
 Exactly one of `folder` / `files` is non-empty; both may be empty (nothing
 loadable), in which case only `problems` is reported.
 
-`files/last_open_dir` (QSettings) is updated by the shared import helpers just
-as a dialog import would, so the next dialog opens where the CLI pointed.
+`files/last_open_dir` (QSettings) is written by the **dialogs only**, never by a
+command-line import. It records where the user *browsed*, and CLI paths are not
+browsing: they arrive from a shell, are frequently relative, and
+`os.path.dirname("a.nef")` is `""` — so letting the shared helpers write it
+would silently wipe the setting and drop both dialogs back to the process cwd.
+`freeccr .` would likewise persist a literal `"."`.
 
 ## 4. Processing
 
@@ -130,7 +134,8 @@ only step 4 touches the GUI.
     so the folder import stops duplicating it.
   - `_import_file_list(files)` / `_import_folder(folder)` — the post-dialog tail
     of `open_files` / `open_folder` (Unicode validation and warning, merge
-    validation, `last_open_dir`, loader launch), now callable without a dialog.
+    validation, loader launch), now callable without a dialog. They deliberately
+    do NOT write `last_open_dir` — that stays in the dialog halves.
   - `open_files` / `open_folder` — reduced to `save_catalog()` + dialog + helper.
     `save_catalog()` stays *before* the dialog so a cancelled dialog still
     persists pending edits.

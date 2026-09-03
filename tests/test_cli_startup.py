@@ -30,9 +30,15 @@ def win(monkeypatch):
     from ui.main_window import MainWindow
     ccr_backend.images.clear()
     ccr_backend.file_paths.clear()
-    ccr_backend.rgb_merge_mode = False
+    saved_merge_mode = ccr_backend.rgb_merge_mode
 
     w = MainWindow()
+    # AFTER construction, not before: MainWindow.__init__ restores
+    # rgb_merge_mode from the user's persisted QSettings
+    # ("import/rgb_merge_mode"), so resetting first is undone by the very next
+    # line. On a machine with 3-way merge enabled that put every file-list
+    # import into merge validation instead of the loader.
+    ccr_backend.rgb_merge_mode = False
     launched = []
     warnings = []
     monkeypatch.setattr(
@@ -46,7 +52,9 @@ def win(monkeypatch):
     # save_catalog() would rewrite the user's real catalog during a test run.
     monkeypatch.setattr(ccr_backend, "save_catalog", lambda *a, **k: None)
     yield w, launched, warnings
-    ccr_backend.rgb_merge_mode = False
+    # Restore, don't force: this is a global singleton, and pinning it to False
+    # would leak a non-default into whatever module runs next in a full run.
+    ccr_backend.rgb_merge_mode = saved_merge_mode
 
 
 def _touch(folder, *names):
@@ -112,6 +120,75 @@ def test_missing_path_alongside_a_real_one_still_loads_the_real_one(win, tmp_pat
     assert launched[0]["files"] == [good]
     assert warnings == ["Nothing to open"]
     assert at_warn == [1]          # the load had already started
+
+
+def _browse_dir(w):
+    return w._settings.value("files/last_open_dir", "", type=str)
+
+
+def test_command_line_import_does_not_move_the_browse_location(win, tmp_path):
+    """last_open_dir records where the user BROWSED, so a command-line import
+    must leave it alone. Shell paths are often relative and
+    os.path.dirname("a.nef") is "", which would wipe the setting and drop both
+    dialogs back to the process cwd."""
+    w, launched, _warnings = win
+    saved = _browse_dir(w)
+    try:
+        w._settings.setValue("files/last_open_dir", "/previously/browsed")
+        a, = _touch(tmp_path, "a.nef")
+        w.load_paths([a])
+        assert launched                       # the import really did run
+        assert _browse_dir(w) == "/previously/browsed"
+    finally:
+        w._settings.setValue("files/last_open_dir", saved)
+
+
+def test_command_line_folder_import_does_not_move_it_either(win, tmp_path):
+    """The folder half of the same rule — `freeccr .` must not persist "."."""
+    w, launched, _warnings = win
+    saved = _browse_dir(w)
+    try:
+        w._settings.setValue("files/last_open_dir", "/previously/browsed")
+        d = tmp_path / "roll"
+        d.mkdir()
+        _touch(d, "a.nef")
+        w.load_paths([str(d)])
+        assert launched
+        assert _browse_dir(w) == "/previously/browsed"
+    finally:
+        w._settings.setValue("files/last_open_dir", saved)
+
+
+def test_open_files_dialog_still_records_the_browse_location(win, tmp_path,
+                                                             monkeypatch):
+    """...and the dialog still does record it — the fix moved the write, it did
+    not remove the feature."""
+    w, _launched, _warnings = win
+    saved = _browse_dir(w)
+    try:
+        a, = _touch(tmp_path, "a.nef")
+        monkeypatch.setattr(QFileDialog, "getOpenFileNames",
+                            staticmethod(lambda *a_, **k: ([a], "")))
+        w.open_files()
+        assert _browse_dir(w) == os.path.dirname(a)
+    finally:
+        w._settings.setValue("files/last_open_dir", saved)
+
+
+def test_open_folder_dialog_still_records_the_browse_location(win, tmp_path,
+                                                              monkeypatch):
+    w, _launched, _warnings = win
+    saved = _browse_dir(w)
+    try:
+        d = tmp_path / "roll"
+        d.mkdir()
+        _touch(d, "a.nef")
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                            staticmethod(lambda *a_, **k: str(d)))
+        w.open_folder()
+        assert _browse_dir(w) == str(d)
+    finally:
+        w._settings.setValue("files/last_open_dir", saved)
 
 
 def test_merge_mode_rejects_a_non_triplet_from_the_command_line(win, tmp_path):
