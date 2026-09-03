@@ -313,14 +313,39 @@ the *normalised display domain* the curve operates on, not the 0–65535 scale
   back up by 65535 (`image_preview.py:421-424`); that multiply is dropped, the
   clamp to `[0,1]` kept.
 
-**Known limitation.** Both sample the *base* (`resized_raw`), while the balance
-stage sees the base *after* Channel Levels. With Channel Levels neutral the
-solve is exact; with it non-neutral the sampled tone is not quite the tone the
-curve will act on, so the pick is approximate. This is pre-existing behaviour
-(the WB picker had the same gap), but it matters slightly more for a
-tone-dependent control than it did for a flat gain. Sampling the adjusted
-preview instead would require inverting every intervening stage; out of scope,
-recorded here as the known follow-up.
+**Solving against the stage's actual input (required).** The bare curve inverse
+is only correct if nothing moved the pixel before the Balance stage — and
+something almost always has:
+
+* **Channel Levels** runs first and is per-channel, so it changes the very cast
+  the pick is cancelling.
+* Its Master Gain carries the hidden **Auto Gain** offset, which is **on by
+  default for converted images**. Auto Gain is channel-symmetric and so cannot
+  create a cast, but it *moves the tone* — and a tone-DEPENDENT control solved
+  at the wrong tone lands on the wrong part of the curve.
+
+So both callers go through `compute_neutral_balance_for_image(image, rgb)`,
+which runs `apply_pre_balance_stages()` (Channel Levels, with Auto Gain folded
+into Master Gain, clamped iff the base is full-range) on the sample and solves
+`compute_neutral_balance` on the result. Measured on a cast frame, spot spread
+after the pick:
+
+| preceding state | bare inverse | image-aware solve |
+| --- | --- | --- |
+| nothing set | 4.9% | **1.1%** |
+| Channel Levels set | 27.0% | **1.0%** |
+| Master Gain 35 | 19.9% | **0.3%** |
+| Input Gain −20 | 19.6% | **0.1%** |
+
+The residual is integer slider quantization. Everything *after* Balance is
+channel-symmetric for a neutral pixel (contrast, brightness, gamma, saturation
+and the bands all leave a neutral alone), so making the stage's input neutral is
+what makes the render neutral — the one exception being a user-set per-channel
+**Curves** entry, which can re-introduce a cast after the fact.
+
+Auto Gain is measured from the **whole base**, not the crop, because that is
+what the render does. Two different bases therefore land on different sliders
+from an identical estimate, which is correct.
 
 ### 4.5 Dispatch
 

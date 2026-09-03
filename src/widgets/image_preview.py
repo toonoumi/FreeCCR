@@ -428,8 +428,13 @@ class GraphicsImageView(QGraphicsView):
         else:
             means = np.clip(means / 65535.0, 0.0, 1.0)
 
-        from core.ccr_processor import compute_neutral_balance
-        balance = compute_neutral_balance(means[0], means[1], means[2])
+        # Solve against what the Balance stage actually RECEIVES, not the bare
+        # base sample: Channel Levels runs first and carries the hidden Auto Gain
+        # offset, and Balance is tone-dependent, so the un-adjusted sample lands
+        # on the wrong part of the curve. See spec/channel-balance.md §4.4.
+        from core.ccr_processor import compute_neutral_balance_for_image
+        balance = compute_neutral_balance_for_image(
+            img_obj, (means[0], means[1], means[2]))
         try:
             pw.parent().parent().sliders_panel.on_wb_sampled(*balance)
         except AttributeError:

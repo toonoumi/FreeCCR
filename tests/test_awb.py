@@ -22,7 +22,7 @@ from core.awb import (  # noqa: E402
     estimate_neutral_rgb, compute_awb_balance,
 )
 from core.ccr_processor import (  # noqa: E402
-    _balance_curve, compute_neutral_balance, encode_window,
+    _balance_curve, apply_crop_to_image, compute_neutral_balance, encode_window,
 )
 
 CAST = (1.25, 1.0, 0.8)          # warm illuminant (R high, B low)
@@ -228,19 +228,28 @@ def test_compute_awb_balance_no_base():
 
 def test_crop_region_drives_the_estimate():
     """Cast-A content inside the crop, strongly different cast-B junk outside:
-    the cropped estimate matches the interior content, not the whole frame."""
+    the cropped estimate matches the interior content, not the whole frame.
+
+    Asserted on the ESTIMATE rather than the resulting slider values: the solve
+    is now image-aware (Channel Levels + the Auto Gain offset run ahead of the
+    tone-dependent Balance stage), and Auto Gain is measured from the whole
+    base — as the render measures it — so a 128px frame and a bare 64px interior
+    legitimately land on different sliders even from an identical estimate."""
     rng = np.random.default_rng(10)
     inside = _cast_scene(rng, cast=CAST, shape=(64, 64))
     d = _cast_scene(rng, cast=(0.7, 1.0, 1.3), shape=(128, 128))   # cool junk
     d[32:96, 32:96, :] = inside                                     # centered 50%
     crop = (0.25, 0.25, 0.75, 0.75)
-    cropped = compute_awb_balance(
-        _StubImage(_u16(d), crop=crop), algorithm="gray_world")
-    interior_only = compute_awb_balance(
-        _StubImage(_u16(inside)), algorithm="gray_world")
-    full = compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world")
-    assert cropped == interior_only
-    assert cropped != full
+    est_cropped = estimate_neutral_rgb(
+        apply_crop_to_image(_u16(d), crop, 0.0), algorithm="gray_world")
+    est_interior = estimate_neutral_rgb(_u16(inside), algorithm="gray_world")
+    est_full = estimate_neutral_rgb(_u16(d), algorithm="gray_world")
+    assert est_cropped == pytest.approx(est_interior, rel=1e-6)
+    assert est_cropped != pytest.approx(est_full, rel=1e-3)
+    # ...and the crop still changes what the user ends up with.
+    assert (compute_awb_balance(_StubImage(_u16(d), crop=crop),
+                                algorithm="gray_world")
+            != compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world"))
 
 
 def test_rotated_crop_black_fill_is_masked():

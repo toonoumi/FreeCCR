@@ -1294,6 +1294,60 @@ def _apply_channel_balance(d: np.ndarray, balance_r: float, balance_g: float,
     return d
 
 
+def apply_pre_balance_stages(rgb, settings, auto_gain: float = 0.0,
+                             clamp: bool = False) -> tuple:
+    """Run the stages that precede Channel Balance on one sampled DISPLAY triple,
+    returning the triple the Balance stage will actually receive.
+
+    Only one stage sits in front of Balance — Channel Levels — but it matters for
+    two reasons, and BOTH bite in practice:
+
+      * it is per-channel, so it changes the cast the pick is trying to cancel;
+      * it carries the hidden AUTO GAIN offset on its Master Gain. Auto Gain is
+        channel-symmetric (it cannot create a cast) but it MOVES THE TONE, and
+        Balance is tone-DEPENDENT — solving at the un-gained tone lands on the
+        wrong part of the curve. Auto Gain is on by default for converted
+        images, so ignoring this made every pick wrong.
+
+    `clamp` mirrors the pipeline position: False for a windowed base (Channel
+    Levels runs un-clamped there), True for a full-range one.
+    See spec/channel-balance.md §4.4."""
+    s = settings or {}
+    d = np.asarray(rgb, dtype=np.float32).reshape(1, 1, 3).copy()
+    ch = [s.get(k, 0) for k in (
+        "ch_input_gain", "ch_master_shift", "ch_master_gain",
+        "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
+        "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
+        "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")]
+    ch[2] = ch[2] + auto_gain            # Auto Gain rides Master Gain
+    if _channel_levels_active(*ch):
+        _apply_channel_levels(d, *ch, clamp=clamp)
+    return float(d[0, 0, 0]), float(d[0, 0, 1]), float(d[0, 0, 2])
+
+
+def compute_neutral_balance_for_image(image_obj, rgb) -> tuple:
+    """Balance slider values that neutralize a sampled DISPLAY triple `rgb` on
+    `image_obj`, accounting for what runs before the Balance stage.
+
+    This is what the WB eyedropper and AWB both call: solving the bare curve
+    inverse against the sampled BASE value is wrong whenever Channel Levels or
+    Auto Gain has moved the pixel, which is the normal case. Tolerates
+    stub/minimal image objects (getattr defaults throughout)."""
+    ws = bool(getattr(image_obj, "_ws_windowed", False))
+    auto_gain = 0.0
+    try:
+        from core.ccr_backend import ccr_backend      # deferred: circular at load
+        if getattr(ccr_backend, "auto_gain", True) and getattr(image_obj, "converted", False):
+            base = getattr(image_obj, "resized_raw", None)
+            if base is not None:
+                auto_gain = compute_auto_gain_offset(base, ws)
+    except Exception:
+        auto_gain = 0.0                                # never block a pick on this
+    pre = apply_pre_balance_stages(rgb, getattr(image_obj, "adjustment_settings", None),
+                                   auto_gain=auto_gain, clamp=not ws)
+    return compute_neutral_balance(*pre)
+
+
 def compute_neutral_balance(r: float, g: float, b: float) -> tuple:
     """Balance slider ints [-100, 100] that neutralize a sampled cast.
 

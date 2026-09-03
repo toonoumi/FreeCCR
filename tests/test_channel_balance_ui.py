@@ -202,5 +202,72 @@ def test_unknown_channel_is_ignored(panel):
                for k in BALANCE_KEYS)
 
 
+# --- WB picker / AWB end to end ---------------------------------------------
+#
+# The user-visible contract: clicking a neutral spot must make THAT SPOT render
+# neutral. Solving the bare curve inverse against the sampled base does not do
+# that, because Channel Levels (carrying the hidden Auto Gain offset) runs ahead
+# of the tone-dependent Balance stage.
+
+def _cast_scene(tmp_path):
+    """A converted, windowed base: a tonal ramp under a yellow cast so Auto Gain
+    has real highlights to normalise against, plus a mid-grey patch to pick."""
+    from core.ccr_processor import encode_window
+    path = str(tmp_path / "scene.png")
+    cv2.imwrite(path, np.full((60, 90, 3), 20000, np.uint16))
+    img = CCRImage(path)
+    img.converted = True
+    img._ws_windowed = True
+    h, w = 60, 90
+    ramp = np.linspace(0.02, 1.0, w, dtype=np.float32)[None, :, None].repeat(h, 0)
+    cast = np.array([1.0, 0.88, 0.55], np.float32)
+    disp = np.clip(ramp * cast, 0, 1.2)
+    disp[25:35, 40:50] = np.array([0.35, 0.35, 0.35], np.float32) * cast
+    img.resized_raw = encode_window(disp.copy())
+    return img
+
+
+def _pick(img):
+    """What _sample_wb_point hands the solver: the de-windowed sampled triple."""
+    from core.ccr_processor import WS_B, WS_W
+    m = img.resized_raw[30, 45, :].astype(np.float64)
+    return tuple(np.clip((m - WS_B) / (WS_W - WS_B), 0.0, 1.0))
+
+
+@pytest.mark.parametrize("preset", [
+    {},
+    {"ch_r_shift": 15, "ch_g_gain": 12, "ch_b_blackpoint": -8},
+    {"ch_master_gain": 35},
+    {"ch_input_gain": -20},
+])
+def test_picked_spot_renders_neutral(tmp_path, preset):
+    """End to end through apply_adjustments: after the pick, the sampled spot
+    comes out neutral in the RENDER — including with Channel Levels set and with
+    Auto Gain live."""
+    from core.ccr_processor import compute_neutral_balance_for_image
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = dict(preset)
+    r, g, b = compute_neutral_balance_for_image(img, _pick(img))
+    settings = dict(preset, balance_r=r, balance_g=g, balance_b=b)
+    out = img.apply_adjustments(img.resized_raw.copy(), settings=settings)
+    spot = out[30, 45, :].astype(float)
+    spread = (spot.max() - spot.min()) / max(spot.max(), 1.0)
+    assert spread < 0.02, f"spot {spot} spread {spread:.3f} with {preset}"
+
+
+def test_bare_inverse_would_miss(tmp_path):
+    """Guards the regression itself: the un-corrected solve is measurably wrong
+    on the very same frame, so this suite fails if someone reverts to it."""
+    from core.ccr_processor import compute_neutral_balance
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {"ch_master_gain": 35}
+    r, g, b = compute_neutral_balance(*_pick(img))
+    settings = dict(img.adjustment_settings,
+                    balance_r=r, balance_g=g, balance_b=b)
+    out = img.apply_adjustments(img.resized_raw.copy(), settings=settings)
+    spot = out[30, 45, :].astype(float)
+    assert (spot.max() - spot.min()) / max(spot.max(), 1.0) > 0.05
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

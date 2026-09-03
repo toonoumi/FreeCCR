@@ -10,7 +10,8 @@ through the same inverse the WB eyedropper uses. See spec/channel-balance.md.
 import numpy as np
 
 from core.ccr_processor import (MIN_CONTENT_FRACTION, WS_B, _WS_INV_WIDTH,
-                                apply_crop_to_image, compute_neutral_balance)
+                                apply_crop_to_image,
+                                compute_neutral_balance_for_image)
 
 # (id, UI label) — ordered as shown in the Settings dropdown.
 AWB_ALGORITHMS = [
@@ -130,5 +131,8 @@ def compute_awb_balance(ccr_image, algorithm=None):
     if est is None:
         return None
     # tint_balance_factor was a Temperature/Tint-only perceptual weighting; the
-    # Balance curve has no such term, so the estimate feeds the inverse directly.
-    return compute_neutral_balance(est[0], est[1], est[2])
+    # Balance curve has no such term. The estimate does NOT feed the bare curve
+    # inverse though: Channel Levels (and the hidden Auto Gain offset it carries)
+    # run before Balance and move the tone a tone-dependent control is solving
+    # at. See spec/channel-balance.md §4.4.
+    return compute_neutral_balance_for_image(ccr_image, est)
