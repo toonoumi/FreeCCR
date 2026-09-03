@@ -22,7 +22,7 @@ from core.awb import (  # noqa: E402
     estimate_neutral_rgb, compute_awb_balance,
 )
 from core.ccr_processor import (  # noqa: E402
-    _balance_curve, apply_crop_to_image, compute_neutral_balance, encode_window,
+    apply_crop_to_image, encode_window,
 )
 
 CAST = (1.25, 1.0, 0.8)          # warm illuminant (R high, B low)
@@ -174,24 +174,10 @@ def test_windowed_and_full_range_agree():
 
 # --- estimate → sliders → gains round-trip -----------------------------------
 
-def test_roundtrip_neutralizes_the_cast():
-    """Applying the AWB-computed Balance through the real Balance curve makes
-    the estimated channel values meet (within int-slider quantization).
-
-    The check is AT the estimated tone, which is what a tone-weighted control
-    can neutralize — unlike the old flat WB gain, a Balance move does not
-    neutralize every tone at once, by design."""
-    d = _cast_scene(np.random.default_rng(4))
-    est = estimate_neutral_rgb(_u16(d), algorithm="gray_world")
-    vals = compute_neutral_balance(*est)
-    got = [float(_balance_curve(s, v)) for s, v in zip(vals, est)]
-    assert max(got) - min(got) < 0.005
-
-
 def test_estimate_domain_is_normalised():
-    """estimate_neutral_rgb must hand compute_neutral_balance NORMALISED [0,1]
-    display units. Balance is tone-DEPENDENT, so (unlike the old ratio-only
-    temp/tint inverse) the absolute scale is part of the answer."""
+    """estimate_neutral_rgb hands the solver NORMALISED [0,1] display units;
+    compute_awb_balance encodes that back into the base domain as a 1-pixel
+    sample area, so the closed loop can render it like any other pick."""
     est = estimate_neutral_rgb(_u16(_cast_scene(np.random.default_rng(5))),
                                algorithm="gray_world")
     assert all(0.0 <= v <= 1.0 for v in est)
@@ -199,20 +185,33 @@ def test_estimate_domain_is_normalised():
 
 # --- compute_awb_balance on an image-like object -----------------------------
 
-class _StubImage:
-    def __init__(self, base, ws=False, converted=True, crop=None, angle=0.0):
-        self.resized_raw = base
-        self._ws_windowed = ws
-        self.converted = converted
-        self.tint_balance_factor = 1.0
-        self.adjustment_settings = {}
-        self.crop_rect = crop
-        self.crop_angle = angle
+# compute_awb_balance now finishes through CCRImage.solve_neutral_balance, which
+# renders the sample area through the real pipeline — so these need a REAL image,
+# not a duck-typed stub. The estimate half is still exercised directly against
+# estimate_neutral_rgb above, where a bare array is the right input.
+
+def _real_image(tmp_path, base, ws=False, converted=True, crop=None, angle=0.0,
+                name="scan.png"):
+    """A CCRImage carrying `base` as its converted base."""
+    import cv2
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication(sys.argv[:1])
+    from core.ccr_image import CCRImage
+    path = str(tmp_path / name)
+    cv2.imwrite(path, np.full((8, 8, 3), 20000, np.uint16))
+    img = CCRImage(path)
+    img.resized_raw = base
+    img._ws_windowed = ws
+    img.converted = converted
+    img.adjustment_settings = {}
+    img.crop_rect = crop
+    img.crop_angle = angle
+    return img
 
 
-def test_compute_awb_balance_stub_image():
+def test_compute_awb_balance_end_to_end(tmp_path):
     d = _cast_scene(np.random.default_rng(5))
-    res = compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world")
+    res = compute_awb_balance(_real_image(tmp_path, _u16(d)), algorithm="gray_world")
     assert res is not None
     br, bg, bb = res
     # Red is the anchor and never moves; a warm cast (R high, B low) is corrected
@@ -222,13 +221,14 @@ def test_compute_awb_balance_stub_image():
     assert all(-100 <= v <= 100 for v in res)
 
 
-def test_compute_awb_balance_no_base():
-    assert compute_awb_balance(_StubImage(None), algorithm="gray_world") is None
+def test_compute_awb_balance_no_base(tmp_path):
+    assert compute_awb_balance(_real_image(tmp_path, None),
+                               algorithm="gray_world") is None
 
 
 # --- crop awareness -----------------------------------------------------------
 
-def test_crop_region_drives_the_estimate():
+def test_crop_region_drives_the_estimate(tmp_path):
     """Cast-A content inside the crop, strongly different cast-B junk outside:
     the cropped estimate matches the interior content, not the whole frame.
 
@@ -249,28 +249,31 @@ def test_crop_region_drives_the_estimate():
     assert est_cropped == pytest.approx(est_interior, rel=1e-6)
     assert est_cropped != pytest.approx(est_full, rel=1e-3)
     # ...and the crop still changes what the user ends up with.
-    assert (compute_awb_balance(_StubImage(_u16(d), crop=crop),
+    assert (compute_awb_balance(_real_image(tmp_path, _u16(d), crop=crop, name="a.png"),
                                 algorithm="gray_world")
-            != compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world"))
+            != compute_awb_balance(_real_image(tmp_path, _u16(d), name="b.png"),
+                                   algorithm="gray_world"))
 
 
-def test_rotated_crop_black_fill_is_masked():
+def test_rotated_crop_black_fill_is_masked(tmp_path):
     """An angled crop samples outside the source (black fill); those pixels
     sit below AWB_LO and must not skew the estimate toward neutral-dark."""
     d = _cast_scene(np.random.default_rng(11), shape=(96, 96))
     straight = compute_awb_balance(
-        _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9)), algorithm="gray_world")
+        _real_image(tmp_path, _u16(d), crop=(0.1, 0.1, 0.9, 0.9), name="s.png"),
+        algorithm="gray_world")
     angled = compute_awb_balance(
-        _StubImage(_u16(d), crop=(0.1, 0.1, 0.9, 0.9), angle=8.0),
+        _real_image(tmp_path, _u16(d), crop=(0.1, 0.1, 0.9, 0.9), angle=8.0,
+                    name="ang.png"),
         algorithm="gray_world")
     # same scene statistics → within a slider unit of the straight crop
     assert abs(angled[0] - straight[0]) <= 1
     assert abs(angled[1] - straight[1]) <= 1
 
 
-def test_stub_without_crop_attrs_still_works():
+def test_image_without_crop_attrs_still_works(tmp_path):
     """The hook may see images predating the crop feature — getattr defaults."""
-    img = _StubImage(_u16(_cast_scene(np.random.default_rng(12))))
+    img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(12))))
     del img.crop_rect, img.crop_angle
     assert compute_awb_balance(img, algorithm="gray_world") is not None
 
@@ -285,10 +288,10 @@ def backend():
     ccr_backend.auto_awb, ccr_backend.awb_algorithm = saved
 
 
-def test_hook_writes_when_unset(backend):
+def test_hook_writes_when_unset(backend, tmp_path):
     backend.auto_awb = True
     backend.awb_algorithm = "gray_world"
-    img = _StubImage(_u16(_cast_scene(np.random.default_rng(6))))
+    img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(6))))
     backend.maybe_auto_awb(img)
     assert any(img.adjustment_settings.get(k, 0)
                for k in ("balance_r", "balance_g", "balance_b"))
@@ -297,25 +300,25 @@ def test_hook_writes_when_unset(backend):
 
 @pytest.mark.parametrize("preset", [{"balance_r": 5}, {"balance_g": -3},
                                     {"balance_b": 2, "balance_r": 1}])
-def test_hook_never_clobbers_saved_wb(backend, preset):
+def test_hook_never_clobbers_saved_wb(backend, preset, tmp_path):
     backend.auto_awb = True
-    img = _StubImage(_u16(_cast_scene(np.random.default_rng(7))))
+    img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(7))))
     img.adjustment_settings = dict(preset)
     backend.maybe_auto_awb(img)
     assert img.adjustment_settings == preset
 
 
-def test_hook_off_by_default_and_inert_when_off(backend):
+def test_hook_off_by_default_and_inert_when_off(backend, tmp_path):
     backend.auto_awb = False
-    img = _StubImage(_u16(_cast_scene(np.random.default_rng(8))))
+    img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(8))))
     backend.maybe_auto_awb(img)
     assert img.adjustment_settings == {}
 
 
-def test_hook_skips_unconverted(backend):
+def test_hook_skips_unconverted(backend, tmp_path):
     backend.auto_awb = True
-    img = _StubImage(_u16(_cast_scene(np.random.default_rng(9))),
-                     converted=False)
+    img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(9))),
+                      converted=False)
     backend.maybe_auto_awb(img)
     assert img.adjustment_settings == {}
 

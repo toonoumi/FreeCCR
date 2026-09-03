@@ -29,13 +29,10 @@ from core.ccr_processor import (  # noqa: E402
     _apply_working_space_recovery,
     _balance_curve,
     _balance_lut,
-    apply_pre_balance_stages,
-    compute_neutral_balance_for_image,
     _ws_enabled,
     adjust_image,
     adjust_image_opencl,
     balance_curve_points,
-    compute_neutral_balance,
     encode_window,
 )
 
@@ -273,145 +270,9 @@ def test_cpu_gpu_parity_windowed(ws_on):
     assert np.max(np.abs(cpu.astype(np.int32) - gpu.astype(np.int32))) <= 2
 
 
-# --- The neutralising inverse (WB picker / AWB) -----------------------------
-
-@pytest.mark.parametrize("trip", [
-    (0.30, 0.22, 0.18),
-    (0.12, 0.20, 0.28),
-    (0.45, 0.50, 0.42),
-    (0.60, 0.58, 0.62),
-])
-def test_inverse_neutralizes_at_the_sampled_tone(trip):
-    """The solve must bring the three channels together AT the sampled tone.
-
-    The residual is bounded by INTEGER SLIDER QUANTIZATION, not by the solve, so
-    the tolerance is derived from what one slider step is worth at this tone
-    rather than hardcoded — otherwise it silently becomes a strength test and
-    breaks whenever BALANCE_MAX_STOPS is retuned."""
-    vals = compute_neutral_balance(*trip)
-    assert all(-100 <= v <= 100 for v in vals)
-    got = [float(_balance_curve(s, v)) for s, v in zip(vals, trip)]
-    step = max(abs(float(_balance_curve(s + 1, v)) - float(_balance_curve(s, v)))
-               for s, v in zip(vals, trip))
-    assert max(got) - min(got) <= 2.0 * step
-
-
-def test_inverse_is_neutral_for_a_neutral_sample():
-    assert compute_neutral_balance(0.5, 0.5, 0.5) == (0, 0, 0)
-
-
-def test_inverse_clamps_an_unreachable_cast():
-    """A cast far beyond what the node can span clamps to the endpoints rather
-    than raising or running away. Red still stays put."""
-    vals = compute_neutral_balance(0.02, 0.5, 0.99)
-    assert vals == (0, -100, -100)
-
-
-def test_red_is_the_anchor_and_never_moves():
-    """Red is the reference the other two are solved onto, so its slider is
-    always left at 0 -- the pick must never move it."""
-    for trip in [(0.42, 0.36, 0.22), (0.10, 0.55, 0.80), (0.5, 0.5, 0.5),
-                 (0.02, 0.99, 0.5), (1.0, 0.0, 0.5)]:
-        assert compute_neutral_balance(*trip)[0] == 0
-
-
-def test_green_and_blue_are_solved_onto_red():
-    """Both land on RED's value, not on the mean -- the mean would have required
-    pushing red down, which is the saturating direction."""
-    trip = (0.42, 0.36, 0.22)
-    _, bg, bb = compute_neutral_balance(*trip)
-    assert float(_balance_curve(bg, trip[1])) == pytest.approx(trip[0], abs=0.01)
-    assert float(_balance_curve(bb, trip[2])) == pytest.approx(trip[0], abs=0.01)
-
-
-def test_red_heavy_cast_only_needs_the_unbounded_direction():
-    """The point of anchoring on red: a converted negative is normally red-heavy,
-    so green and blue move UP -- the direction with no geometric limit -- instead
-    of red being dragged down into the saturating one."""
-    _, bg, bb = compute_neutral_balance(0.42, 0.36, 0.22)
-    assert bg > 0 and bb > 0
-    assert bb > bg                       # blue is further off, so it moves more
-
-
-def test_inverse_needs_absolute_tone_not_just_ratio():
-    """Unlike compute_neutral_temp_tint (flat gains, ratio-only), Balance is
-    tone-dependent: the same cast RATIO at a different tone must give different
-    slider values. This is why both callers now pass normalised [0,1]."""
-    low = compute_neutral_balance(0.10, 0.09, 0.08)
-    high = compute_neutral_balance(0.80, 0.72, 0.64)
-    assert low != high
-
-
-# --- Solving against what the stage actually receives ------------------------
-#
-# The bare curve inverse is only correct when NOTHING moved the pixel before the
-# Balance stage. Channel Levels runs first and carries the hidden Auto Gain
-# offset (on by default for converted images), and Balance is tone-DEPENDENT, so
-# ignoring that made every WB pick and AWB result wrong. These lock the fix in.
-
-class _StubImage:
-    """Minimal duck-type for compute_neutral_balance_for_image."""
-
-    def __init__(self, settings=None, ws=True, converted=True, base=None):
-        self.adjustment_settings = dict(settings or {})
-        self._ws_windowed = ws
-        self.converted = converted
-        self.resized_raw = base
-
-
-def test_pre_balance_stages_is_identity_when_nothing_precedes():
-    rgb = (0.35, 0.30, 0.19)
-    assert apply_pre_balance_stages(rgb, {}) == pytest.approx(rgb, abs=1e-6)
-
-
-def test_pre_balance_stages_applies_channel_levels():
-    rgb = (0.35, 0.30, 0.19)
-    out = apply_pre_balance_stages(rgb, {"ch_r_shift": 30})
-    assert out[0] > rgb[0]
-    assert out[1] == pytest.approx(rgb[1], abs=1e-6)
-
-
-def test_pre_balance_stages_folds_auto_gain_into_master_gain():
-    """Auto Gain cannot create a cast (it is symmetric) but it MOVES THE TONE,
-    and a tone-weighted control solved at the wrong tone lands on the wrong part
-    of the curve. This is what made picks wrong with default settings."""
-    rgb = (0.35, 0.30, 0.19)
-    plain = apply_pre_balance_stages(rgb, {})
-    gained = apply_pre_balance_stages(rgb, {}, auto_gain=40.0)
-    assert gained[0] > plain[0] * 1.1
-    # symmetric: the ratios are untouched, only the level moves
-    assert gained[0] / gained[2] == pytest.approx(plain[0] / plain[2], rel=1e-5)
-
-
-@pytest.mark.parametrize("settings", [
-    {},
-    {"ch_r_shift": 15, "ch_g_gain": 12, "ch_b_blackpoint": -8},
-    {"ch_master_gain": 35},
-    {"ch_input_gain": -20},
-])
-def test_image_aware_solve_beats_the_bare_inverse(settings):
-    """With anything set ahead of Balance, the bare inverse misses and the
-    image-aware solve lands. Checked at the stage's own input, which is where
-    'neutral' has to hold for the render to come out neutral."""
-    rgb = (0.35, 0.308, 0.192)
-    img = _StubImage(settings, converted=False)      # no base -> no auto gain
-    vals = compute_neutral_balance_for_image(img, rgb)
-    pre = apply_pre_balance_stages(rgb, settings)
-    got = [float(_balance_curve(v, x)) for v, x in zip(vals, pre)]
-    assert max(got) - min(got) < 0.01
-
-
-def test_image_aware_solve_survives_a_missing_base():
-    """A stub/partial image must not break the pick (getattr defaults)."""
-    assert compute_neutral_balance_for_image(_StubImage(), (0.3, 0.3, 0.3)) == (0, 0, 0)
-
-
-def test_non_windowed_image_uses_the_clamped_levels_position():
-    """clamp mirrors the pipeline: Channel Levels runs un-clamped on a windowed
-    base and clamped on a full-range one."""
-    rgb = (0.9, 0.9, 0.9)
-    assert apply_pre_balance_stages(rgb, {"ch_master_gain": 60}, clamp=True)[0] == 1.0
-    assert apply_pre_balance_stages(rgb, {"ch_master_gain": 60}, clamp=False)[0] > 1.0
+# The neutral solve is no longer an analytic inverse of this curve, so it is not
+# tested here: CCRImage.solve_neutral_balance closes the loop on the real render
+# and lives in tests/test_channel_balance_ui.py, which can build a real image.
 
 
 # --- Settings keys ----------------------------------------------------------

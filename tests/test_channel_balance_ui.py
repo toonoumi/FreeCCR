@@ -202,71 +202,146 @@ def test_unknown_channel_is_ignored(panel):
                for k in BALANCE_KEYS)
 
 
-# --- WB picker / AWB end to end ---------------------------------------------
+# --- WB picker / AWB: the closed-loop neutral solve ---------------------------
 #
-# The user-visible contract: clicking a neutral spot must make THAT SPOT render
-# neutral. Solving the bare curve inverse against the sampled base does not do
-# that, because Channel Levels (carrying the hidden Auto Gain offset) runs ahead
-# of the tone-dependent Balance stage.
+# The contract: clicking a neutral spot makes THAT SPOT render neutral. This is
+# solved by MEASURING the real render, not by inverting the Balance curve --
+# every attempt to model the intervening stages (Channel Levels, the hidden Auto
+# Gain offset, gamma, curves, Cineon) was wrong in some configuration. These
+# tests therefore assert on rendered output only.
 
-def _cast_scene(tmp_path):
+def _cast_scene(tmp_path, name="scene.png"):
     """A converted, windowed base: a tonal ramp under a yellow cast so Auto Gain
     has real highlights to normalise against, plus a mid-grey patch to pick."""
     from core.ccr_processor import encode_window
-    path = str(tmp_path / "scene.png")
+    path = str(tmp_path / name)
     cv2.imwrite(path, np.full((60, 90, 3), 20000, np.uint16))
     img = CCRImage(path)
     img.converted = True
     img._ws_windowed = True
-    h, w = 60, 90
+    h, w = 300, 450
     ramp = np.linspace(0.02, 1.0, w, dtype=np.float32)[None, :, None].repeat(h, 0)
     cast = np.array([1.0, 0.88, 0.55], np.float32)
     disp = np.clip(ramp * cast, 0, 1.2)
-    disp[25:35, 40:50] = np.array([0.35, 0.35, 0.35], np.float32) * cast
+    disp[140:160, 200:220] = np.array([0.35, 0.35, 0.35], np.float32) * cast
     img.resized_raw = encode_window(disp.copy())
     return img
 
 
-def _pick(img):
-    """What _sample_wb_point hands the solver: the de-windowed sampled triple."""
-    from core.ccr_processor import WS_B, WS_W
-    m = img.resized_raw[30, 45, :].astype(np.float64)
-    return tuple(np.clip((m - WS_B) / (WS_W - WS_B), 0.0, 1.0))
+def _patch(img):
+    """The sampled AREA the eyedropper hands the solver (rad=3 -> 7x7)."""
+    return img.resized_raw[147:154, 207:214].copy()
 
 
-@pytest.mark.parametrize("preset", [
-    {},
-    {"ch_r_shift": 15, "ch_g_gain": 12, "ch_b_blackpoint": -8},
-    {"ch_master_gain": 35},
-    {"ch_input_gain": -20},
-])
-def test_picked_spot_renders_neutral(tmp_path, preset):
-    """End to end through apply_adjustments: after the pick, the sampled spot
-    comes out neutral in the RENDER — including with Channel Levels set and with
-    Auto Gain live."""
-    from core.ccr_processor import compute_neutral_balance_for_image
+def _spot(img, settings):
+    """Mean RGB of the grey patch after a FULL-FRAME render."""
+    out = img.apply_adjustments(img.resized_raw.copy(), settings=settings)
+    return out[140:160, 200:220].reshape(-1, 3).mean(axis=0)
+
+
+def _spread(rgb):
+    return float(rgb.max() - rgb.min()) / max(float(rgb.max()), 1.0)
+
+
+PRESETS = [
+    ("nothing set", {}),
+    ("channel levels", {"ch_r_shift": 15, "ch_g_gain": 12, "ch_b_blackpoint": -8}),
+    ("master gain", {"ch_master_gain": 35}),
+    ("input gain", {"ch_input_gain": -20}),
+    ("cineon log", {"cineon_log": True}),
+    ("tone + saturation", {"gamma": 40, "contrast": 30, "saturation": 25}),
+    ("per-channel curves", {"curves": {"r": [[0, 0], [128, 150], [255, 255]]}}),
+    ("everything", {"ch_r_shift": 10, "ch_master_gain": 25, "gamma": 30,
+                    "contrast": 20, "saturation": 20, "cineon_log": True}),
+]
+
+
+@pytest.mark.parametrize("label,preset", PRESETS, ids=[p[0] for p in PRESETS])
+def test_picked_spot_renders_neutral(tmp_path, label, preset):
+    """The whole point: after the pick the sampled spot is grey IN THE RENDER,
+    under every stage combination -- including per-channel Curves and the Cineon
+    transform, which no analytic inverse of the Balance curve could account for."""
     img = _cast_scene(tmp_path)
     img.adjustment_settings = dict(preset)
-    r, g, b = compute_neutral_balance_for_image(img, _pick(img))
-    settings = dict(preset, balance_r=r, balance_g=g, balance_b=b)
-    out = img.apply_adjustments(img.resized_raw.copy(), settings=settings)
-    spot = out[30, 45, :].astype(float)
-    spread = (spot.max() - spot.min()) / max(spot.max(), 1.0)
-    assert spread < 0.02, f"spot {spot} spread {spread:.3f} with {preset}"
+    r, g, b = img.solve_neutral_balance(_patch(img))
+    before = _spot(img, dict(preset))
+    after = _spot(img, dict(preset, balance_r=r, balance_g=g, balance_b=b))
+    assert _spread(before) > 0.2, "test scene should start visibly cast"
+    assert _spread(after) < 0.02, f"{label}: {after} spread {_spread(after):.3f}"
 
 
-def test_bare_inverse_would_miss(tmp_path):
-    """Guards the regression itself: the un-corrected solve is measurably wrong
-    on the very same frame, so this suite fails if someone reverts to it."""
-    from core.ccr_processor import compute_neutral_balance
+def test_red_slider_is_never_moved(tmp_path):
+    """Red is the anchor: the solve reports 0 for it in every configuration."""
     img = _cast_scene(tmp_path)
-    img.adjustment_settings = {"ch_master_gain": 35}
-    r, g, b = compute_neutral_balance(*_pick(img))
-    settings = dict(img.adjustment_settings,
-                    balance_r=r, balance_g=g, balance_b=b)
-    out = img.apply_adjustments(img.resized_raw.copy(), settings=settings)
-    spot = out[30, 45, :].astype(float)
-    assert (spot.max() - spot.min()) / max(spot.max(), 1.0) > 0.05
+    for _label, preset in PRESETS:
+        img.adjustment_settings = dict(preset)
+        assert img.solve_neutral_balance(_patch(img))[0] == 0
+
+
+def test_first_pass_drives_blue_to_the_mean_of_red_and_green(tmp_path):
+    """One pass of the loop is the described step: with R=134 and G=120, blue
+    lands on 127. Iterating that (red pinned) is what converges to grey."""
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {}
+    start = _spot(img, {})
+    target = (start[0] + start[1]) / 2.0
+    r, g, b = img.solve_neutral_balance(_patch(img), passes=1)
+    after = _spot(img, {"balance_r": r, "balance_g": g, "balance_b": b})
+    assert after[2] == pytest.approx(target, rel=0.02)
+
+
+def test_more_passes_never_get_worse(tmp_path):
+    """The loop keeps the best result it has seen, so adding passes cannot
+    regress -- it must converge monotonically toward grey."""
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {}
+    spreads = []
+    for n in (1, 2, 3, 4):
+        r, g, b = img.solve_neutral_balance(_patch(img), passes=n)
+        spreads.append(_spread(_spot(img, {"balance_r": r, "balance_g": g,
+                                           "balance_b": b})))
+    assert all(b <= a + 1e-6 for a, b in zip(spreads, spreads[1:])), spreads
+    assert spreads[-1] < spreads[0]
+
+
+def test_solve_uses_the_area_not_one_pixel(tmp_path):
+    """Sampling by AREA: a single blown pixel inside the patch must not steer
+    the result, because the loop drives the patch MEAN."""
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {}
+    clean = img.solve_neutral_balance(_patch(img))
+    noisy = _patch(img)
+    noisy[3, 3] = 0                       # one dead pixel in a 7x7 area
+    assert img.solve_neutral_balance(noisy) == pytest.approx(clean, abs=3)
+
+
+def test_black_and_white_profile_leaves_the_sliders_alone(tmp_path):
+    """A B&W render collapses to luminance, so no Balance value can change the
+    output spread. The solver must detect the flat response and leave the
+    sliders at 0 rather than driving them to an endpoint."""
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {}
+    img.color_profile = "bw"
+    assert img.solve_neutral_balance(_patch(img)) == (0, 0, 0)
+
+
+def test_solve_survives_an_empty_patch(tmp_path):
+    img = _cast_scene(tmp_path)
+    assert img.solve_neutral_balance(np.zeros((0, 0, 3), np.uint16)) == (0, 0, 0)
+
+
+def test_auto_gain_is_measured_from_the_base_not_the_patch(tmp_path):
+    """The patch carries no highlights, so measuring Auto Gain from it would give
+    a wildly different gain than the render uses. Passing the base-measured value
+    is what keeps the loop's render equal to the real one."""
+    from core.ccr_processor import compute_auto_gain_offset
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {}
+    ag_base = compute_auto_gain_offset(img.resized_raw, True)
+    ag_patch = compute_auto_gain_offset(_patch(img), True)
+    assert abs(ag_base - ag_patch) > 1.0        # they really do differ
+    r, g, b = img.solve_neutral_balance(_patch(img))
+    assert _spread(_spot(img, {"balance_r": r, "balance_g": g, "balance_b": b})) < 0.02
 
 
 if __name__ == "__main__":

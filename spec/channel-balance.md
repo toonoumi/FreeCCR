@@ -283,89 +283,78 @@ edits a catalog.
 
 ### 4.4 Neutralising inverse (WB Picker / AWB)
 
-**Red is the anchor and is never adjusted.** Blue is solved onto red first,
-then green:
+The neutral solve is a **closed loop on the real render**, not an inverse of the
+Balance curve. `CCRImage.solve_neutral_balance(sample_patch)`:
+
+1. renders the sampled **area** through the actual adjustment pipeline,
+2. measures the mean RGB that came out,
+3. corrects, and repeats.
+
+**Why not an analytic inverse.** Balance is one stage among many between the
+base and the pixel the user sees. Inverting its curve requires *modelling* all
+the others — Channel Levels, the hidden Auto Gain offset, gamma, the tone
+sliders, saturation, per-channel Curves, the Cineon transform — and every such
+model was wrong in some configuration. Three successive analytic versions failed
+in the field. Measurement has no model to get wrong. Do not reintroduce an
+open-loop inverse.
+
+**The loop.** Red is the anchor and is never moved. Each pass solves **blue,
+then green**, onto the mean of the other two *measured* channels — R=134, G=120
+drives B to 127. Iterating that is what converges: with red pinned, "each
+channel toward the mean of the other two" halves the remaining gap per pass and
+settles on red.
 
 ```
-target     = r                       # red is left alone
-balance_b  = bisect(s -> curve_s(b) - target)
-balance_g  = bisect(s -> curve_s(g) - target)
-balance_r  = 0
+pass 0:  R 74.0  G 62.6  B 34.0      mean(R,G) = 68.3
+pass 1:  R 74.0  G 71.0  B 68.3   <- blue lands exactly on the mean
+pass 2:  R 74.0  G 73.0  B 72.2
+pass 3:  R 74.0  G 74.0  B 73.2
+pass 4:  R 74.0  G 74.0  B 74.2      grey
 ```
 
-This is not a stylistic choice. Targeting the *mean* of the three (the original
-behaviour) required pushing red **down**, and downward is the direction that
-saturates — a node at `x = 3/16` can never fall further than 3/16, capping
-downward travel near `-0.26` peak deviation. A converted negative is normally
-red-heavy, so the mean target put the largest correction on the one direction
-that cannot deliver it. Anchoring on red moves green and blue **upward** on
-exactly that cast, and upward is unbounded (the node approaches 1
-asymptotically).
+Each channel is solved by **integer bisection on the measured output**, which is
+monotone in that channel's slider. The loop keeps the best (lowest-spread)
+result it has seen, so more passes can never regress. Measured spot spread,
+full-frame render, on a frame that starts 54–86% off:
 
-| cast (R,G,B) | mean target | red anchor |
-| --- | --- | --- |
-| 0.42, 0.36, 0.22 | −27, −7, 30 | **0, 15, 52** |
-| 0.50, 0.42, 0.24 | −42, −10, 38 | **0, 21, 65** |
-| 0.55, 0.45, 0.20 | −65, −15, 53 | **0, 27, 93** |
+| preceding state | after |
+| --- | --- |
+| nothing set | 0.3% |
+| Channel Levels set | 0.5% |
+| Master Gain 35 | 0.6% |
+| Input Gain −20 | 1.2% |
+| Cineon log | 0.4% |
+| gamma + contrast + saturation | 0.5% |
+| **per-channel Curves** | 0.4% |
+| **all of the above** | 0.2% |
 
-The trade-off is real: on a cast where red is the *lowest* channel (a cyan
-cast), green and blue must come down instead and the saturating limit applies
-again. That is the uncommon case for negative film.
+Cost is 55–310 ms: the loop renders only the 7×7 sample area (~0.9 ms), never
+the full frame.
 
-`curve_s(v)` is monotone in `s` for a fixed `v`, so each solve is a bisection
-(24 iterations, `_solve_balance`); there is no closed form because the
-Fritsch–Carlson tangent limiter makes `curve_s(v)` piecewise in `s`. Targets out
-of reach clamp to `±100` rather than raising. The blue-then-green order is the
-stated intent; the two solves are independent (each channel's curve reads only
-its own slider), so the result does not depend on it.
+**Graceful degradation.** Targeting the mean of the other two rather than red
+directly matters when a channel cannot reach: it lands on the achievable middle
+and the other channel follows it down, instead of one slider pegging and leaving
+the rest stranded.
 
-Note the correction is only exact **at the sampled tone**. That is inherent to
-a tone-dependent control and is the point of it — a picked midtone grey and a
-picked shadow grey will legitimately produce different values.
+**Two hooks make the patch render match the real one** (`apply_adjustments`):
 
-**Sample domain.** Both callers must hand `compute_neutral_balance` values in
-the *normalised display domain* the curve operates on, not the 0–65535 scale
-`compute_neutral_temp_tint` took (which only ever used ratios):
+* `auto_gain_override` — Auto Gain is measured from whatever buffer it is given,
+  and a patch carries no highlights, so it would compute a wildly different
+  gain. The caller measures once from the **full base** and passes it in.
+* `skip_dust` — dust healing is spatial and meaningless on a detached patch.
+  Area layers are suppressed with the existing `areas_override=[]`.
 
-- `awb.estimate_neutral_rgb` already returns exactly this — it de-windows for a
-  windowed base and divides by 65535 otherwise (`awb.py:80-85`). No change.
-- `image_preview._sample_wb_point` currently rescales its de-windowed sample
-  back up by 65535 (`image_preview.py:421-424`); that multiply is dropped, the
-  clamp to `[0,1]` kept.
+**Flat-response guard.** Under a Black & White profile the output is luminance,
+so no Balance value changes the spread. The solver detects the unresponsive
+channel and leaves it at 0 instead of driving it to an endpoint.
 
-**Solving against the stage's actual input (required).** The bare curve inverse
-is only correct if nothing moved the pixel before the Balance stage — and
-something almost always has:
+**AWB** shares the loop: `estimate_neutral_rgb` produces a display triple, which
+`compute_awb_balance` encodes back into the base domain as a one-pixel sample
+area and hands to the same solver.
 
-* **Channel Levels** runs first and is per-channel, so it changes the very cast
-  the pick is cancelling.
-* Its Master Gain carries the hidden **Auto Gain** offset, which is **on by
-  default for converted images**. Auto Gain is channel-symmetric and so cannot
-  create a cast, but it *moves the tone* — and a tone-DEPENDENT control solved
-  at the wrong tone lands on the wrong part of the curve.
-
-So both callers go through `compute_neutral_balance_for_image(image, rgb)`,
-which runs `apply_pre_balance_stages()` (Channel Levels, with Auto Gain folded
-into Master Gain, clamped iff the base is full-range) on the sample and solves
-`compute_neutral_balance` on the result. Measured on a cast frame, spot spread
-after the pick:
-
-| preceding state | bare inverse | image-aware solve |
-| --- | --- | --- |
-| nothing set | 4.9% | **1.1%** |
-| Channel Levels set | 27.0% | **1.0%** |
-| Master Gain 35 | 19.9% | **0.3%** |
-| Input Gain −20 | 19.6% | **0.1%** |
-
-The residual is integer slider quantization. Everything *after* Balance is
-channel-symmetric for a neutral pixel (contrast, brightness, gamma, saturation
-and the bands all leave a neutral alone), so making the stage's input neutral is
-what makes the render neutral — the one exception being a user-set per-channel
-**Curves** entry, which can re-introduce a cast after the fact.
-
-Auto Gain is measured from the **whole base**, not the crop, because that is
-what the render does. Two different bases therefore land on different sliders
-from an identical estimate, which is correct.
+Note the correction is exact only **at the sampled tone** — inherent to a
+tone-dependent control. A picked midtone and a picked shadow legitimately give
+different values.
 
 ### 4.5 Dispatch
 

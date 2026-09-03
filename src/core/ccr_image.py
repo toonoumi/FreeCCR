@@ -1133,22 +1133,138 @@ class CCRImage:
               f"{time.time() - t0:.3f}s")
         return out
 
+    # --- Closed-loop neutral solve (WB picker / AWB) -------------------------
+    # See spec/channel-balance.md. The Balance stage is only one of many stages
+    # between the base and the pixel the user sees, and inverting the Balance
+    # curve analytically means MODELLING all the others (Channel Levels, the
+    # hidden Auto Gain offset, gamma, curves, the Cineon transform, ...). Every
+    # such model has been wrong in some configuration. This measures instead:
+    # render the sampled AREA through the real pipeline, look at what came out,
+    # correct, repeat.
+    NEUTRAL_SOLVE_PASSES = 8        # outer passes over (blue, green)
+    NEUTRAL_SOLVE_TOL = 0.002       # stop once the spread is under 0.2% of full scale
+    _NEUTRAL_FLAT_EPS = 8.0         # counts: below this a channel is unresponsive
+
+    def solve_neutral_balance(self, sample_patch, settings=None,
+                              passes=None) -> tuple:
+        """Balance slider ints that drive the RENDERED `sample_patch` to grey.
+
+        `sample_patch` is a patch of the BASE (the same neighbourhood the
+        eyedropper samples); it is rendered as an AREA and its mean is what gets
+        driven to neutral, so a single noisy pixel cannot steer the result.
+
+        Red is the anchor and is never moved. Each pass solves BLUE, then GREEN,
+        onto the mean of the other two measured channels — i.e. R=134, G=120
+        drives B to 127. Iterating that is what makes it converge: with red
+        pinned, "each channel toward the mean of the other two" halves the
+        remaining gap each pass and settles on red, while degrading gracefully
+        when a channel cannot reach (it lands on the achievable middle instead
+        of pegging and leaving the other two stranded).
+
+        Each channel is solved by bisection **on the measured output**, which is
+        monotone in that channel's slider, so no model of the pipeline is
+        involved. A channel whose output does not respond at all (Black & White
+        profile, say) is left alone rather than driven to an endpoint.
+
+        Returns (balance_r, balance_g, balance_b); balance_r is always 0."""
+        from core.ccr_processor import compute_auto_gain_offset
+        from core.ccr_backend import ccr_backend
+
+        patch = np.asarray(sample_patch)
+        if patch.ndim == 2:
+            patch = patch.reshape(1, -1, 3)
+        if patch.size == 0:
+            return (0, 0, 0)
+        ws = bool(getattr(self, "_ws_windowed", False))
+        base = getattr(self, "resized_raw", None)
+        auto_on = getattr(ccr_backend, "auto_gain", True) and self.converted
+        # Auto Gain is measured from the WHOLE base, exactly as the render
+        # measures it — never from the patch, which carries no highlights.
+        ag = (compute_auto_gain_offset(base, ws)
+              if (auto_on and base is not None) else 0.0)
+        base_settings = dict(self.adjustment_settings if settings is None else settings)
+
+        def measure(bal):
+            """Mean RGB of the sample AREA after the real adjustment pipeline."""
+            st = dict(base_settings)
+            st["balance_r"], st["balance_g"], st["balance_b"] = bal
+            out = self.apply_adjustments(patch.copy(), settings=st,
+                                         areas_override=[], ws_windowed=ws,
+                                         auto_gain_override=ag, skip_dust=True)
+            return out.reshape(-1, 3).mean(axis=0).astype(np.float64)
+
+        def solve_channel(idx, bal, target):
+            """Integer bisection on the MEASURED output of channel `idx`."""
+            probe = list(bal)
+            probe[idx] = -100
+            lo_val = measure(probe)[idx]
+            probe[idx] = 100
+            hi_val = measure(probe)[idx]
+            if abs(hi_val - lo_val) < self._NEUTRAL_FLAT_EPS:
+                return bal[idx]              # unresponsive — don't peg it
+            if lo_val >= target:
+                return -100
+            if hi_val <= target:
+                return 100
+            lo, hi = -100, 100
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                probe[idx] = mid
+                if measure(probe)[idx] < target:
+                    lo = mid
+                else:
+                    hi = mid
+            probe[idx] = lo
+            d_lo = abs(measure(probe)[idx] - target)
+            probe[idx] = hi
+            d_hi = abs(measure(probe)[idx] - target)
+            return lo if d_lo <= d_hi else hi
+
+        bal = [0, int(base_settings.get("balance_g", 0)),
+               int(base_settings.get("balance_b", 0))]
+        best, best_spread = list(bal), float("inf")
+        tol = self.NEUTRAL_SOLVE_TOL * 65535.0
+        for _ in range(self.NEUTRAL_SOLVE_PASSES if passes is None else passes):
+            m = measure(bal)
+            spread = float(m.max() - m.min())
+            if spread < best_spread:
+                best, best_spread = list(bal), spread
+            if spread <= tol:
+                break
+            for idx in (2, 1):               # blue first, then green
+                m = measure(bal)
+                target = float(sum(m[j] for j in range(3) if j != idx) / 2.0)
+                bal[idx] = solve_channel(idx, bal, target)
+        m = measure(bal)
+        if float(m.max() - m.min()) < best_spread:
+            best = list(bal)
+        return (0, int(best[1]), int(best[2]))
+
     def apply_adjustments(self, image: np.ndarray, settings=None, contrast_base=None,
                           temperature_base=None, brightness_base=None,
                           color_profile=None, areas_override=None,
-                          exposure_base=None, ws_windowed=None) -> np.ndarray:
+                          exposure_base=None, ws_windowed=None,
+                          auto_gain_override=None, skip_dust=False) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently — and let the
         export pipeline describe the buffer it just produced (ws_windowed)
-        without mutating this image's live state."""
+        without mutating this image's live state.
+
+        `auto_gain_override` / `skip_dust` exist for solve_neutral_balance, which
+        renders a small SAMPLE AREA repeatedly in a closed loop. Auto Gain is
+        measured from whatever buffer it is handed, so a patch would compute its
+        own (wrong) gain — the caller passes the value measured from the full
+        base instead. Dust healing is spatial and meaningless on a detached
+        patch, so it is skipped there."""
         # Dust removal runs FIRST so the inpainted positive flows through the
         # rest of the adjustment stage (and so a dust-only image is still
         # cleaned even when the early-return guard below would otherwise skip).
         # It runs on the (possibly WINDOWED) base, so the heal must know — the
         # sampling rule's hue/sat/value deltas are computed on display values.
         ws = self._ws_windowed if ws_windowed is None else ws_windowed
-        image = self._apply_dust_removal(image, ws_windowed=ws)
+        if not skip_dust:
+            image = self._apply_dust_removal(image, ws_windowed=ws)
         s = self.adjustment_settings if settings is None else settings
         cb = self.contrast_base if contrast_base is None else contrast_base
         tb = self.temperature_base if temperature_base is None else temperature_base
@@ -1170,7 +1286,10 @@ class CCRImage:
         # ccr_backend imports CCRImage at load.
         from core.ccr_backend import ccr_backend
         auto_on = getattr(ccr_backend, "auto_gain", True) and self.converted
-        ag = compute_auto_gain_offset(image, ws) if auto_on else 0.0
+        if auto_gain_override is not None:
+            ag = float(auto_gain_override)     # measured once from the full base
+        else:
+            ag = compute_auto_gain_offset(image, ws) if auto_on else 0.0
         eb_eff = 0.0 if auto_on else eb        # suppress-overlap with the baked eb
         if (not s and cb == 0 and tb == 0 and bb == 0 and eb_eff == 0 and ag == 0
                 and not has_areas):

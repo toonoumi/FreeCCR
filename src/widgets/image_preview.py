@@ -411,30 +411,16 @@ class GraphicsImageView(QGraphicsView):
         h, w = data.shape[:2]
         if not (0 <= x < w and 0 <= y < h):
             return
-        import numpy as np
         rad = 3
-        crop = data[max(0, y - rad):min(h, y + rad + 1),
-                    max(0, x - rad):min(w, x + rad + 1), :]
-        means = np.mean(crop.reshape(-1, 3), axis=0)
-        # A windowed working-space base is in container codes, not display values;
-        # de-window (+ window-clamp) the sample so the neutral pick matches the
-        # displayed positive (a no-op when the feature is off / base is full-range).
-        # Channel Balance is TONE-weighted, so the inverse needs the sample in
-        # NORMALISED [0,1] display units, not the 0-65535 scale the old
-        # temperature/tint inverse took (it used channel ratios only).
-        if getattr(img_obj, '_ws_windowed', False):
-            from core.ccr_processor import WS_B, WS_W
-            means = np.clip((means - WS_B) / (WS_W - WS_B), 0.0, 1.0)
-        else:
-            means = np.clip(means / 65535.0, 0.0, 1.0)
-
-        # Solve against what the Balance stage actually RECEIVES, not the bare
-        # base sample: Channel Levels runs first and carries the hidden Auto Gain
-        # offset, and Balance is tone-dependent, so the un-adjusted sample lands
-        # on the wrong part of the curve. See spec/channel-balance.md §4.4.
-        from core.ccr_processor import compute_neutral_balance_for_image
-        balance = compute_neutral_balance_for_image(
-            img_obj, (means[0], means[1], means[2]))
+        patch = data[max(0, y - rad):min(h, y + rad + 1),
+                     max(0, x - rad):min(w, x + rad + 1), :]
+        if patch.size == 0:
+            return
+        # Closed loop on the REAL render: the solver renders this sample AREA
+        # through the whole adjustment pipeline, measures what actually comes
+        # out, and corrects — no model of the intervening stages, which is what
+        # kept getting this wrong. See spec/channel-balance.md.
+        balance = img_obj.solve_neutral_balance(patch)
         try:
             pw.parent().parent().sliders_panel.on_wb_sampled(*balance)
         except AttributeError:

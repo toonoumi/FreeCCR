@@ -1294,119 +1294,14 @@ def _apply_channel_balance(d: np.ndarray, balance_r: float, balance_g: float,
     return d
 
 
-def apply_pre_balance_stages(rgb, settings, auto_gain: float = 0.0,
-                             clamp: bool = False) -> tuple:
-    """Run the stages that precede Channel Balance on one sampled DISPLAY triple,
-    returning the triple the Balance stage will actually receive.
-
-    Only one stage sits in front of Balance — Channel Levels — but it matters for
-    two reasons, and BOTH bite in practice:
-
-      * it is per-channel, so it changes the cast the pick is trying to cancel;
-      * it carries the hidden AUTO GAIN offset on its Master Gain. Auto Gain is
-        channel-symmetric (it cannot create a cast) but it MOVES THE TONE, and
-        Balance is tone-DEPENDENT — solving at the un-gained tone lands on the
-        wrong part of the curve. Auto Gain is on by default for converted
-        images, so ignoring this made every pick wrong.
-
-    `clamp` mirrors the pipeline position: False for a windowed base (Channel
-    Levels runs un-clamped there), True for a full-range one.
-    See spec/channel-balance.md §4.4."""
-    s = settings or {}
-    d = np.asarray(rgb, dtype=np.float32).reshape(1, 1, 3).copy()
-    ch = [s.get(k, 0) for k in (
-        "ch_input_gain", "ch_master_shift", "ch_master_gain",
-        "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
-        "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
-        "ch_b_shift", "ch_b_gain", "ch_b_blackpoint")]
-    ch[2] = ch[2] + auto_gain            # Auto Gain rides Master Gain
-    if _channel_levels_active(*ch):
-        _apply_channel_levels(d, *ch, clamp=clamp)
-    return float(d[0, 0, 0]), float(d[0, 0, 1]), float(d[0, 0, 2])
-
-
-def compute_neutral_balance_for_image(image_obj, rgb) -> tuple:
-    """Balance slider values that neutralize a sampled DISPLAY triple `rgb` on
-    `image_obj`, accounting for what runs before the Balance stage.
-
-    This is what the WB eyedropper and AWB both call: solving the bare curve
-    inverse against the sampled BASE value is wrong whenever Channel Levels or
-    Auto Gain has moved the pixel, which is the normal case. Tolerates
-    stub/minimal image objects (getattr defaults throughout)."""
-    ws = bool(getattr(image_obj, "_ws_windowed", False))
-    auto_gain = 0.0
-    try:
-        from core.ccr_backend import ccr_backend      # deferred: circular at load
-        if getattr(ccr_backend, "auto_gain", True) and getattr(image_obj, "converted", False):
-            base = getattr(image_obj, "resized_raw", None)
-            if base is not None:
-                auto_gain = compute_auto_gain_offset(base, ws)
-    except Exception:
-        auto_gain = 0.0                                # never block a pick on this
-    pre = apply_pre_balance_stages(rgb, getattr(image_obj, "adjustment_settings", None),
-                                   auto_gain=auto_gain, clamp=not ws)
-    return compute_neutral_balance(*pre)
-
-
-def _solve_balance(v: float, target: float) -> int:
-    """The Balance slider int that maps display value `v` onto `target`.
-
-    curve_s(v) is monotone in the slider value s for a fixed v, so this is a
-    bisection; there is no closed form because the Fritsch-Carlson tangent
-    limiter makes curve_s(v) piecewise in s. A target out of reach clamps to the
-    endpoint instead of raising."""
-    if float(_balance_curve(100.0, v)) <= target:
-        return 100
-    if float(_balance_curve(-100.0, v)) >= target:
-        return -100
-    lo, hi = -100.0, 100.0
-    for _ in range(24):                       # ~1e-5 slider units — far below 1 step
-        mid = 0.5 * (lo + hi)
-        if float(_balance_curve(mid, v)) < target:
-            lo = mid
-        else:
-            hi = mid
-    return int(round(0.5 * (lo + hi)))
-
-
-def compute_neutral_balance(r: float, g: float, b: float) -> tuple:
-    """Balance slider ints [-100, 100] that neutralize a sampled cast.
-
-    `r`, `g`, `b` are NORMALISED display values in [0,1] — the domain the
-    Balance curve operates on. (compute_neutral_temp_tint took 0–65535 and used
-    ratios only; a tone-DEPENDENT control needs the absolute tone, not the
-    ratio, so both callers pass normalised values.)
-
-    **Red is the anchor and is never adjusted.** Blue is solved onto red first,
-    then green. This is not a stylistic choice — it is what makes the pick
-    actually reach neutral on film:
-
-      * Targeting the MEAN (the previous behaviour) required pushing red DOWN,
-        and downward is the direction that saturates: a node at x=3/16 can never
-        fall further than 3/16, capping downward travel near -0.26 peak
-        deviation. A converted negative is normally red-heavy, so the mean
-        target put the largest correction on the one direction that cannot
-        deliver it, and the pick fell short.
-      * Anchoring on red moves green and blue UPWARD instead on exactly that
-        cast, and upward is the unbounded direction (the node approaches 1
-        asymptotically). The same correction now lands comfortably.
-
-    The trade-off is real and worth knowing: on a cast where red is the LOWEST
-    channel (a cyan cast), green and blue have to come down instead and the
-    saturating limit applies again. That is the uncommon case for negative film.
-
-    The blue-then-green order is the stated intent; the two solves are
-    independent (each channel's curve reads only its own slider), so the result
-    does not depend on it.
-
-    The correction is exact only AT the sampled tone — inherent to a
-    tone-weighted control, and the reason a picked shadow and a picked midtone
-    legitimately give different answers."""
-    r, g, b = (float(np.clip(v, 0.0, 1.0)) for v in (r, g, b))
-    target = r                                # red is the anchor: never moved
-    balance_b = _solve_balance(b, target)     # blue first...
-    balance_g = _solve_balance(g, target)     # ...then green
-    return (0, balance_g, balance_b)
+# The analytic neutral inverse that used to live here (compute_neutral_balance /
+# compute_neutral_balance_for_image / apply_pre_balance_stages) is GONE. It
+# inverted the Balance curve and then tried to MODEL every other stage between
+# the base and the visible pixel — Channel Levels, the hidden Auto Gain offset,
+# gamma, curves, Cineon — and each model was wrong in some configuration. The
+# WB picker and AWB now measure instead: CCRImage.solve_neutral_balance renders
+# the sampled AREA through the real pipeline and bisects on the OUTPUT. Do not
+# reintroduce an open-loop inverse here. See spec/channel-balance.md.
 
 
 # --- Channel Levels: the FIRST adjustment stage (spec/channel-levels-pre-clamp.md)
