@@ -1158,9 +1158,12 @@ class CCRImage:
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)
-        # Auto Gain (spec/auto-gain.md): a hidden, live offset on the Gain stage
-        # that places the top-0.1% in-bound highlight at 99% of the working-space
-        # window. Film CONVERSIONS only — its reference is the sampled clear/dense
+        # Auto Gain (spec/auto-gain.md): a hidden, live offset on Channel Levels'
+        # MASTER GAIN that places the top-2% in-bound highlight at 95% of the
+        # working-space window. Master Gain is now the app's one gain control (the
+        # general-adjustments "Gain" slider was the same math at a different scale
+        # and was removed), so Auto Gain and the user's manual gain ride the same
+        # stage. Film CONVERSIONS only — its reference is the sampled clear/dense
         # range, which positive mode has no concept of (positive previews stay
         # identity; adjustments own the look). When ON it SUPERSEDES the legacy
         # baked auto-exposure (eb) so they don't double-apply. Deferred import —
@@ -1181,13 +1184,15 @@ class CCRImage:
         adjusted = adjust_image_opencl(image,
                      s.get('temperature', 0) + tb,
                      s.get('tint', 0),
-                     # Auto-exposure (default-slope mode) rides the Gain/Exposure
-                     # stage as a non-destructive base (UI slider stays 0). With the
-                     # working space ON it is applied un-clamped before the window
-                     # clamp, so the lifted top lands in highlight headroom. Auto
-                     # Gain (ag) is the live, toggleable generalization; when on it
-                     # replaces eb (eb_eff == 0). Both ride this same Gain value.
-                     s.get('exposure', 0) + eb_eff + ag,
+                     # The Gain/Exposure stage has no slider any more. It still
+                     # carries the legacy baked auto-exposure (eb, default-slope
+                     # mode) and whatever an AREA layer sets programmatically;
+                     # applied un-clamped before the window clamp so a lift lands
+                     # in highlight headroom. Auto Gain (ag) is the live,
+                     # toggleable generalization and now rides MASTER GAIN below;
+                     # when it is on it replaces eb (eb_eff == 0) so the two can't
+                     # double-apply.
+                     s.get('exposure', 0) + eb_eff,
                      # Brightness slider is half-strength per click; the
                      # always-on base offset (bb) keeps full weight so the
                      # default look is unchanged.
@@ -1201,7 +1206,10 @@ class CCRImage:
                      shadows=s.get('shadows', 0),
                      ch_input_gain=s.get('ch_input_gain', 0),
                      ch_master_shift=s.get('ch_master_shift', 0),
-                     ch_master_gain=s.get('ch_master_gain', 0),
+                     # Auto Gain rides Master Gain: ADDED to the user's value, so
+                     # the slider still reads what the user set while the render
+                     # carries the automatic normalization on top.
+                     ch_master_gain=s.get('ch_master_gain', 0) + ag,
                      ch_r_shift=s.get('ch_r_shift', 0),
                      ch_r_gain=s.get('ch_r_gain', 0),
                      ch_r_blackpoint=s.get('ch_r_blackpoint', 0),

@@ -1456,21 +1456,26 @@ def compute_auto_exposure_gain(img_bgr: np.ndarray, ws_windowed: bool = False) -
 AG_PERCENTILE = 98.0       # top 2% highlight
 AG_TARGET = 0.95           # placed at 95% of the window (display white = 1.0)
 AG_HI = 1.0                # in-bound ceiling = sampled dense point / SLOPE ceiling
-AG_GMIN = 0.6              # Gain stage range: v=-200..+200 → g = 1/(1-v/300) = 0.6..3.0
+# Master Gain range: v=-100..+100 → g = 1/(1 - v/CH_SLIDER_DIV) = 0.6..3.0. The
+# slider spans EXACTLY this gain range, so no achievable gain is clipped away.
+AG_GMIN = 0.6
 AG_GMAX = 3.0
 AG_EPS = 1e-4
 
 
 def compute_auto_gain_offset(base_u16: np.ndarray, ws_windowed: bool = False) -> float:
-    """Return the invisible Gain-slider offset that places the AG_PERCENTILE
+    """Return the invisible MASTER GAIN offset that places the AG_PERCENTILE
     in-bound highlight luminance at AG_TARGET of the working-space window.
 
-    The offset rides the Gain/Exposure stage (g = 1/(1 - v/300)) and is ADDED to
-    the user's Gain value; with the slider at 0 the realized gain is exactly the
-    clamped g, so the measured highlight lands at AG_TARGET. Depends only on the
-    base pixels + window geometry (NOT on any slider), so it is constant across a
-    slider drag. Index 0=R, 1=G, 2=B. Returns 0.0 when there isn't enough in-bound
-    content (mostly headroom/holder). See spec/auto-gain.md."""
+    The offset rides Channel Levels' Master Gain (g = 1/(1 - v/CH_SLIDER_DIV))
+    and is ADDED to the user's Master Gain value; with that slider at 0 the
+    realized gain is exactly the clamped g, so the measured highlight lands at
+    AG_TARGET. Master Gain is the app's one gain control — the old general-
+    adjustments "Gain" slider was the same math at a different scale and is gone.
+
+    Depends only on the base pixels + window geometry (NOT on any slider), so it
+    is constant across a slider drag. Index 0=R, 1=G, 2=B. Returns 0.0 when there
+    isn't enough in-bound content (mostly headroom/holder). See spec/auto-gain.md."""
     d = base_u16.astype(np.float32)
     if ws_windowed:
         d -= np.float32(WS_B)
@@ -1486,8 +1491,11 @@ def compute_auto_gain_offset(base_u16: np.ndarray, ws_windowed: bool = False) ->
     if p <= AG_EPS:
         return 0.0
     g = float(np.clip(AG_TARGET / p, AG_GMIN, AG_GMAX))
-    v = 300.0 * (1.0 - 1.0 / g)                # inverse of g = 1/(1 - v/300)
-    return float(np.clip(v, -200.0, 200.0))
+    # Inverse of the Master Gain curve g = 1/(1 - v/CH_SLIDER_DIV). AG_GMIN/GMAX
+    # are exactly the slider's endpoints, so this never needs clipping — the
+    # clamp is belt-and-braces against a future retune of either constant.
+    v = CH_SLIDER_DIV * (1.0 - 1.0 / g)
+    return float(np.clip(v, -100.0, 100.0))
 
 
 def _twopoint_invert(img_f: np.ndarray, black_point_bgr, white_point_bgr,

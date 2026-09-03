@@ -219,6 +219,50 @@ population block (`:659-697`) stays exactly where it is — it runs after the ma
 sliders (`:584-602`) and before the band sliders (`:749`), which is the order
 `ADJUSTMENT_KEYS` requires, and `self.od_section` already exists by then.
 
+## 4.1 Master Gain is the one gain control (v2)
+
+The general-adjustments **Gain** slider and Channel Levels' **Master Gain** were
+the same math at different scales — `g = 1/(1 - v/300)` over `±200` versus
+`g = 1/(1 - v/150)` over `±100`. Both span exactly `g ∈ [0.6, 3.0]`. Keeping two
+sliders for one control, on two different stages, is what made "which gain does
+Auto Gain move?" ambiguous. So:
+
+- **The Gain slider is removed.** `"exposure"` leaves `ADJUSTMENT_KEYS` and the
+  `tone` sync group (whose label drops "gain").
+- **Master Gain moves outside the collapsible**, immediately below it, so it is
+  always visible. Its `create_slider()` call stays third among the channel
+  sliders — only the layout it is inserted into changes — so the positional
+  `ADJUSTMENT_KEYS` zip is untouched. The panel reserves the slot with
+  `scroll_layout.count()` right after adding the section and fills it later with
+  `insertLayout`.
+- **Auto Gain rides Master Gain.** `compute_auto_gain_offset` returns
+  `v = CH_SLIDER_DIV * (1 - 1/g)` clamped to `±100`, and
+  `apply_adjustments` adds it to `ch_master_gain` instead of `exposure`.
+  `AG_GMIN`/`AG_GMAX` (0.6/3.0) are exactly the slider's endpoints, so no
+  reachable gain is clipped.
+- Master Gain stays in the **`channels`** sync group rather than moving to
+  `tone`: it is a Channel Levels key on the Channel Levels stage, and splitting
+  one stage across two sync groups would be worse than the label change. The
+  group's label becomes "Channel Levels (incl. Master Gain)".
+
+**The `exposure` pipeline parameter survives** — it is not dead. It still carries
+the legacy baked auto-exposure `eb` (default-slope conversions when Auto Gain is
+off) and whatever an area layer sets programmatically. It simply has no slider.
+`eb` was deliberately *not* moved: it is computed in `50·log2(g)` stops units and
+consumed by the `/300` curve, a pre-existing mismatch (it delivers ~1.2× when it
+asks for 2×), and re-pointing it at Master Gain would change the look of
+default-slope conversions for anyone with Auto Gain off without fixing the
+underlying units bug. That fix is its own change.
+
+### Ordering note
+
+Auto Gain moving from the `exposure` stage to Master Gain does **not** reorder it
+relative to the per-channel work: after §3.2, Channel Levels already ran ahead of
+`exposure`, and Master Gain is the last sub-stage of Channel Levels. Master Gain,
+White Balance, White Point and `exposure` are all pure multiplies on un-clamped
+`d`, so they commute — the only non-commuting neighbour is Master *Shift*, which
+Master Gain already followed.
+
 ## 5. Data model
 
 No key changes. `ch_input_gain`, `ch_master_shift`, `ch_master_gain`,

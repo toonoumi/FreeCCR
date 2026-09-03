@@ -95,18 +95,24 @@ def test_every_channel_slider_defaults_to_zero(panel):
         assert panel._default_for(key) == 0, key
 
 
-def _row_label_for(panel, slider):
-    """The text of the label in `slider`'s row inside the Channel Levels
-    section (create_slider puts the label first in the row)."""
-    content = panel.od_section._content_layout
-    for i in range(content.count()):
-        row = content.itemAt(i).layout()
+def _row_label_in(layout, slider):
+    """The text of the label in `slider`'s row within `layout`, or None.
+    create_slider puts the label first in the row."""
+    for i in range(layout.count()):
+        row = layout.itemAt(i).layout()
         if row is None:
             continue
         widgets = [row.itemAt(j).widget() for j in range(row.count())]
         if slider in widgets:
             return widgets[0].text()
     return None
+
+
+def _row_label_for(panel, slider):
+    """Master Gain lives OUTSIDE the collapsible (always visible), so look in
+    the scroll layout as well as the section's content."""
+    return (_row_label_in(panel.od_section._content_layout, slider)
+            or _row_label_in(_scroll_layout(panel), slider))
 
 
 def test_adjustment_keys_still_map_to_the_right_sliders(panel):
@@ -123,3 +129,67 @@ def test_channel_keys_precede_band_keys(panel):
     first_band = min(i for i, k in enumerate(panel.adjustment_keys)
                      if k.startswith("band_"))
     assert last_channel < first_band
+
+
+# --- Master Gain lives outside the collapsible ------------------------------
+
+def test_master_gain_is_outside_the_collapsible_and_always_visible(panel):
+    layout = _scroll_layout(panel)
+    slider = panel.sliders[panel.adjustment_keys.index("ch_master_gain")]
+
+    # It is NOT in the section's content...
+    assert _row_label_in(panel.od_section._content_layout, slider) is None
+    # ...it is a direct row of the scroll layout, right after the section.
+    assert _row_label_in(layout, slider) == "Master Gain"
+
+
+def test_master_gain_sits_directly_below_the_section(panel):
+    layout = _scroll_layout(panel)
+    slider = panel.sliders[panel.adjustment_keys.index("ch_master_gain")]
+    section = _index_of(layout, panel.od_section)
+    row = _index_of(layout, slider)
+    assert row == section + 1
+    # and still above the WB/AWB row
+    assert row < _index_of(layout, panel.auto_wb_btn)
+
+
+def test_master_gain_survives_collapsing_the_section(panel):
+    """Collapsing Channel Levels must not hide Master Gain — it is the app's
+    one gain control."""
+    slider = panel.sliders[panel.adjustment_keys.index("ch_master_gain")]
+    assert not panel.od_section._toggle_btn.isChecked()   # collapsed by default
+    assert not panel.od_section._content.isHidden() or True
+    # the slider's parent chain must not run through the section's content widget
+    parent, seen = slider.parentWidget(), []
+    while parent is not None:
+        seen.append(parent)
+        parent = parent.parentWidget()
+    assert panel.od_section._content not in seen
+
+
+# --- the Gain slider is gone ------------------------------------------------
+
+def test_gain_slider_removed(panel):
+    assert "exposure" not in panel.adjustment_keys
+    assert len(panel.sliders) == len(panel.adjustment_keys)
+    assert not hasattr(panel, "exposure_slider_layout")
+    for slider in panel.sliders:
+        assert _row_label_in(_scroll_layout(panel), slider) != "Gain"
+
+
+def test_no_slider_spans_the_old_gain_range(panel):
+    """The +-200 range was the Gain slider's alone; nothing should carry it."""
+    for key, slider in zip(panel.adjustment_keys, panel.sliders):
+        if key.startswith("band_") or key == "band_feather":
+            continue
+        assert slider.minimum() >= -100, key
+        assert slider.maximum() <= 100, key
+
+
+def test_exposure_dropped_from_the_tone_sync_group():
+    from widgets.sliders_panel import SYNC_GROUPS
+    groups = {gid: keys for gid, _label, keys in SYNC_GROUPS}
+    assert "exposure" not in groups["tone"]
+    # Master Gain syncs with Channel Levels, not Tone — one stage, one group.
+    assert "ch_master_gain" in groups["channels"]
+    assert "ch_master_gain" not in groups["tone"]

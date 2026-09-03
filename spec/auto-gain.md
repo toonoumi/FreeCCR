@@ -42,7 +42,8 @@ supersedes when on), [`spec/working-space-headroom.md`](working-space-headroom.m
 ## 1. Summary
 
 Auto Gain is a toggleable (Settings → **General**) convenience that, **without
-moving the Gain slider**, secretly offsets the Gain stage so the top 2 % of
+moving the Master Gain slider**, secretly offsets Channel Levels' Master Gain
+stage so the top 2 % of
 in-bound highlights lands at 95 % of the working-space window (display 0.95). It
 rides the exact mechanism the legacy default-slope auto-exposure already uses —
 an invisible additive offset on the `exposure` (Gain) parameter — but is general
@@ -68,18 +69,20 @@ clear/dense range when measuring the highlight.
   same shared stage on both the numpy and OpenCL paths.
 
 ### Non-goals
-- Changing the Gain slider's value, range, or UI; the offset stays invisible.
+- Changing the Master Gain slider's value, range, or UI; the offset stays invisible.
 - Per-channel / white-balance behaviour (Auto Gain is a uniform gain).
 - Auto-gaining **area layers** (`_adjust_for_area` zeroes base offsets — areas
   composite on the already-gained whole-image base and must not re-gain).
 - The reference-frame normalize conversion math, dust, crop, curves.
 - Fixing the pre-existing units quirk in `compute_auto_exposure_gain` (it returns
   `50·log2(g)`, a stops mapping consumed by the `/300` curve — left as-is for the
-  OFF path; the new function uses the correct inverse of the actual stage).
+  OFF path; the new function uses the correct inverse of the actual stage). Note
+  that the legacy `eb` still rides the slider-less `exposure` stage, which keeps
+  its `/300` curve; only Auto Gain moved to Master Gain.
 
 ## 3. Current behaviour (as-is)
 
-`ccr_image.apply_adjustments` already adds a hidden offset to the Gain stage:
+`ccr_image.apply_adjustments` already adds a hidden offset to the gain stage:
 
 ```
 adjust_image_opencl(image,
@@ -92,7 +95,8 @@ adjust_image_opencl(image,
 `eb` is computed **once** at conversion by `compute_auto_exposure_gain` (98th
 percentile → 0.98, film-holder excluded via a luminance cut) and stored on the
 image; it is non-zero **only** for default-slope (black-point-only) conversions.
-The Gain stage is `g = 1 / (1 − v/300)` for slider value `v ∈ [−200, 200]`
+The Master Gain stage is `g = 1 / (1 − v/CH_SLIDER_DIV)` (`CH_SLIDER_DIV = 150`)
+for slider value `v ∈ [−100, 100]`
 (`g ∈ [0.6, 3.0]`), applied **un-clamped before the window clamp** in
 `_apply_working_space_recovery` when `ws_windowed` (so it can lift dark frames
 *and* pull blown highlights down out of headroom), or on the clamped range in the
@@ -128,8 +132,8 @@ if p <= AG_EPS:
     return 0.0
 g = AG_TARGET / p                                # gain that puts p at 0.95
 g = clip(g, AG_GMIN, AG_GMAX)                    # [0.6, 3.0] — the stage's range
-v = 300.0 * (1.0 - 1.0/g)                        # inverse of g = 1/(1 - v/300)
-return clip(v, -200.0, 200.0)
+v = CH_SLIDER_DIV * (1.0 - 1.0/g)                # inverse of g = 1/(1 - v/CH_SLIDER_DIV)
+return clip(v, -100.0, 100.0)
 ```
 
 Constants: `AG_PERCENTILE = 98.0`, `AG_TARGET = 0.95`, `AG_HI = 1.0`,
@@ -138,7 +142,7 @@ Constants: `AG_PERCENTILE = 98.0`, `AG_TARGET = 0.95`, `AG_HI = 1.0`,
 affects a top-2 % percentile.
 
 Why this is the correct inverse: the offset is added to the user's Gain value and
-the **sum** is fed to `g = 1/(1 − v/300)`. With the slider at 0, the sum is `v`
+the **sum** is fed to `g = 1/(1 − v/CH_SLIDER_DIV)`. With the slider at 0, the sum is `v`
 and the realized gain is exactly the clamped `g`, so `p·g = 0.95`. With the slider
 moved, the user is deliberately deviating (same as `exposure_base` today).
 
@@ -205,7 +209,7 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
 - **Highlights already at the window top** (p98 ≈ 0.99): a small pull *down* to
   the 0.95 target (g ≈ 0.96) — deliberate since the 2026-07-07 retune; the target
   keeps a visible margin below display white.
-- **Very dark frame** (p98 < ~0.32): `g` clamps at 3.0 → offset 200, lifted as
+- **Very dark frame** (p98 < ~0.32): `g` clamps at 3.0 → offset 100, lifted as
   far as the stage allows (cannot reach 0.95; flagged by the histogram, not here).
 - **Blown frame in headroom** (p98 > 1, ws on): excluded by `AG_HI`, so the
   *in-bound* p98 (just under 1) drives a pull down to 0.95. With the working space
@@ -220,14 +224,16 @@ in `_init_toggles`, staged, and applied on Done in `_apply_pending` by calling
 ## 8. Test plan (`tests/test_auto_gain.py`, pure numpy, headless)
 
 - **Placement**: a windowed base whose in-bound p98 = 0.5 → offset `v` with
-  `1/(1−v/300) ≈ 1.9`; feeding `exposure=v` through `adjust_image(ws_windowed)`
-  puts the 98th percentile of the output at ≈ 0.95·65535.
+  `1/(1−v/CH_SLIDER_DIV) ≈ 1.9`; feeding `ch_master_gain=v` through
+  `adjust_image(ws_windowed)` puts the 98th percentile of the output at ≈ 0.95·65535.
+- **Routing**: `apply_adjustments` adds the offset to `ch_master_gain` and leaves
+  the `exposure` argument at 0 — nothing rides the old, slider-less gain stage.
 - **Over-range exclusion (req 4)**: a base with ~5 % pixels at d=1.5 and the rest
   at d=0.5 yields the *same* offset as the all-0.5 base (the 1.5 pixels are
   discarded) — the headroom pixels do not pull the gain down.
 - **Neutral**: in-bound p98 already ≈ 0.95 → offset ≈ 0.
 - **Insufficient content**: < 0.5 % in-bound pixels → offset 0.0.
-- **Clamp**: a very dark base → offset 200 (g capped at 3.0). The g = 0.6 floor
+- **Clamp**: a very dark base → offset 100 (g capped at 3.0). The g = 0.6 floor
   would need in-bound p98 > 0.95/0.6 ≈ 1.58 — impossible for in-bound values
   (≤ 1), so it stays a safety net only.
 - **Suppress-overlap**: with `ccr_backend.auto_gain=True`, a default-slope image's
