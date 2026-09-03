@@ -1348,42 +1348,65 @@ def compute_neutral_balance_for_image(image_obj, rgb) -> tuple:
     return compute_neutral_balance(*pre)
 
 
+def _solve_balance(v: float, target: float) -> int:
+    """The Balance slider int that maps display value `v` onto `target`.
+
+    curve_s(v) is monotone in the slider value s for a fixed v, so this is a
+    bisection; there is no closed form because the Fritsch-Carlson tangent
+    limiter makes curve_s(v) piecewise in s. A target out of reach clamps to the
+    endpoint instead of raising."""
+    if float(_balance_curve(100.0, v)) <= target:
+        return 100
+    if float(_balance_curve(-100.0, v)) >= target:
+        return -100
+    lo, hi = -100.0, 100.0
+    for _ in range(24):                       # ~1e-5 slider units — far below 1 step
+        mid = 0.5 * (lo + hi)
+        if float(_balance_curve(mid, v)) < target:
+            lo = mid
+        else:
+            hi = mid
+    return int(round(0.5 * (lo + hi)))
+
+
 def compute_neutral_balance(r: float, g: float, b: float) -> tuple:
     """Balance slider ints [-100, 100] that neutralize a sampled cast.
 
     `r`, `g`, `b` are NORMALISED display values in [0,1] — the domain the
     Balance curve operates on. (compute_neutral_temp_tint took 0–65535 and used
     ratios only; a tone-DEPENDENT control needs the absolute tone, not the
-    ratio, so both callers now pass normalised values.)
+    ratio, so both callers pass normalised values.)
 
-    Targets the mean of the three, so the overall level is preserved and only
-    the cast moves. curve_s(v) is monotone in the slider value s for a fixed v,
-    so each channel is an independent bisection; there is no closed form because
-    the Fritsch-Carlson tangent limiter makes curve_s(v) piecewise in s. Targets
-    out of reach clamp to the endpoint instead of raising.
+    **Red is the anchor and is never adjusted.** Blue is solved onto red first,
+    then green. This is not a stylistic choice — it is what makes the pick
+    actually reach neutral on film:
+
+      * Targeting the MEAN (the previous behaviour) required pushing red DOWN,
+        and downward is the direction that saturates: a node at x=3/16 can never
+        fall further than 3/16, capping downward travel near -0.26 peak
+        deviation. A converted negative is normally red-heavy, so the mean
+        target put the largest correction on the one direction that cannot
+        deliver it, and the pick fell short.
+      * Anchoring on red moves green and blue UPWARD instead on exactly that
+        cast, and upward is the unbounded direction (the node approaches 1
+        asymptotically). The same correction now lands comfortably.
+
+    The trade-off is real and worth knowing: on a cast where red is the LOWEST
+    channel (a cyan cast), green and blue have to come down instead and the
+    saturating limit applies again. That is the uncommon case for negative film.
+
+    The blue-then-green order is the stated intent; the two solves are
+    independent (each channel's curve reads only its own slider), so the result
+    does not depend on it.
 
     The correction is exact only AT the sampled tone — inherent to a
     tone-weighted control, and the reason a picked shadow and a picked midtone
     legitimately give different answers."""
-    vals = [float(np.clip(v, 0.0, 1.0)) for v in (r, g, b)]
-    target = sum(vals) / 3.0
-    out = []
-    for v in vals:
-        lo, hi = -100.0, 100.0
-        if float(_balance_curve(hi, v)) <= target:
-            out.append(100)
-            continue
-        if float(_balance_curve(lo, v)) >= target:
-            out.append(-100)
-            continue
-        for _ in range(24):                   # ~1e-5 slider units — far below 1 step
-            mid = 0.5 * (lo + hi)
-            if float(_balance_curve(mid, v)) < target:
-                lo = mid
-            else:
-                hi = mid
-        out.append(int(round(0.5 * (lo + hi))))
-    return tuple(out)
+    r, g, b = (float(np.clip(v, 0.0, 1.0)) for v in (r, g, b))
+    target = r                                # red is the anchor: never moved
+    balance_b = _solve_balance(b, target)     # blue first...
+    balance_g = _solve_balance(g, target)     # ...then green
+    return (0, balance_g, balance_b)
 
 
 # --- Channel Levels: the FIRST adjustment stage (spec/channel-levels-pre-clamp.md)

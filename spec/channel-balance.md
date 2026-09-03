@@ -283,21 +283,41 @@ edits a catalog.
 
 ### 4.4 Neutralising inverse (WB Picker / AWB)
 
-Given a sampled/estimated triple `(r, g, b)` in display units, target the mean
-`m = (r + g + b) / 3` (preserves overall level; only ratios matter downstream).
-
-`curve_s(v)` is strictly monotone in the slider value `s` for a fixed `v`
-(raising the node can only raise the curve), so each channel is solved
-independently by **bisection on `s ∈ [-100, +100]`**, 24 iterations, taking the
-clamped endpoint when the target is out of reach:
+**Red is the anchor and is never adjusted.** Blue is solved onto red first,
+then green:
 
 ```
-balance_c = bisect(s -> curve_s(v_c) - m_norm)
+target     = r                       # red is left alone
+balance_b  = bisect(s -> curve_s(b) - target)
+balance_g  = bisect(s -> curve_s(g) - target)
+balance_r  = 0
 ```
 
-Bisection rather than a closed form because the monotone-cubic tangent limiter
-makes `curve_s(v)` piecewise in `s`. 24 iterations × 3 channels is
-microseconds, and it is exact to well under one slider step.
+This is not a stylistic choice. Targeting the *mean* of the three (the original
+behaviour) required pushing red **down**, and downward is the direction that
+saturates — a node at `x = 3/16` can never fall further than 3/16, capping
+downward travel near `-0.26` peak deviation. A converted negative is normally
+red-heavy, so the mean target put the largest correction on the one direction
+that cannot deliver it. Anchoring on red moves green and blue **upward** on
+exactly that cast, and upward is unbounded (the node approaches 1
+asymptotically).
+
+| cast (R,G,B) | mean target | red anchor |
+| --- | --- | --- |
+| 0.42, 0.36, 0.22 | −27, −7, 30 | **0, 15, 52** |
+| 0.50, 0.42, 0.24 | −42, −10, 38 | **0, 21, 65** |
+| 0.55, 0.45, 0.20 | −65, −15, 53 | **0, 27, 93** |
+
+The trade-off is real: on a cast where red is the *lowest* channel (a cyan
+cast), green and blue must come down instead and the saturating limit applies
+again. That is the uncommon case for negative film.
+
+`curve_s(v)` is monotone in `s` for a fixed `v`, so each solve is a bisection
+(24 iterations, `_solve_balance`); there is no closed form because the
+Fritsch–Carlson tangent limiter makes `curve_s(v)` piecewise in `s`. Targets out
+of reach clamp to `±100` rather than raising. The blue-then-green order is the
+stated intent; the two solves are independent (each channel's curve reads only
+its own slider), so the result does not depend on it.
 
 Note the correction is only exact **at the sampled tone**. That is inherent to
 a tone-dependent control and is the point of it — a picked midtone grey and a

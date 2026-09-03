@@ -215,8 +215,10 @@ def test_compute_awb_balance_stub_image():
     res = compute_awb_balance(_StubImage(_u16(d)), algorithm="gray_world")
     assert res is not None
     br, bg, bb = res
-    # Warm cast (R high, B low) → pull R down and push B up.
-    assert br < 0 and bb > 0
+    # Red is the anchor and never moves; a warm cast (R high, B low) is corrected
+    # by raising green and blue onto red -- blue furthest, since it is furthest off.
+    assert br == 0
+    assert bg > 0 and bb > 0 and bb > bg
     assert all(-100 <= v <= 100 for v in res)
 
 
@@ -418,8 +420,9 @@ def test_auto_wb_button_applies_and_shows(wb_panel, backend):
     panel, img, log = wb_panel
     backend.awb_algorithm = "gray_world"
     panel._on_auto_wb()
-    # Warm cast (R high, B low) → R pulled down, B pushed up.
-    assert img.adjustment_settings["balance_r"] < 0
+    # Red is the anchor; a warm cast is corrected by raising green and blue.
+    assert img.adjustment_settings["balance_r"] == 0
+    assert img.adjustment_settings["balance_g"] > 0
     assert img.adjustment_settings["balance_b"] > 0
     assert "render" in log and log[-1] == "show"
 

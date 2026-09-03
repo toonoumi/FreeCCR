@@ -302,9 +302,35 @@ def test_inverse_is_neutral_for_a_neutral_sample():
 
 def test_inverse_clamps_an_unreachable_cast():
     """A cast far beyond what the node can span clamps to the endpoints rather
-    than raising or running away."""
+    than raising or running away. Red still stays put."""
     vals = compute_neutral_balance(0.02, 0.5, 0.99)
-    assert vals[0] == 100 and vals[2] == -100
+    assert vals == (0, -100, -100)
+
+
+def test_red_is_the_anchor_and_never_moves():
+    """Red is the reference the other two are solved onto, so its slider is
+    always left at 0 -- the pick must never move it."""
+    for trip in [(0.42, 0.36, 0.22), (0.10, 0.55, 0.80), (0.5, 0.5, 0.5),
+                 (0.02, 0.99, 0.5), (1.0, 0.0, 0.5)]:
+        assert compute_neutral_balance(*trip)[0] == 0
+
+
+def test_green_and_blue_are_solved_onto_red():
+    """Both land on RED's value, not on the mean -- the mean would have required
+    pushing red down, which is the saturating direction."""
+    trip = (0.42, 0.36, 0.22)
+    _, bg, bb = compute_neutral_balance(*trip)
+    assert float(_balance_curve(bg, trip[1])) == pytest.approx(trip[0], abs=0.01)
+    assert float(_balance_curve(bb, trip[2])) == pytest.approx(trip[0], abs=0.01)
+
+
+def test_red_heavy_cast_only_needs_the_unbounded_direction():
+    """The point of anchoring on red: a converted negative is normally red-heavy,
+    so green and blue move UP -- the direction with no geometric limit -- instead
+    of red being dragged down into the saturating one."""
+    _, bg, bb = compute_neutral_balance(0.42, 0.36, 0.22)
+    assert bg > 0 and bb > 0
+    assert bb > bg                       # blue is further off, so it moves more
 
 
 def test_inverse_needs_absolute_tone_not_just_ratio():
