@@ -298,13 +298,12 @@ def test_hook_writes_when_unset(backend, tmp_path):
     backend.awb_algorithm = "gray_world"
     img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(6))))
     backend.maybe_auto_awb(img)
-    assert any(img.adjustment_settings.get(k, 0)
-               for k in ("balance_r", "balance_g", "balance_b"))
-    assert "balance_g" in img.adjustment_settings
+    assert any(img.adjustment_settings.get(k, 0) for k in ("temperature", "tint"))
+    assert "tint" in img.adjustment_settings
 
 
-@pytest.mark.parametrize("preset", [{"balance_r": 5}, {"balance_g": -3},
-                                    {"balance_b": 2, "balance_r": 1}])
+@pytest.mark.parametrize("preset", [{"temperature": 5}, {"tint": -3},
+                                    {"temperature": 2, "tint": 1}])
 def test_hook_never_clobbers_saved_wb(backend, preset, tmp_path):
     backend.auto_awb = True
     img = _real_image(tmp_path, _u16(_cast_scene(np.random.default_rng(7))))
@@ -402,13 +401,12 @@ def wb_panel(tmp_path):
 
 
 def test_wb_result_is_rendered_before_it_is_shown(wb_panel):
-    """The eyedropper/AWB apply path: the new Balance values reach the settings
+    """The eyedropper/AWB apply path: the new Temperature/Tint reach the settings
     AND the canvas is repainted from a fresh render, in that order."""
     panel, img, log = wb_panel
-    panel.on_wb_sampled(-30, 12, 7)
-    assert img.adjustment_settings["balance_r"] == -30
-    assert img.adjustment_settings["balance_g"] == 12
-    assert img.adjustment_settings["balance_b"] == 7
+    panel.on_wb_sampled(-30, 12)
+    assert img.adjustment_settings["temperature"] == -30
+    assert img.adjustment_settings["tint"] == 12
     assert "render" in log            # not just the stale cached preview
     assert log[-1] == "show"          # ...and the fresh render is what's shown
 
@@ -417,7 +415,7 @@ def test_wb_apply_leaves_no_pending_reprocess(wb_panel):
     """The debounced reprocess is cancelled — the final state was rendered now,
     so nothing is left queued to redo it."""
     panel, _img, _log = wb_panel
-    panel.on_wb_sampled(-30, 12, 7)
+    panel.on_wb_sampled(-30, 12)
     assert panel._pending_adjustment is None
     assert not panel._debounce_timer.isActive()
 
@@ -428,10 +426,9 @@ def test_auto_wb_button_applies_and_shows(wb_panel, backend):
     panel, img, log = wb_panel
     backend.awb_algorithm = "gray_world"
     panel._on_auto_wb()
-    # Red is the anchor; a warm cast is corrected by raising green and blue.
-    assert img.adjustment_settings["balance_r"] == 0
-    assert img.adjustment_settings["balance_g"] > 0
-    assert img.adjustment_settings["balance_b"] > 0
+    # A warm cast (R high, B low) is corrected by cooling: temperature < 0.
+    assert img.adjustment_settings["temperature"] < 0
+    assert "tint" in img.adjustment_settings
     assert "render" in log and log[-1] == "show"
 
 

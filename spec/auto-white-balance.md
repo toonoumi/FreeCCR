@@ -1,6 +1,8 @@
 # Spec: Auto White Balance (AWB)
 
-Status: REFINED v2 (open questions resolved — ready to implement)
+Status: SHIPPED (see [`spec/white-balance-restore.md`](white-balance-restore.md)
+for the current target: AWB drives Temperature/Tint through a closed loop on the
+real render, not the analytic inverse this spec describes)
 Owner: FreeCCR
 Feature branch: `feature/awb`
 Related: [`spec/working-space-white-balance.md`](working-space-white-balance.md) (the

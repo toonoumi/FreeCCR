@@ -251,8 +251,8 @@ class MainWindow(QMainWindow):
         ccr_backend.gamma_luminance = self._settings.value(
             "adjust/gamma_luminance", False, type=bool)
         # Restore the Auto WB toggle + algorithm (defaults OFF / Gray World).
-        # When on, a fresh conversion writes the AWB-estimated R/G/B Balance into
-        # the image's sliders — only when none is already set. Affects only
+        # When on, a fresh conversion writes AWB-estimated temperature/tint into
+        # the image's sliders — only when neither is already set. Affects only
         # FUTURE conversions and the AWB button. See spec/auto-white-balance.md.
         from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
         ccr_backend.auto_awb = self._settings.value(
@@ -959,13 +959,13 @@ class MainWindow(QMainWindow):
     # --- Gamma application mode (global, persistent) ----------------------
     def on_auto_awb_toggled(self, checked: bool):
         """Flip the global Auto WB flag and persist it. No re-render: the flag
-        only affects FUTURE conversions (and never images with a saved R/G/B
-        Balance). See spec/auto-white-balance.md."""
+        only affects FUTURE conversions (and never images with a saved
+        temperature/tint). See spec/auto-white-balance.md."""
         ccr_backend.auto_awb = bool(checked)
         self._settings.setValue("adjust/auto_awb", bool(checked))
         self.sliders_panel.set_temporary_hint(
             "Auto white balance on — new conversions get an automatic "
-            "R/G/B Balance estimate." if checked else
+            "Temperature/Tint estimate." if checked else
             "Auto white balance off.", duration=4000)
 
     def on_awb_algorithm_changed(self, algorithm: str):

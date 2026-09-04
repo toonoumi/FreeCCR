@@ -88,7 +88,7 @@ class CCRBackend:
         # spec/gamma-luminance-mode.md.
         self.gamma_luminance: bool = False
         # Auto white balance: when True, a fresh conversion writes AWB-estimated
-        # R/G/B Balance into the image's sliders — only when none is
+        # temperature/tint into the image's sliders — only when neither is
         # already set. The algorithm id selects the estimator (core/awb.py).
         # Global, persisted by MainWindow. See spec/auto-white-balance.md.
         self.auto_awb: bool = False
@@ -914,20 +914,20 @@ class CCRBackend:
 
     def maybe_auto_awb(self, image_obj):
         """One-shot auto white balance at conversion: writes the AWB-estimated
-        R/G/B Balance values into the image's whole-image settings when the
-        toggle is on and none is already set (never clobbers a saved value).
-        Called only from fresh-conversion sites, not replay/reconvert paths.
-        Pure numpy + a dict write, so it is safe from the auto-frame worker
-        threads. See spec/auto-white-balance.md and spec/channel-balance.md."""
+        temperature/tint into the image's whole-image settings when the toggle
+        is on and neither is already set (never clobbers a saved value). Called
+        only from fresh-conversion sites, not replay/reconvert paths. Pure
+        numpy + a dict write, so it is safe from the auto-frame worker threads.
+        See spec/auto-white-balance.md and spec/white-balance-restore.md."""
         if not self.auto_awb or not image_obj.converted:
             return
         ci = image_obj.adjustment_settings
-        if any(ci.get(k, 0) for k in ("balance_r", "balance_g", "balance_b")):
+        if ci.get("temperature", 0) or ci.get("tint", 0):
             return
-        from core.awb import compute_awb_balance
-        res = compute_awb_balance(image_obj)
+        from core.awb import compute_awb_wb
+        res = compute_awb_wb(image_obj)
         if res is not None and any(res):
-            ci["balance_r"], ci["balance_g"], ci["balance_b"] = res
+            ci["temperature"], ci["tint"] = res
 
     def convert_negative_by_index(self, idx: int):
         """

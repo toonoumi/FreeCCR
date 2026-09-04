@@ -2,9 +2,10 @@
 
 Learning-free estimators over the converted base (spec/auto-white-balance.md).
 Each algorithm returns the RGB triple that *should* be neutral — exactly what a
-perfect grey-spot pick would sample — so the result feeds
-compute_neutral_balance unchanged and lands on the R/G/B Balance sliders
-through the same inverse the WB eyedropper uses. See spec/channel-balance.md.
+perfect grey-spot pick would sample — so the result drives the same closed-loop
+neutral solve the WB eyedropper uses, and lands on the Temperature/Tint sliders
+(compute_awb_wb) or, for the Channel Balance control, on the R/G/B Balance trio
+(compute_awb_balance). See spec/white-balance-restore.md.
 """
 
 import numpy as np
@@ -168,29 +169,33 @@ def downscale_for_solve(base_u16, long_side=AWB_SOLVE_LONG_SIDE):
                       interpolation=cv2.INTER_AREA)
 
 
-def compute_awb_balance(ccr_image, algorithm=None):
-    """(balance_r, balance_g, balance_b) slider ints that neutralize the image's
-    overall cast, or None when there is not enough usable content.
+def _awb_solve(ccr_image, algorithm, solver):
+    """Run one closed-loop AWB regression over the whole frame and return the
+    slider values `solver` reports, or None when the frame carries too little
+    usable content for any estimator to speak.
 
     This is a REGRESSION OVER THE WHOLE FRAME, not a solve at one estimated
     pixel. A downscaled copy of the (cropped) frame is rendered through the real
     adjustment pipeline on every iteration, the illuminant estimator runs on
     THAT — the rendered result, the thing the user actually sees — and the loop
-    drives its estimate to grey. Red is the anchor, blue then green are solved
-    by bisection on the measured output.
+    drives its estimate to grey.
 
-    Solving at a single estimated pixel (the previous approach) was fragile:
-    the estimate is measured on the BASE, but the tone it lands on after Channel
-    Levels and Auto Gain may be up where a low-anchored Balance node has almost
-    no authority, so the solve produced tiny or zero values and the button
-    looked dead. Optimising the rendered frame's own estimate has no such blind
-    spot — every tone in the image contributes.
+    Solving at a single estimated pixel (the previous approach) was fragile: the
+    estimate is measured on the BASE, but the tone it lands on after Channel
+    Levels and Auto Gain may be somewhere the colour control has little
+    authority, so the solve produced tiny or zero values and the button looked
+    dead. Optimising the rendered frame's own estimate has no such blind spot —
+    every tone in the image contributes.
 
     Runs on the converted base (resized_raw), so the result does not depend on
-    the current Balance values (idempotent). Crop-aware: with a crop set, only
-    the kept region drives the estimate (a rotated crop's black corner fill sits
-    below AWB_LO, so the mask discards it). Uses the backend-selected algorithm
-    when none is given. See spec/channel-balance.md and spec/auto-white-balance.md.
+    the image's current colour settings (idempotent). Crop-aware: with a crop
+    set, only the kept region drives the estimate (a rotated crop's black corner
+    fill sits below AWB_LO, so the mask discards it). Uses the backend-selected
+    algorithm when none is given.
+
+    `solver` names the CCRImage method that turns the objective into slider
+    values — "solve_neutral_wb" for Temperature/Tint (what the UI drives) or
+    "solve_neutral_balance" for the R/G/B Balance trio.
     """
     if ccr_image is None or getattr(ccr_image, "resized_raw", None) is None:
         return None
@@ -231,4 +236,25 @@ def compute_awb_balance(ccr_image, algorithm=None):
             est = estimate_neutral_rgb(rendered, False, algorithm)
             return None if est is None else np.asarray(est) * 65535.0
 
-    return ccr_image.solve_neutral_balance(sample, combine=combine)
+    return getattr(ccr_image, solver)(sample, combine=combine)
+
+
+def compute_awb_wb(ccr_image, algorithm=None):
+    """(temperature, tint) slider ints that neutralize the image's overall cast,
+    or None when there is not enough usable content. What the AWB button and the
+    post-conversion Auto WB hook apply. See spec/white-balance-restore.md."""
+    return _awb_solve(ccr_image, algorithm, "solve_neutral_wb")
+
+
+def compute_awb_balance(ccr_image, algorithm=None):
+    """(balance_r, balance_g, balance_b) slider ints that neutralize the image's
+    overall cast, or None when there is not enough usable content.
+
+    The same whole-frame regression as compute_awb_wb, landing on the R/G/B
+    Balance trio instead of Temperature/Tint: red is the anchor, blue then green
+    are solved by bisection on the measured output. Retained as the tested
+    inverse for the Channel Balance control — the UI's AWB button drives white
+    balance (compute_awb_wb). See spec/channel-balance.md,
+    spec/white-balance-restore.md and spec/auto-white-balance.md.
+    """
+    return _awb_solve(ccr_image, algorithm, "solve_neutral_balance")

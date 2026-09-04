@@ -195,14 +195,14 @@ class TestPaste:
         panel = _panel()
 
         panel.current_idx = 0
-        _set(panel, "balance_r", 40)
+        _set(panel, "temperature", 40)
         _copy(panel, monkeypatch, {"wb": True})
 
         panel.current_idx = 1
         panel.paste_adjustment_settings()
 
         assert _orient(tgt) == (90, False, True)
-        assert tgt.adjustment_settings["balance_r"] == 40   # the copied group did land
+        assert tgt.adjustment_settings["temperature"] == 40  # the copied group did land
 
     def test_paste_resets_the_zoom_when_the_view_re_orients(self, tmp_path, monkeypatch):
         """The paste target IS the displayed image, so a kept zoom would strand

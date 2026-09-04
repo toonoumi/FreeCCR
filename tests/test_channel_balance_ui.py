@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Channel Balance panel wiring and nudge hotkeys (spec/channel-balance.md).
 
-The three sliders replaced Temperature/Tint in the same panel slot, so the
+The three sliders live in their own collapsible under Channel Levels, so the
 positional ADJUSTMENT_KEYS zip is the thing most likely to break silently — a
 mis-zip would route every slider below them to the wrong key without erroring.
 The hotkeys (U/I/O raise R/G/B, J/K/L lower) are checked through the panel
@@ -68,30 +68,25 @@ def panel(tmp_path):
 
 # --- panel wiring -----------------------------------------------------------
 
-def test_temperature_and_tint_are_gone():
-    assert "temperature" not in SlidersPanel.ADJUSTMENT_KEYS
-    assert "tint" not in SlidersPanel.ADJUSTMENT_KEYS
-
-
-def test_balance_keys_lead_the_positional_zip(panel):
+def test_balance_keys_follow_the_channel_levels_keys(panel):
     """ADJUSTMENT_KEYS is zipped positionally against create_slider() call
-    order. The three Balance sliders took the two Temperature/Tint slots plus
-    one, so everything below shifted by one — if that zip is off, sliders
-    silently write the wrong keys."""
-    assert panel.adjustment_keys[:3] == list(BALANCE_KEYS)
-    assert len(panel.sliders) == len(panel.adjustment_keys)
-    for i, key in enumerate(BALANCE_KEYS):
-        assert panel.adjustment_keys.index(key) == i
+    order. The Balance sliders live in their own collapsible under Channel
+    Levels, and are created right after the Channel Levels sliders — if that
+    zip is off, sliders silently write the wrong keys."""
+    keys = panel.adjustment_keys
+    assert len(panel.sliders) == len(keys)
+    last_channel = max(keys.index(k) for k in keys if k.startswith("ch_"))
+    assert keys[last_channel + 1:last_channel + 4] == list(BALANCE_KEYS)
 
 
-def test_keys_after_balance_still_line_up(panel):
-    """Spot-check a key well below the insertion point: a mis-zip would show up
+def test_keys_around_balance_still_line_up(panel):
+    """Spot-check keys either side of the Balance block: a mis-zip would show up
     as Brightness driving Gamma's slider, with no error anywhere."""
-    idx = panel.adjustment_keys.index("brightness")
-    panel.sliders[idx].setValue(33)
     img = ccr_backend.get_image_by_index(0)
-    assert img.adjustment_settings["brightness"] == 33
-    assert img.adjustment_settings.get("gamma", 0) == 0
+    for key, other in (("brightness", "gamma"), ("band_feather", "saturation")):
+        panel.sliders[panel.adjustment_keys.index(key)].setValue(33)
+        assert img.adjustment_settings[key] == 33
+        assert img.adjustment_settings.get(other, 0) == 0
 
 
 def test_balance_sliders_have_full_range_and_zero_default(panel):
@@ -117,11 +112,12 @@ def test_sliders_carry_their_channel_gradient(panel):
     assert theme.BALANCE_B_GRADIENT[1] == theme.CH_B
 
 
-def test_wb_sync_group_carries_the_balance_keys():
-    """The group id stays "wb" so a remembered selection from an earlier
-    session still applies, but its keys are now the Balance trio."""
-    group = {gid: keys for gid, _label, keys in SYNC_GROUPS}["wb"]
-    assert tuple(group) == BALANCE_KEYS
+def test_balance_has_its_own_sync_group():
+    """Balance syncs independently of White Balance: they are different stages,
+    and "wb" carries Temperature/Tint again."""
+    groups = {gid: keys for gid, _label, keys in SYNC_GROUPS}
+    assert tuple(groups["balance"]) == BALANCE_KEYS
+    assert tuple(groups["wb"]) == ("temperature", "tint")
 
 
 def test_sync_groups_still_partition_adjustment_keys():
