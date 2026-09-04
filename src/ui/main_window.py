@@ -1054,9 +1054,10 @@ class MainWindow(QMainWindow):
             licenses_text = "No license files found."
         return licenses_text
 
-    def _launch_file_loader(self, files, force_no_merge=False):
-        """Start the async image loader for a file list. Shared by Open Files and
-        the merge-replace reload (force_no_merge loads the generated TIFFs as
+    def _launch_loader(self, files=None, folder=None, force_no_merge=False):
+        """Start the async image loader for a file list OR a folder (exactly one).
+        Shared by Open Files, Open Folder, the command-line import, and the
+        merge-replace reload (force_no_merge loads the generated TIFFs as
         normal images even while 3-way merge is on)."""
         self._stop_loader_if_running()
         # New batch = new roll: the combo returns to "Default"
@@ -1064,7 +1065,7 @@ class MainWindow(QMainWindow):
         self.sliders_panel.reset_film_stock_combo()
         self.thumbnail_list.show_loading_dialog()
         self._loader_thread = QThread()
-        self._loader_worker = ImageLoaderWorker(files=files,
+        self._loader_worker = ImageLoaderWorker(folder=folder, files=files,
                                                 force_no_merge=force_no_merge)
         self._loader_worker.moveToThread(self._loader_thread)
         self._loader_thread.started.connect(self._loader_worker.run)
@@ -1201,7 +1202,7 @@ class MainWindow(QMainWindow):
 
         if tiffs:
             # Reload from the generated TIFFs as normal negatives (merge bypassed).
-            self._launch_file_loader(tiffs, force_no_merge=True)
+            self._launch_loader(files=tiffs, force_no_merge=True)
             self.sliders_panel.set_temporary_hint(
                 f"Replaced {len(tiffs)} frame(s) with linear TIFFs; "
                 f"deleted {len(deleted)} original(s).", duration=5000)
@@ -1262,51 +1263,61 @@ class MainWindow(QMainWindow):
             "Images (*.dng *.tif *.tiff *.arw *.nef *.cr2 *.cr3 *.raf *.png *.jpg *.jpeg *.rw2 *.3fr *.fff);;All Files (*)"
         )
         if files:
-            # Remember where the user browses to (survives restarts)
+            # Remember where the user BROWSED to (survives restarts). Set here
+            # rather than in _import_file_list so a command-line import never
+            # moves it: those paths come from a shell, are often relative, and
+            # `os.path.dirname("a.nef")` is "" — which would silently wipe the
+            # setting and drop both dialogs back to the process cwd.
             self._settings.setValue("files/last_open_dir", os.path.dirname(files[0]))
-            # Validate and normalize Unicode paths
-            valid_files = []
-            invalid_files = []
-            
-            for file_path in files:
-                normalized_path = normalize_unicode_path(file_path)
-                if validate_unicode_path(normalized_path):
-                    valid_files.append(normalized_path)
-                else:
-                    invalid_files.append(file_path)
-            
-            if invalid_files:
-                invalid_list = '\n'.join(invalid_files[:5])  # Show first 5 invalid files
-                if len(invalid_files) > 5:
-                    invalid_list += f'\n... and {len(invalid_files) - 5} more files'
-                QMessageBox.warning(
-                    self,
-                    "Unicode Path Warning",
-                    f"Some files have paths that may not be processed correctly due to Unicode characters:\n\n{invalid_list}\n\nThese files will be skipped. Please consider moving these files to paths with simpler names."
-                )
-            
-            if valid_files:
-                # 3-way RGB merge: validate the selection up front (multiple of
-                # 3, all RAW) so the user gets immediate feedback before any load.
-                # FreeCCR-baked merge TIFFs are excluded — they re-open as normal
-                # images even in merge mode. See spec/merge-linear-tiff-replace.md.
-                if ccr_backend.rgb_merge_mode:
-                    from core import ccr_merge
-                    to_merge = [p for p in valid_files
-                                if not ccr_merge.is_freeccr_merge_tiff(p)]
-                    if to_merge:
-                        ok, err = ccr_merge.validate_merge_inputs(
-                            ccr_merge.sort_for_merge(to_merge))
-                        if not ok:
-                            QMessageBox.warning(self, "3-way RGB merge", err)
-                            return
-                self._launch_file_loader(valid_files)
-            elif files:  # If there were files selected but all were invalid
-                QMessageBox.critical(
-                    self,
-                    "No Valid Files",
-                    "None of the selected files could be processed due to Unicode character issues in their paths. Please rename the files or move them to simpler paths."
-                )
+            self._import_file_list(files)
+
+    def _import_file_list(self, files):
+        """Replace the current batch with `files`: Unicode validation, 3-way
+        merge validation, then the loader. The post-dialog tail of open_files,
+        shared with the command-line import (spec/cli-file-args.md)."""
+        # Validate and normalize Unicode paths
+        valid_files = []
+        invalid_files = []
+
+        for file_path in files:
+            normalized_path = normalize_unicode_path(file_path)
+            if validate_unicode_path(normalized_path):
+                valid_files.append(normalized_path)
+            else:
+                invalid_files.append(file_path)
+
+        if invalid_files:
+            invalid_list = '\n'.join(invalid_files[:5])  # Show first 5 invalid files
+            if len(invalid_files) > 5:
+                invalid_list += f'\n... and {len(invalid_files) - 5} more files'
+            QMessageBox.warning(
+                self,
+                "Unicode Path Warning",
+                f"Some files have paths that may not be processed correctly due to Unicode characters:\n\n{invalid_list}\n\nThese files will be skipped. Please consider moving these files to paths with simpler names."
+            )
+
+        if valid_files:
+            # 3-way RGB merge: validate the selection up front (multiple of
+            # 3, all RAW) so the user gets immediate feedback before any load.
+            # FreeCCR-baked merge TIFFs are excluded — they re-open as normal
+            # images even in merge mode. See spec/merge-linear-tiff-replace.md.
+            if ccr_backend.rgb_merge_mode:
+                from core import ccr_merge
+                to_merge = [p for p in valid_files
+                            if not ccr_merge.is_freeccr_merge_tiff(p)]
+                if to_merge:
+                    ok, err = ccr_merge.validate_merge_inputs(
+                        ccr_merge.sort_for_merge(to_merge))
+                    if not ok:
+                        QMessageBox.warning(self, "3-way RGB merge", err)
+                        return
+            self._launch_loader(files=valid_files)
+        else:  # There were files, but all of them were invalid
+            QMessageBox.critical(
+                self,
+                "No Valid Files",
+                "None of the selected files could be processed due to Unicode character issues in their paths. Please rename the files or move them to simpler paths."
+            )
 
     def open_folder(self):
         # Loading a new batch replaces the current one — persist its edits first
@@ -1318,32 +1329,57 @@ class MainWindow(QMainWindow):
             start_dir
         )
         if folder:
-            # Remember where the user browses to (survives restarts)
+            # Dialog-only, like open_files above: `freeccr .` would otherwise
+            # persist the literal "." as the browse location.
             self._settings.setValue("files/last_open_dir", folder)
-            # Validate and normalize Unicode path
-            normalized_folder = normalize_unicode_path(folder)
-            if not validate_unicode_path(normalized_folder):
-                QMessageBox.warning(
-                    self,
-                    "Unicode Path Warning",
-                    f"The selected folder path contains characters that may cause issues:\n\n{folder}\n\nPlease consider using a folder with a simpler path name."
-                )
-                return
-                
-            self._stop_loader_if_running()
-            # New batch = new roll: the combo returns to "Default"
-            # (the backend loader clears its copy too).
-            self.sliders_panel.reset_film_stock_combo()
-            self.thumbnail_list.show_loading_dialog()
-            self._loader_thread = QThread()
-            self._loader_worker = ImageLoaderWorker(normalized_folder)
-            self._loader_worker.moveToThread(self._loader_thread)
-            self._loader_thread.started.connect(self._loader_worker.run)
-            self._loader_worker.finished.connect(self._loader_thread.quit)
-            self._loader_worker.finished.connect(self._loader_worker.deleteLater)
-            self._loader_thread.finished.connect(self._cleanup_loader)
-            self._loader_worker.finished.connect(self.thumbnail_list.load_thumbnails)
-            self._loader_thread.start()
+            self._import_folder(folder)
+
+    def _import_folder(self, folder):
+        """Replace the current batch with every supported image in `folder`.
+        The post-dialog tail of open_folder, shared with the command-line
+        import (spec/cli-file-args.md)."""
+        # Validate and normalize Unicode path
+        normalized_folder = normalize_unicode_path(folder)
+        if not validate_unicode_path(normalized_folder):
+            QMessageBox.warning(
+                self,
+                "Unicode Path Warning",
+                f"The selected folder path contains characters that may cause issues:\n\n{folder}\n\nPlease consider using a folder with a simpler path name."
+            )
+            return
+
+        self._launch_loader(folder=normalized_folder)
+
+    def load_paths(self, paths):
+        """Open the files and/or folders named on the command line. The public
+        seam for argument-driven imports (and any later Open With / drag-and-
+        drop support): it plans the paths, reports the ones that contribute
+        nothing, then hands off to the same importers the dialogs use.
+        See spec/cli-file-args.md."""
+        from utils.cli_args import plan_open
+        # Loading a new batch replaces the current one — persist its edits first
+        ccr_backend.save_catalog()
+        plan = plan_open(paths)
+        # Start the import BEFORE reporting bad arguments: the report is modal,
+        # and one mistyped path must not hold up the paths that were fine.
+        if plan.folder:
+            self._import_folder(plan.folder)
+        elif plan.files:
+            self._import_file_list(plan.files)
+        if plan.problems:
+            shown = '\n'.join(plan.problems[:5])
+            if len(plan.problems) > 5:
+                shown += f'\n... and {len(plan.problems) - 5} more'
+            # An import may well be running behind this box (the dispatch
+            # above deliberately goes first), so only say "Nothing to open"
+            # when nothing actually opened — otherwise the title
+            # contradicts the load the user can see starting.
+            imported = bool(plan.folder or plan.files)
+            QMessageBox.warning(
+                self,
+                "Some paths could not be opened" if imported
+                else "Nothing to open",
+                f"These command-line paths could not be opened:\n\n{shown}")
 
     # --- Tethering (watch-folder capture) ---------------------------------
     def toggle_tethering(self):
