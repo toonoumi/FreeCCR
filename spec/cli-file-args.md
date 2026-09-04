@@ -51,8 +51,11 @@ Qt options (-platform, -style, …) are also accepted.
 - The window appears first, then the import starts on the next event-loop turn,
   so the user sees the app (and the loading dialog on top of it) rather than a
   frozen splash. Startup with no arguments is byte-for-byte unchanged.
-- Paths that do not exist are collected and reported in **one** warning box
-  ("Nothing to open"), listing at most 5 with an "… and N more" tail, matching
+- Paths that do not exist are collected and reported in **one** warning box,
+  titled "Nothing to open" only when nothing was importable and "Some paths
+  could not be opened" when an import is running behind it (the box goes up
+  after the dispatch, so the first title would contradict the load the user can
+  see starting). It lists at most 5 with an "… and N more" tail, matching
   the Unicode-warning style already used by `open_files`. The box goes up
   **after** the good paths are dispatched — it is modal, and one mistyped
   argument must not hold up the rest of the import. If *every* argument is

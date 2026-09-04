@@ -118,8 +118,18 @@ def test_missing_path_alongside_a_real_one_still_loads_the_real_one(win, tmp_pat
                                                       at_warn.append(len(launched)))))
     w.load_paths([good, str(tmp_path / "gone.nef")])
     assert launched[0]["files"] == [good]
-    assert warnings == ["Nothing to open"]
+    # ...and the box must not claim nothing opened while that load runs.
+    assert warnings == ["Some paths could not be opened"]
     assert at_warn == [1]          # the load had already started
+
+
+def test_all_paths_bad_still_says_nothing_to_open(win, tmp_path):
+    """The other half of the title rule: when nothing was importable,
+    "Nothing to open" is exactly right."""
+    w, launched, warnings = win
+    w.load_paths([str(tmp_path / "gone.nef"), str(tmp_path / "x.nef")])
+    assert launched == []
+    assert warnings == ["Nothing to open"]
 
 
 def _browse_dir(w):

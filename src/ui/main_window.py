@@ -1319,8 +1319,15 @@ class MainWindow(QMainWindow):
             shown = '\n'.join(plan.problems[:5])
             if len(plan.problems) > 5:
                 shown += f'\n... and {len(plan.problems) - 5} more'
+            # An import may well be running behind this box (the dispatch
+            # above deliberately goes first), so only say "Nothing to open"
+            # when nothing actually opened — otherwise the title
+            # contradicts the load the user can see starting.
+            imported = bool(plan.folder or plan.files)
             QMessageBox.warning(
-                self, "Nothing to open",
+                self,
+                "Some paths could not be opened" if imported
+                else "Nothing to open",
                 f"These command-line paths could not be opened:\n\n{shown}")
 
     # --- Tethering (watch-folder capture) ---------------------------------
