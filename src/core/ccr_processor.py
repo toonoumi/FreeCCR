@@ -1316,13 +1316,26 @@ CH_INPUT_GAIN_DIV = 25.0    # input gain: slider +-100 -> 2^+-4 (+-4 stops)
 CH_MIN_RANGE = 0.1          # => at most a 10x per-channel gain
 
 
+def _master_gain_divisor(ch_master_gain: float) -> float:
+    """Master Gain as a single uniform divisor: out = in / max(1 - v/DIV, MIN).
+
+    Split out of _apply_channel_levels because Master Gain no longer runs with
+    the rest of Channel Levels — it is applied AFTER Channel Balance (and, being
+    a pure scalar, commutes with the White Balance multiply that follows). The
+    hidden Auto Gain offset rides this same parameter, so it moves with it.
+    See spec/master-gain-after-balance.md."""
+    mg = float(np.clip(ch_master_gain, -100.0, 100.0)) / CH_SLIDER_DIV
+    return max(1.0 - mg, CH_MIN_RANGE)
+
+
 def _apply_channel_levels(d: np.ndarray,
                           ch_input_gain: float, ch_master_shift: float,
                           ch_master_gain: float,
                           ch_r_shift: float, ch_r_gain: float, ch_r_blackpoint: float,
                           ch_g_shift: float, ch_g_gain: float, ch_g_blackpoint: float,
                           ch_b_shift: float, ch_b_gain: float, ch_b_blackpoint: float,
-                          clamp: bool) -> np.ndarray:
+                          clamp: bool,
+                          include_master_gain: bool = True) -> np.ndarray:
     """Channel Levels, applied to float DISPLAY values `d` (0 = display black,
     1 = display white). Index 0=R, 1=G, 2=B. Modifies `d` in place.
 
@@ -1331,6 +1344,13 @@ def _apply_channel_levels(d: np.ndarray,
       2. Per channel — out = (in + shift - black) / max((1 - gain) - black, MIN).
       3. Master      — a uniform shift + gain AFTER the per-channel work. Master
                        is its own stage, NOT summed into the per-channel values.
+
+    `include_master_gain=False` runs everything EXCEPT the Master Gain divide,
+    which the caller then applies after Channel Balance — Master Gain (and the
+    Auto Gain offset riding it) is an EXPOSURE control, and running it ahead of
+    the tone-weighted Balance node made a gain change move the colour. Master
+    Shift stays here: it is part of placing the histogram in the window, which
+    Balance needs done first. See spec/master-gain-after-balance.md.
 
     `clamp` is the pipeline-position switch:
       False (windowed base) — no clipping at all, so `d` stays un-clamped for the
@@ -1353,7 +1373,6 @@ def _apply_channel_levels(d: np.ndarray,
               float(np.clip(ch_g_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV,
               float(np.clip(ch_b_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV)
     ms = float(np.clip(ch_master_shift, -100.0, 100.0)) / CH_SLIDER_DIV
-    mg = float(np.clip(ch_master_gain, -100.0, 100.0)) / CH_SLIDER_DIV
 
     # 1. Input Gain (uniform, before everything else)
     if ig != 1.0:
@@ -1372,9 +1391,10 @@ def _apply_channel_levels(d: np.ndarray,
     # 3. Master shift / gain (uniform, after the per-channel work)
     if ms != 0.0:
         d += np.float32(ms)
-    mden = max(1.0 - mg, CH_MIN_RANGE)
-    if mden != 1.0:
-        d /= np.float32(mden)
+    if include_master_gain:
+        mden = _master_gain_divisor(ch_master_gain)
+        if mden != 1.0:
+            d /= np.float32(mden)
 
     if clamp:
         np.clip(d, 0.0, 1.0, out=d)
@@ -1440,7 +1460,7 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                               ch_r_shift, ch_r_gain, ch_r_blackpoint,
                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                              clamp=False)
+                              clamp=False, include_master_gain=False)
     # Channel Balance - the tone-WEIGHTED per-channel control, right after the
     # tone-uniform one and in the slot Temperature/Tint used to occupy. It runs
     # AFTER Channel Levels deliberately: on a windowed base much of the data
@@ -1450,6 +1470,16 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     # Un-clamped like everything else here. See spec/channel-balance.md §4.2.
     if _channel_balance_active(balance_r, balance_g, balance_b):
         _apply_channel_balance(d, balance_r, balance_g, balance_b)
+    # Master Gain (and the hidden Auto Gain offset riding it) - the EXPOSURE
+    # control, deliberately AFTER Channel Balance. Balance is tone-weighted
+    # (its node sits at a fixed display value), so with the gain ahead of it a
+    # brightness change moved the colour; behind it, exposure and colour are
+    # independent. Un-clamped like everything else here, and a pure scalar, so
+    # it commutes with the White Balance multiply below.
+    # See spec/master-gain-after-balance.md.
+    _mden = _master_gain_divisor(ch_master_gain)
+    if _mden != 1.0:
+        d /= np.float32(_mden)
     # White balance - flat per-channel gain in the scene-linear working domain
     # (before the window clamp) so a warm/cool shift lands in headroom (recoverable)
     # instead of clipping, and cooling can pull highlights back. Index 0=R,1=G,2=B.
@@ -2868,31 +2898,35 @@ def adjust_image(
         ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
     img = img16.astype(np.float32)
 
-    # Channel Levels - the FIRST adjustment stage, ahead of White Balance and the
-    # whole look domain. Only reached on a NON-windowed base (reference mode,
-    # positive mode, area layers); a windowed base consumed it above, un-clamped.
-    # Those paths carry no sub-black data, so this runs clamped, as before.
-    if _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
-                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
-                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                              ch_b_shift, ch_b_gain, ch_b_blackpoint):
+    # Channel Levels -> Channel Balance -> Master Gain: the first three stages,
+    # ahead of White Balance and the whole look domain, in one normalised pass.
+    # Only reached on a NON-windowed base (reference mode, positive mode, area
+    # layers); a windowed base consumed all three above. Master Gain lands after
+    # Balance so a gain change cannot move the colour through Balance's
+    # tone-weighted node (spec/master-gain-after-balance.md), and the clamp
+    # Channel Levels used to do at its own exit now closes the pass instead —
+    # these paths carry no sub-black data and the later pow() stages must not
+    # see negatives. With Balance neutral that is bit-identical to the old
+    # single clamped Levels call, since nothing between them clips.
+    _levels_on = _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
+                                        ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                        ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                        ch_b_shift, ch_b_gain, ch_b_blackpoint)
+    _balance_on = _channel_balance_active(balance_r, balance_g, balance_b)
+    _mden = _master_gain_divisor(ch_master_gain)
+    if _levels_on or _balance_on or _mden != 1.0:
         img /= np.float32(65535.0)
-        _apply_channel_levels(img, ch_input_gain, ch_master_shift, ch_master_gain,
-                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
-                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                              ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                              clamp=True)
-        img *= np.float32(65535.0)
-
-    # Channel Balance - the tone-weighted per-channel control, after Channel
-    # Levels and before White Balance, mirroring the windowed order. Only
-    # reached on a NON-windowed base (reference mode, positive mode, area
-    # layers); a windowed base consumed it above. uint16 input means every value
-    # is already inside [0,1] here, so the identity-outside rule is a no-op.
-    # See spec/channel-balance.md.
-    if _channel_balance_active(balance_r, balance_g, balance_b):
-        img /= np.float32(65535.0)
-        _apply_channel_balance(img, balance_r, balance_g, balance_b)
+        if _levels_on:
+            _apply_channel_levels(img, ch_input_gain, ch_master_shift, ch_master_gain,
+                                  ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                  ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                  ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                                  clamp=False, include_master_gain=False)
+        if _balance_on:
+            _apply_channel_balance(img, balance_r, balance_g, balance_b)
+        if _mden != 1.0:
+            img /= np.float32(_mden)
+        np.clip(img, 0.0, 1.0, out=img)
         img *= np.float32(65535.0)
 
     # White balance - flat per-channel gain (spec/working-space-white-balance.md).
@@ -3349,12 +3383,24 @@ def adjust_image_opencl(
                                   ch_r_shift, ch_r_gain, ch_r_blackpoint,
                                   ch_g_shift, ch_g_gain, ch_g_blackpoint,
                                   ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                                  clamp=True)
-            ch_input_gain = ch_master_shift = ch_master_gain = 0.0
+                                  clamp=False, include_master_gain=False)
+            ch_input_gain = ch_master_shift = 0.0
             ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
             ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
             ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
         _apply_channel_balance(img16, balance_r, balance_g, balance_b)
+        # Master Gain lands AFTER Balance (spec/master-gain-after-balance.md).
+        # Only reachable with Levels consumed above, since ch_master_gain is one
+        # of the values _channel_levels_active tests — but guard on the divisor
+        # anyway so it can never double-apply with the kernel's own copy.
+        _mden = _master_gain_divisor(ch_master_gain)
+        if _mden != 1.0:
+            img16 /= np.float32(_mden)
+            ch_master_gain = 0.0
+        # Same closing clamp as adjust_image's non-windowed pass — the kernel
+        # would otherwise receive negatives its pow() stages cannot take, and
+        # CPU/GPU parity depends on the clamp sitting in the same place.
+        np.clip(img16, 0.0, 1.0, out=img16)
         img16 *= np.float32(65535.0)
         balance_r = balance_g = balance_b = 0.0
 
