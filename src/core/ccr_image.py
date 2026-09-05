@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
-                                apply_gamma_curve, apply_cineon_to_rec709,
+                                apply_gamma_curve,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal, DUST_FEATHER_DEFAULT,
                                 _DUST_PLAN_LONG,
@@ -1488,6 +1488,13 @@ class CCRImage:
                      balance_r=s.get('balance_r', 0),
                      balance_g=s.get('balance_g', 0),
                      balance_b=s.get('balance_b', 0),
+                     # Cineon film log → workspace: decodes OUT of log right
+                     # after Master Gain, so White Balance and the whole tone
+                     # chain below it grade display-referred data instead of log
+                     # density. Whole-image only — area layers never carry the
+                     # key, and they grade the decoded base.
+                     # See spec/cineon-display-transform.md.
+                     cineon_log=bool(s.get('cineon_log')),
                      # Windowed working-space base → de-window + Gain/Exposure
                      # recovery happens inside the adjustment call.
                      ws_windowed=ws)
@@ -1512,12 +1519,6 @@ class CCRImage:
             adjusted = apply_area_layers(adjusted, areas, self._adjust_for_area)
         if profile == "bw":
             adjusted = self._to_grayscale(adjusted)
-        # Cineon film log → Rec.709 (γ 2.2): optional FINAL stage after every
-        # other adjustment (Channel Levels checkbox), so preview, hi-res zoom
-        # and export transform identically. Whole-image only — area layers
-        # never carry the key. See spec/cineon-display-transform.md.
-        if s.get("cineon_log"):
-            adjusted = apply_cineon_to_rec709(adjusted)
         return adjusted
 
     def _adjust_for_area(self, base_u16: np.ndarray, settings: dict) -> np.ndarray:

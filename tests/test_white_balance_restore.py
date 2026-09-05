@@ -189,9 +189,13 @@ def test_groups_still_partition_adjustment_keys():
 # analytic inverse of any one stage can account for. These assert on rendered
 # output only.
 
-def _cast_scene(tmp_path, name="scene.png"):
+def _cast_scene(tmp_path, name="scene.png", cast=(1.0, 0.88, 0.55)):
     """A converted, windowed base: a tonal ramp under a yellow cast so Auto Gain
-    has real highlights to normalise against, plus a mid-grey patch to pick."""
+    has real highlights to normalise against, plus a mid-grey patch to pick.
+
+    The default cast is deliberately extreme, to prove the solve's reach. It is
+    extreme in DENSITY terms, so a Cineon decode expands it beyond what the
+    White Balance gains can span - those tests pass a milder one."""
     from core.ccr_processor import encode_window
     path = str(tmp_path / name)
     cv2.imwrite(path, np.full((60, 90, 3), 20000, np.uint16))
@@ -200,7 +204,7 @@ def _cast_scene(tmp_path, name="scene.png"):
     img._ws_windowed = True
     h, w = 300, 450
     ramp = np.linspace(0.02, 1.0, w, dtype=np.float32)[None, :, None].repeat(h, 0)
-    cast = np.array([1.0, 0.88, 0.55], np.float32)
+    cast = np.asarray(cast, np.float32)
     disp = np.clip(ramp * cast, 0, 1.2)
     disp[140:160, 200:220] = np.array([0.35, 0.35, 0.35], np.float32) * cast
     img.resized_raw = encode_window(disp.copy())
@@ -222,17 +226,29 @@ def _spread(rgb):
     return float(rgb.max() - rgb.min()) / max(float(rgb.max()), 1.0)
 
 
+# (label, settings, tolerance). Everything reaches grey except the Cineon
+# presets — see test_the_decoded_base_limits_what_wb_can_reach for why that is a
+# property of the control's range, not of the solve.
 PRESETS = [
     ("nothing set", {}),
     ("channel levels", {"ch_r_shift": 15, "ch_g_gain": 12, "ch_b_blackpoint": -8}),
     ("master gain", {"ch_master_gain": 35}),
     ("input gain", {"ch_input_gain": -20}),
-    ("cineon log", {"cineon_log": True}),
     ("tone + saturation", {"gamma": 40, "contrast": 30, "saturation": 25}),
     ("per-channel curves", {"curves": {"r": [[0, 0], [128, 150], [255, 255]]}}),
     ("channel balance set", {"balance_g": 20, "balance_b": 35}),
     ("everything", {"ch_r_shift": 10, "ch_master_gain": 25, "gamma": 30,
-                    "contrast": 20, "saturation": 20, "cineon_log": True}),
+                    "contrast": 20, "saturation": 20}),
+]
+
+# Cineon gets its own scene: it decodes OUT of log before White Balance, which
+# turns a cast from a log OFFSET into a linear RATIO, and the deliberately
+# extreme cast above then lands outside what the WB gains can span. See
+# test_the_decoded_base_limits_what_wb_can_reach.
+CINEON_PRESETS = [
+    ("cineon log", {"cineon_log": True}),
+    ("cineon + everything", {"cineon_log": True, "ch_master_gain": 25,
+                             "gamma": 30, "contrast": 20, "saturation": 20}),
 ]
 
 
@@ -248,6 +264,40 @@ def test_picked_spot_renders_neutral(tmp_path, label, preset):
     after = _spot(img, dict(preset, temperature=temp, tint=tint))
     assert _spread(before) > 0.2, "test scene should start visibly cast"
     assert _spread(after) < 0.02, f"{label}: {after} spread {_spread(after):.3f}"
+
+
+@pytest.mark.parametrize("label,preset", CINEON_PRESETS,
+                         ids=[p[0] for p in CINEON_PRESETS])
+def test_picked_spot_renders_neutral_on_a_decoded_base(tmp_path, label, preset):
+    """The pick still lands on grey when Cineon has decoded out of log before
+    White Balance — the position that makes WB a real colour shift instead of a
+    per-channel gamma change."""
+    img = _cast_scene(tmp_path, cast=(1.0, 0.95, 0.86))
+    img.adjustment_settings = dict(preset)
+    temp, tint = img.solve_neutral_wb(_patch(img))
+    before = _spot(img, dict(preset))
+    after = _spot(img, dict(preset, temperature=temp, tint=tint))
+    assert _spread(before) > 0.1, "test scene should start visibly cast"
+    assert _spread(after) < 0.02, f"{label}: {after} spread {_spread(after):.3f}"
+
+
+def test_the_decoded_base_limits_what_wb_can_reach(tmp_path):
+    """The flip side, pinned so it is a known property and not a surprise: the
+    decode turns a cast from a log OFFSET into a linear RATIO — 4:1 R/B on the
+    deliberately extreme scene, where the WB gains span at most 1.4/0.6 = 2.33:1.
+    The solve does the right thing (pegs the knob, keeps the closest result it
+    found), but a cast that strong belongs in Channel Levels BEFORE the decode,
+    where a per-channel shift is a density offset — the exact correction."""
+    img = _cast_scene(tmp_path)
+    img.adjustment_settings = {"cineon_log": True}
+    temp, _tint = img.solve_neutral_wb(_patch(img))
+    assert temp == -100, "expected the temperature knob to peg, not to converge"
+    # ...and correcting the cast in log first leaves WB with a reachable job.
+    pre = {"cineon_log": True, "ch_r_shift": -18, "ch_b_shift": 24}
+    img.adjustment_settings = dict(pre)
+    temp, tint = img.solve_neutral_wb(_patch(img))
+    assert abs(temp) < 100
+    assert _spread(_spot(img, dict(pre, temperature=temp, tint=tint))) < 0.02
 
 
 def test_a_warm_cast_is_cooled(tmp_path):

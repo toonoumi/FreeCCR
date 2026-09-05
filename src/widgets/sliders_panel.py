@@ -47,8 +47,8 @@ SYNC_GROUPS = [
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
-        # Non-slider flag (Cineon log → Rec.709 display conversion) — rides
-        # the Channel Levels sync group, preserved specially in the merge.
+        # Non-slider flag (Cineon log → workspace decode) — rides the
+        # Channel Levels sync group, preserved specially in the merge.
         "cineon_log")),
     # Channel Balance — the tone-WEIGHTED per-channel control, its own group
     # right after Channel Levels (the tone-uniform one), matching the panel's
@@ -753,18 +753,19 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("B Gain"))
         self.od_section.add_layout(self.create_slider("B Blackpoint"))
 
-        # Cineon film log → Rec.709 (γ 2.2) display conversion — a FINAL
-        # pipeline stage after every other adjustment (incl. curves/areas),
-        # identical for preview, zoom detail and export. Non-slider flag
+        # Cineon film log → workspace — the decode OUT of log, applied right
+        # after Master Gain, so White Balance and the whole tone chain below it
+        # grade display-referred data instead of log density. Non-slider flag
         # ("cineon_log" in adjustment_settings); whole-image only, so it is
-        # disabled while an area layer is the edit target. See
-        # spec/cineon-display-transform.md.
-        self.cineon_checkbox = QCheckBox("Cineon Log → Rec.709 (γ 2.2)")
+        # disabled while an area layer is the edit target (an area grades the
+        # already-decoded base). See spec/cineon-display-transform.md.
+        self.cineon_checkbox = QCheckBox("Cineon Log → Workspace")
         self.cineon_checkbox.setToolTip(
-            "Interpret the adjusted image as Cineon film log (10-bit black at "
-            "code 95, 90% white at 685 — the levels the Scopes parade marks) "
-            "and convert to Rec.709 video with a 2.2 gamma, as the final step "
-            "before display/export.")
+            "Interpret the value as Cineon film log (10-bit black at code 95, "
+            "90% white at 685 — the levels the Scopes parade marks) and decode "
+            "it into the working space, right after Master Gain. Everything "
+            "below — White Balance, the tone sliders and curves — then grades "
+            "the decoded image instead of log density.")
         self.cineon_checkbox.toggled.connect(self._on_cineon_toggled)
         self.od_section.add_widget(self.cineon_checkbox)
 
@@ -1331,7 +1332,7 @@ class SlidersPanel(QWidget):
         return adjustment
 
     def _on_cineon_toggled(self, checked):
-        """Cineon log → Rec.709 checkbox: a discrete, single-undo edit on the
+        """Cineon log → Workspace checkbox: a discrete, single-undo edit on the
         GLOBAL settings dict. Mirrors _on_curve_edit_finished's settle path —
         regenerate the preview first, then display it."""
         if self.current_idx is None:
@@ -1971,7 +1972,7 @@ class SlidersPanel(QWidget):
             "measuring your film base, so the frame keeps its own cast and "
             "placement. Grade it with <b>Channel Levels</b> (Master Gain, and the "
             "per-channel Shift / Gain / Blackpoint), and enable <b>Cineon Log "
-            "→ Rec.709</b> for the intended display transform.<br><br>"
+            "→ Workspace</b> to decode out of log.<br><br>"
             "Set a <b>Black Point</b> first for a conversion anchored to your "
             "own film base.<br><br>"
             "<i>This warning can be turned off in Settings → General.</i>")

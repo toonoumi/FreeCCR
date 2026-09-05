@@ -227,10 +227,16 @@ def srgb_decode(v: np.ndarray) -> np.ndarray:
     return np.where(v <= 0.04045, v / 12.92, np.power((v + a) / (1 + a), 2.4))
 
 
-def srgb_encode(x: np.ndarray) -> np.ndarray:
-    """sRGB inverse EOTF: linear -> encoded."""
+def srgb_encode(x: np.ndarray, clip: bool = True) -> np.ndarray:
+    """sRGB inverse EOTF: linear -> encoded.
+
+    clip=False keeps values above 1 (the curve extends smoothly past white),
+    for callers working in a headroom-carrying buffer that clamps later —
+    the Cineon → workspace stage runs un-clamped inside the working space.
+    Values below 0 are floored either way: the power segment is undefined
+    there."""
     a = 0.055
-    x = np.clip(x, 0.0, 1.0)
+    x = np.clip(x, 0.0, 1.0) if clip else np.maximum(x, 0.0)
     return np.where(x <= 0.0031308, x * 12.92, (1 + a) * np.power(x, 1 / 2.4) - a)
 
 
