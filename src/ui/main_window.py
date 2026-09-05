@@ -251,8 +251,8 @@ class MainWindow(QMainWindow):
         ccr_backend.gamma_luminance = self._settings.value(
             "adjust/gamma_luminance", False, type=bool)
         # Restore the Auto WB toggle + algorithm (defaults OFF / Gray World).
-        # When on, a fresh conversion writes the AWB-estimated R/G/B Balance into
-        # the image's sliders — only when none is already set. Affects only
+        # When on, a fresh conversion writes AWB-estimated temperature/tint into
+        # the image's sliders — only when neither is already set. Affects only
         # FUTURE conversions and the AWB button. See spec/auto-white-balance.md.
         from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
         ccr_backend.auto_awb = self._settings.value(
@@ -261,6 +261,11 @@ class MainWindow(QMainWindow):
         ccr_backend.awb_algorithm = (
             stored_algo if any(a == stored_algo for a, _ in AWB_ALGORITHMS)
             else AWB_DEFAULT)
+        # Restore the Channel Balance nudge keys (default OFF — the sliders they
+        # move live in a collapsed section). Read before the shortcuts are built
+        # below, which is what decides whether they are created enabled.
+        ccr_backend.balance_hotkeys = self._settings.value(
+            "adjust/balance_hotkeys", False, type=bool)
         # Restore the reversal-look sprocket-hole mask (default OFF). When on,
         # clear-film regions are painted white as the last render step for
         # B/W-point conversions. See spec/sprocket-hole-mask.md.
@@ -344,7 +349,9 @@ class MainWindow(QMainWindow):
         # top row adds, home row subtracts. Same WindowShortcut context as the
         # mode keys above, so they fire whichever panel has focus; modal dialogs
         # are separate windows, so they never reach text entry there.
-        # See spec/channel-balance.md.
+        # OPT-IN (Settings → General → Keyboard, default off): they are gated by
+        # setEnabled rather than by a check in the handler, so while off the six
+        # letters are not consumed at all. See spec/white-balance-restore.md.
         self._balance_shortcuts = []
         for key, channel, direction in (("U", "r", +1), ("I", "g", +1),
                                         ("O", "b", +1), ("J", "r", -1),
@@ -353,6 +360,7 @@ class MainWindow(QMainWindow):
             sc.activated.connect(
                 lambda c=channel, d=direction: self._shortcut_nudge_balance(c, d))
             self._balance_shortcuts.append(sc)
+        self._apply_balance_hotkey_state()
 
 
         # Non-blocking startup update check (2s network timeout, off-thread)
@@ -520,15 +528,24 @@ class MainWindow(QMainWindow):
         self.sliders_panel._on_pick_neutral_point()
 
     def _shortcut_nudge_balance(self, channel, direction):
-        """U/I/O and J/K/L: nudge one R/G/B Balance slider. Gated like the other
-        mode keys — needs a current image, and never fires while crop or dust
-        mode owns the canvas (those modes have their own keyboard semantics).
-        The panel itself no-ops when its sliders are disabled."""
+        """U/I/O and J/K/L: nudge one R/G/B Balance slider. Only reachable while
+        the keys are enabled (Settings → General → Keyboard) — the shortcuts
+        themselves are disabled otherwise. Gated like the other mode keys —
+        needs a current image, and never fires while crop or dust mode owns the
+        canvas (those modes have their own keyboard semantics). The panel itself
+        no-ops when its sliders are disabled."""
         if self.image_preview.current_idx is None:
             return
         if self.image_preview.dust_mode or self.image_preview.crop_mode:
             return
         self.sliders_panel.nudge_balance(channel, direction)
+
+    def _apply_balance_hotkey_state(self):
+        """Enable/disable the six nudge shortcuts from the global flag. A
+        disabled QShortcut does not consume its key, so U/I/O/J/K/L stay
+        entirely free while the setting is off."""
+        for sc in self._balance_shortcuts:
+            sc.setEnabled(bool(ccr_backend.balance_hotkeys))
 
     def _sync_dust_action(self, checked: bool):
         action = getattr(self.image_preview, "dust_action", None)
@@ -959,14 +976,25 @@ class MainWindow(QMainWindow):
     # --- Gamma application mode (global, persistent) ----------------------
     def on_auto_awb_toggled(self, checked: bool):
         """Flip the global Auto WB flag and persist it. No re-render: the flag
-        only affects FUTURE conversions (and never images with a saved R/G/B
-        Balance). See spec/auto-white-balance.md."""
+        only affects FUTURE conversions (and never images with a saved
+        temperature/tint). See spec/auto-white-balance.md."""
         ccr_backend.auto_awb = bool(checked)
         self._settings.setValue("adjust/auto_awb", bool(checked))
         self.sliders_panel.set_temporary_hint(
             "Auto white balance on — new conversions get an automatic "
-            "R/G/B Balance estimate." if checked else
+            "Temperature/Tint estimate." if checked else
             "Auto white balance off.", duration=4000)
+
+    def on_balance_hotkeys_toggled(self, checked: bool):
+        """Flip the global Channel Balance nudge-key flag, persist it, and
+        enable/disable the six shortcuts to match. See
+        spec/white-balance-restore.md."""
+        ccr_backend.balance_hotkeys = bool(checked)
+        self._settings.setValue("adjust/balance_hotkeys", bool(checked))
+        self._apply_balance_hotkey_state()
+        self.sliders_panel.set_temporary_hint(
+            "Channel Balance keys on — U/I/O raise R/G/B, J/K/L lower them."
+            if checked else "Channel Balance keys off.", duration=4000)
 
     def on_awb_algorithm_changed(self, algorithm: str):
         """Persist the AWB algorithm choice. Used by the AWB button and the

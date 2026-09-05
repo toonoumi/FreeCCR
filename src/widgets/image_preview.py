@@ -393,7 +393,7 @@ class GraphicsImageView(QGraphicsView):
 
     def _sample_wb_point(self, scene_pos):
         """Sample a small neighborhood at the clicked point and auto-set the
-        R/G/B Balance sliders so that point becomes neutral."""
+        Temperature/Tint sliders so that point becomes neutral."""
         pw = self.parent_widget
         display_transform = self._display_transform()
         if not display_transform.isInvertible():
@@ -419,10 +419,10 @@ class GraphicsImageView(QGraphicsView):
         # Closed loop on the REAL render: the solver renders this sample AREA
         # through the whole adjustment pipeline, measures what actually comes
         # out, and corrects — no model of the intervening stages, which is what
-        # kept getting this wrong. See spec/channel-balance.md.
-        balance = img_obj.solve_neutral_balance(patch)
+        # kept getting this wrong. See spec/white-balance-restore.md.
+        wb = img_obj.solve_neutral_wb(patch)
         try:
-            pw.parent().parent().sliders_panel.on_wb_sampled(*balance)
+            pw.parent().parent().sliders_panel.on_wb_sampled(*wb)
         except AttributeError:
             pass
 
@@ -1554,7 +1554,7 @@ class ImagePreview(QWidget):
 
     def set_wb_pick_mode(self, enabled):
         """Eyedropper mode: next click on the image picks a neutral point
-        for automatic R/G/B Balance adjustment."""
+        for automatic temperature/tint adjustment."""
         if enabled and self.crop_mode:
             self.cancel_crop_mode()
         if enabled and self.slice_mode:

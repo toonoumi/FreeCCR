@@ -88,11 +88,18 @@ class CCRBackend:
         # spec/gamma-luminance-mode.md.
         self.gamma_luminance: bool = False
         # Auto white balance: when True, a fresh conversion writes AWB-estimated
-        # R/G/B Balance into the image's sliders — only when none is
+        # temperature/tint into the image's sliders — only when neither is
         # already set. The algorithm id selects the estimator (core/awb.py).
         # Global, persisted by MainWindow. See spec/auto-white-balance.md.
         self.auto_awb: bool = False
         self.awb_algorithm: str = "gray_world"
+        # Channel Balance nudge keys (U/I/O raise R/G/B, J/K/L lower). OFF by
+        # default: Balance is a collapsed section, so the keys would otherwise
+        # edit sliders the user cannot see — and they hold six single letters
+        # hostage. MainWindow enables/disables the QShortcuts from this flag, so
+        # while it is off the keys are not consumed at all. Global, persisted by
+        # MainWindow. See spec/white-balance-restore.md.
+        self.balance_hotkeys: bool = False
         # Reversal-look sprocket-hole mask: when True, clear-film regions (sprocket
         # holes / rebate, brighter than the sampled black point) are painted white
         # as the LAST render step for B/W-point conversions, on preview and export.
@@ -914,20 +921,20 @@ class CCRBackend:
 
     def maybe_auto_awb(self, image_obj):
         """One-shot auto white balance at conversion: writes the AWB-estimated
-        R/G/B Balance values into the image's whole-image settings when the
-        toggle is on and none is already set (never clobbers a saved value).
-        Called only from fresh-conversion sites, not replay/reconvert paths.
-        Pure numpy + a dict write, so it is safe from the auto-frame worker
-        threads. See spec/auto-white-balance.md and spec/channel-balance.md."""
+        temperature/tint into the image's whole-image settings when the toggle
+        is on and neither is already set (never clobbers a saved value). Called
+        only from fresh-conversion sites, not replay/reconvert paths. Pure
+        numpy + a dict write, so it is safe from the auto-frame worker threads.
+        See spec/auto-white-balance.md and spec/white-balance-restore.md."""
         if not self.auto_awb or not image_obj.converted:
             return
         ci = image_obj.adjustment_settings
-        if any(ci.get(k, 0) for k in ("balance_r", "balance_g", "balance_b")):
+        if ci.get("temperature", 0) or ci.get("tint", 0):
             return
-        from core.awb import compute_awb_balance
-        res = compute_awb_balance(image_obj)
+        from core.awb import compute_awb_wb
+        res = compute_awb_wb(image_obj)
         if res is not None and any(res):
-            ci["balance_r"], ci["balance_g"], ci["balance_b"] = res
+            ci["temperature"], ci["tint"] = res
 
     def convert_negative_by_index(self, idx: int):
         """
@@ -1413,7 +1420,8 @@ class CCRBackend:
                 print(f"Failed to convert image at index {idx}: {e}")
 
     def _export_merged_linear(self, image_obj, output_path: str,
-                              mark: bool = False) -> None:
+                              mark: bool = False,
+                              apply_crop: bool = True) -> None:
         """Write the raw trichrome combination as an untagged 16-bit linear
         TIFF: what merge_raw_channels produced at full canonical resolution,
         plus FRAMING only — the slice chain and the user crop (which is
@@ -1424,7 +1432,17 @@ class CCRBackend:
 
         mark=True stamps the FreeCCR merge marker into the Software tag (used by
         the replace-originals bake) so the file re-opens as a normal image even
-        with 3-way merge mode on. See spec/merge-linear-tiff-replace.md."""
+        with 3-way merge mode on. See spec/merge-linear-tiff-replace.md.
+
+        apply_crop=False keeps the user crop OUT of the file. The bake that
+        replaces the originals passes it: that TIFF becomes the only surviving
+        copy, and a crop is a non-destructive, re-editable setting everywhere
+        else in the app — baking it into the last copy would make the discarded
+        pixels unrecoverable. The slice chain still applies, because a slice is
+        what makes this image a distinct frame rather than a framing preference:
+        drop it and three sliced siblings would each bake the same whole scan.
+        A deliberate export (the Linear TIFF export action) still gets the crop
+        it asked for."""
         from core import ccr_merge
         from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
         merged, _full = ccr_merge.merge_raw_channels(
@@ -1432,8 +1450,10 @@ class CCRBackend:
             demosaic=getattr(image_obj, "merge_demosaic", True))
         if getattr(image_obj, "source_ops", None):
             merged = image_obj._apply_source_ops(merged)
-        merged = apply_crop_to_image(merged, getattr(image_obj, "crop_rect", None),
-                                     getattr(image_obj, "crop_angle", 0.0) or 0.0)
+        if apply_crop:
+            merged = apply_crop_to_image(
+                merged, getattr(image_obj, "crop_rect", None),
+                getattr(image_obj, "crop_angle", 0.0) or 0.0)
         out = os.path.splitext(output_path)[0] + ".tiff"
         extra = {"software": ccr_merge.FREECCR_MERGE_TIFF_MARKER} if mark else {}
         # predictor=True (horizontal differencing, TIFF Predictor 2) decorrelates
@@ -1490,6 +1510,10 @@ class CCRBackend:
         source safety). Cancelling deletes nothing and removes any TIFF already
         written, leaving the session exactly as it was.
 
+        The baked file is the FULL canonical merge (through the slice chain, but
+        NOT the user crop) — it is about to become the only copy, so it keeps
+        every pixel the merge produced. See _export_merged_linear.
+
         Returns {"tiff_paths", "deleted", "failures": [(name, reason)],
         "cancelled": bool}. See spec/merge-linear-tiff-replace.md."""
         imgs = [im for im in (self.images if images is None else images)
@@ -1509,7 +1533,10 @@ class CCRBackend:
                 progress_cb(i, total, name)
             try:
                 out = self._linear_tiff_output_path(im)
-                self._export_merged_linear(im, out, mark=True)
+                # apply_crop=False: this file replaces the originals, so it must
+                # keep every pixel the merge produced — the crop stays a
+                # reversible setting, not a permanent cut.
+                self._export_merged_linear(im, out, mark=True, apply_crop=False)
                 out = os.path.splitext(out)[0] + ".tiff"   # writer normalises ext
                 self._verify_linear_tiff(out, im)
             except Exception as e:
@@ -1548,6 +1575,24 @@ class CCRBackend:
                     deleted.append(sp)
             except OSError as e:
                 failures.append((os.path.basename(sp), f"could not delete: {e}"))
+
+        # Move each replaced frame's cataloged edits onto its replacement. The
+        # "merge:" record is validated source-by-source, so the deletions above
+        # just made it permanently unmatchable — without this re-key the user's
+        # conversion, sliders, curves, crop and dust would be stranded on a dead
+        # key and the reloaded TIFF would come back untouched. Only images whose
+        # sources really went are re-keyed (a frame kept because a sibling
+        # failed still has its live merge record). Bookkeeping never breaks the
+        # bake: a failure here is logged, and the files are already safe.
+        gone = set(deleted)
+        rekeyed = [(im, out) for im, out in written
+                   if all(os.path.normpath(s) in gone for s in im.merge_sources)]
+        try:
+            from core.catalog import rekey_merges_to_files
+            rekey_merges_to_files(rekeyed)
+        except Exception as e:
+            print(f"Catalog re-key after replace failed: {e}")
+
         return {"tiff_paths": [out for _im, out in written], "deleted": deleted,
                 "failures": failures, "cancelled": False}
 

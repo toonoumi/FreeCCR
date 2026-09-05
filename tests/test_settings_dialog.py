@@ -50,6 +50,7 @@ def _reset_profile_state():
         ccr_backend.positive_mode = False
         ccr_backend.density_bwpoint = False        # product default: opt-in
         ccr_backend.gamma_luminance = False        # product default: per-channel
+        ccr_backend.balance_hotkeys = False        # product default: opt-in
         ccr_backend.active_profile_path = None
         ccr_backend.images = []
     _reset()
@@ -288,6 +289,10 @@ class _StubMW(QWidget):
         self.calls.append(("gamma_lum", bool(c)))
         ccr_backend.gamma_luminance = bool(c)
 
+    def on_balance_hotkeys_toggled(self, c):
+        self.calls.append(("balance_hotkeys", bool(c)))
+        ccr_backend.balance_hotkeys = bool(c)
+
 
 # The dialogs are built with a non-QWidget stub "main window", so they have no
 # Qt parent and are owned by Python alone. Letting them be garbage-collected
@@ -405,6 +410,27 @@ class TestSettingsDialog:
         d.accept()                                      # Done
         assert ("gamma_lum", True) in d._mw.calls
         assert ccr_backend.gamma_luminance is True
+
+    def test_balance_hotkeys_toggle_staged_until_done(self):
+        """The nudge keys are opt-in (spec/white-balance-restore.md), and stage
+        like every other toggle on this page."""
+        ccr_backend.balance_hotkeys = False
+        d = _dialog()
+        assert d._cb_balance_hotkeys.isChecked() is False
+        d._cb_balance_hotkeys.setChecked(True)
+        assert d._mw.calls == []                        # staged: nothing yet
+        assert ccr_backend.balance_hotkeys is False
+        d.accept()                                      # Done
+        assert ("balance_hotkeys", True) in d._mw.calls
+        assert ccr_backend.balance_hotkeys is True
+
+    def test_balance_hotkeys_toggle_discarded_on_close(self):
+        ccr_backend.balance_hotkeys = False
+        d = _dialog()
+        d._cb_balance_hotkeys.setChecked(True)
+        d.reject()                                      # Escape / close, not Done
+        assert d._mw.calls == []
+        assert ccr_backend.balance_hotkeys is False
 
     def test_gamma_toggle_discarded_on_close(self):
         ccr_backend.gamma_luminance = False

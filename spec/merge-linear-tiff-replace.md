@@ -53,9 +53,36 @@ spec/trichrome-linear-tiff-export.md).
   it is gated by an explicit confirmation and readback verification.
 - No re-merge after baking (originals are gone); the demosaic mode is baked in.
 - No new export format or change to the existing linear-TIFF export path.
-- No framing at import time: a freshly imported merged image has no slice/crop,
-  so the baked TIFF is the full canonical merge. (`_export_merged_linear` applies
-  `source_ops`/crop, which are identity here.)
+- No crop in the baked file, ever — see "Framing" below. (This started as an
+  assumption that a freshly imported merged image has no slice/crop, so the
+  identity `source_ops`/crop `_export_merged_linear` applies did not matter. The
+  assumption does not hold: a catalog restore brings a previous session's crop
+  back before the bake runs, and the crop was then baked into the only surviving
+  copy. It is now skipped explicitly.)
+
+## Framing
+
+The baked TIFF is the **full canonical merge, through the slice chain but NOT
+through the user crop** (`_export_merged_linear(..., apply_crop=False)`).
+
+The two are treated differently on purpose:
+
+- A **crop** is a framing *preference*. Everywhere else in the app it is
+  non-destructive and re-editable — you can widen it, straighten it, or clear it
+  at any time. This bake deletes the originals, so whatever it writes is the only
+  copy that will ever exist; baking the crop would silently make those discarded
+  pixels unrecoverable. An angled crop would also interpolate, costing the
+  bit-exactness that is the whole point of a linear archival TIFF.
+- A **slice** is what makes this image a *distinct frame* rather than a framing
+  choice. It still applies: drop it and three sliced siblings would each bake the
+  same whole scan (and each try to delete the same three sources).
+
+The deliberate **Linear TIFF export** action still applies the crop — it is a
+"give me this framing" request, and it destroys nothing.
+
+The crop therefore stays a live setting, and the catalog **re-key** below is what
+carries it (and every other edit) onto the replacement, so the frame comes back
+framed exactly as the user left it — but re-croppable.
 
 ## UX / Interaction
 
@@ -133,9 +160,36 @@ arbitrary third-party TIFF in merge mode is still rejected as a non-RAW input.
 
 - `ccr_backend.rgb_merge_replace: bool = False` (in `_init`, next to
   `rgb_merge_mode`/`rgb_merge_demosaic`).
-- No catalog impact: replaced merged images simply leave the list on reload;
-  their composite-key catalog entries (if any) become stale (sources deleted)
-  and are ignored/pruned. The new TIFFs are normal cataloged files.
+- **Catalog re-key** (`catalog.rekey_merges_to_files(pairs)`): a `merge:` record
+  is validated *source-by-source*, so deleting the three RAWs makes it
+  permanently unmatchable. Every edit the user made would be stranded on a dead
+  key and the reloaded TIFF would come back untouched. The bake therefore moves
+  each replaced frame's record onto its replacement's file key — same edits, new
+  key, signature taken from the TIFF just written — and drops the dead composite
+  record.
+
+  Carried over: the conversion (`converted` + `conversion_inputs`), adjustment
+  settings, curves, areas, dust spots + heal plan, colour profile, orientation,
+  reference frame, the tone bases, **and the crop** (the bake does not apply it —
+  see § Framing).
+
+  Stripped, because the replacement file already CONTAINS it: `source_ops` (the
+  slice chain is in the pixels), `is_merged`/`merge_sources`,
+  `slice_group`/`slice_parent` (no siblings or parent survive the flattening),
+  `is_duplicate` (each duplicate got its own file). `display_name` becomes the
+  new file's basename.
+
+  Only frames whose sources were **actually deleted** are re-keyed: one kept
+  because a sibling failed still has a live merge record, which must not be
+  moved. Siblings share their sources, so a merge key is always all-or-nothing
+  here. The re-key is wrapped in try/except at the call site and logs on
+  failure — bookkeeping must never be able to break the destructive path that
+  called it, and by then the files are already written and deleted.
+
+  This rests on the premise the whole feature rests on: the TIFF is the same
+  pixels, so a future session loading it renders what the merge rendered. A
+  restore that does fail is already handled — `create_images_for_path` is
+  all-or-nothing and falls back to a plain load.
 
 ## Processing
 

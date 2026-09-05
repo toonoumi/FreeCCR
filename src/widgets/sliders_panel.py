@@ -27,10 +27,7 @@ FILM_STOCK_DEFAULT_LABEL = "Default"
 # rotation/mirror flags, instead of adjustment keys.
 SYNC_GROUPS = [
     ("profile", "Color Profile (Color / B&W)", ()),
-    # Channel Balance — the tone-WEIGHTED per-channel control that replaced
-    # Temperature/Tint. The group id stays "wb" so a remembered {gid: bool}
-    # selection from an earlier session still applies. See spec/channel-balance.md.
-    ("wb", "Channel Balance (R/G/B)", ("balance_r", "balance_g", "balance_b")),
+    ("wb", "White Balance / Tint", ("temperature", "tint")),
     # Gain is no longer here: it lives in Channel Levels as Master Gain, and
     # syncs with the "channels" group below rather than splitting one stage
     # across two groups.
@@ -50,9 +47,14 @@ SYNC_GROUPS = [
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
-        # Non-slider flag (Cineon log → Rec.709 display conversion) — rides
-        # the Channel Levels sync group, preserved specially in the merge.
+        # Non-slider flag (Cineon log → workspace decode) — rides the
+        # Channel Levels sync group, preserved specially in the merge.
         "cineon_log")),
+    # Channel Balance — the tone-WEIGHTED per-channel control, its own group
+    # right after Channel Levels (the tone-uniform one), matching the panel's
+    # adjacency. Separate from "wb" because the two are different stages that a
+    # user syncs independently. See spec/white-balance-restore.md.
+    ("balance", "Channel Balance (R/G/B)", ("balance_r", "balance_g", "balance_b")),
     ("bands", "Subtractive Saturations (per color)",
      tuple(BAND_ADJUSTMENT_KEYS) + ("band_feather",)),
     # "curves" lives outside ADJUSTMENT_KEYS (it's a nested structure, not a
@@ -242,8 +244,8 @@ class ResettableSlider(QSlider):
 
 class GradientSlider(ResettableSlider):
     """A horizontal slider whose groove is a left->right colour gradient
-    (R Balance cyan->red, G Balance magenta->green, B Balance yellow->blue) so
-    the axis reads at a glance.
+    (Temperature blue->amber, Tint green->magenta, R/G/B Balance from each
+    channel's complement to the channel colour) so the axis reads at a glance.
 
     The groove + knob are painted directly rather than via QSS: a global
     ``QSlider`` stylesheet rule, matching this widget through subclassing, would
@@ -296,9 +298,7 @@ class SlidersPanel(QWidget):
         # "exposure" is deliberately absent: the Gain slider was removed (Master
         # Gain replaces it). The pipeline parameter still exists for the baked
         # auto-exposure and for area layers — it just has no slider to zip to.
-        # Channel Balance replaced Temperature/Tint in the same panel slot: one
-        # low-anchored curve node per channel (spec/channel-balance.md).
-        "balance_r", "balance_g", "balance_b", "brightness", "gamma", "highlights",
+        "temperature", "tint", "brightness", "gamma", "highlights",
         "white_point", "shadows", "black_point", "contrast", "saturation",
         "sub_saturation",
         # Per-channel levels controls (collapsible section)
@@ -306,6 +306,11 @@ class SlidersPanel(QWidget):
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
         "ch_g_shift", "ch_g_gain", "ch_g_blackpoint",
         "ch_b_shift", "ch_b_gain", "ch_b_blackpoint",
+        # Channel Balance (its own collapsible, under Channel Levels + Master
+        # Gain). Created right after the Channel Levels sliders, so the creation
+        # order matches both the panel's top-to-bottom order and the pipeline's
+        # (Levels -> Balance -> White Balance). See spec/white-balance-restore.md.
+        "balance_r", "balance_g", "balance_b",
         # Per-color-band sliders (Subtractive Saturations section, created
         # last): band_<color>_<param> for the color bands × 4 params
     ] + list(BAND_ADJUSTMENT_KEYS) + [
@@ -554,12 +559,24 @@ class SlidersPanel(QWidget):
         scroll_layout.addWidget(theme.section_separator())
         self.od_section = CollapsibleSection("Channel Levels")
         scroll_layout.addWidget(self.od_section)
-        # Master Gain sits OUTSIDE the collapsible, directly below it, so it is
-        # always visible: it is the app's one gain control (the general-
-        # adjustments "Gain" slider was the same math and is gone) and the stage
-        # Auto Gain rides. Its row is created later, with the rest of the Channel
-        # Levels sliders, to keep the positional ADJUSTMENT_KEYS zip intact — so
-        # reserve its slot here and insert into it below.
+        # Channel Balance sits directly under Channel Levels, collapsed by
+        # default: it is the tone-WEIGHTED per-channel control (crossover), where
+        # Channel Levels above it is the tone-uniform one and White Balance below
+        # is a flat multiply. Placed here, POPULATED below with the rest of the
+        # collapsible sections. See spec/white-balance-restore.md.
+        self.balance_section = CollapsibleSection("Channel Balance")
+        scroll_layout.addWidget(self.balance_section)
+
+        # Master Gain sits OUTSIDE both collapsibles, directly BELOW Channel
+        # Balance, so it is always visible and the panel reads in pipeline
+        # order: Levels -> Balance -> Master Gain, which is the order the render
+        # applies them (spec/master-gain-after-balance.md — the gain runs after
+        # the tone-weighted node so a brightness change cannot move the colour).
+        # It is the app's one gain control (the general-adjustments "Gain"
+        # slider was the same math and is gone) and the stage Auto Gain rides.
+        # Its row is created later, with the rest of the Channel Levels sliders,
+        # to keep the positional ADJUSTMENT_KEYS zip intact — so reserve its slot
+        # here and insert into it below.
         _master_gain_slot = scroll_layout.count()
 
         # Separator between B/W Point tools and the adjustment sliders
@@ -570,13 +587,13 @@ class SlidersPanel(QWidget):
         self.wb_picker_btn = QPushButton("WB Picker")
         self.wb_picker_btn.setToolTip(
             "Click, then pick a neutral gray/white point on the image "
-            "to auto-set the R/G/B Balance sliders.")
+            "to auto-set Temperature and Tint.")
         # Fully automatic white balance: no picking — estimates the neutral
         # from the whole image and sets the Temperature/Tint sliders.
         self.auto_wb_btn = QPushButton("AWB")
         self.auto_wb_btn.setToolTip(
             "Automatic white balance — estimates the neutral color from the "
-            "whole image and sets the R/G/B Balance sliders. The algorithm is "
+            "whole image and sets Temperature and Tint. The algorithm is "
             "chosen in Settings → General.")
         # Crop: non-destructive crop of the preview/export (same gating).
         self.crop_btn = QPushButton("Crop")
@@ -610,17 +627,15 @@ class SlidersPanel(QWidget):
         # luminance channel (preview and export). Per-image, like the sliders.
         self.color_profile_row = self._create_color_profile_row()
 
-        # Channel Balance: three low-anchored curve nodes, one per channel, in
-        # the slot Temperature/Tint used to occupy. Labels stay "<C> Balance" so
-        # they never read as Channel Levels' "<C> Shift / Gain / Blackpoint" —
-        # Levels is the tone-uniform control, Balance the tone-weighted one.
-        # See spec/channel-balance.md.
-        self.balance_r_slider_layout = self.create_slider(
-            "R Balance", gradient=theme.BALANCE_R_GRADIENT)
-        self.balance_g_slider_layout = self.create_slider(
-            "G Balance", gradient=theme.BALANCE_G_GRADIENT)
-        self.balance_b_slider_layout = self.create_slider(
-            "B Balance", gradient=theme.BALANCE_B_GRADIENT)
+        # White Balance: the flat per-channel multiply, back in its own slot
+        # directly above Brightness. It is the right control wherever the base
+        # is not optical density — reference-frame conversions and Positive mode
+        # — and Channel Balance above handles the casts it cannot reach.
+        # See spec/white-balance-restore.md.
+        self.temperature_slider_layout = self.create_slider(
+            "Temperature", gradient=theme.TEMP_GRADIENT)
+        self.tint_slider_layout = self.create_slider(
+            "Tint", gradient=theme.TINT_GRADIENT)
         # (The general-adjustments "Gain" slider used to be created here. It was
         # the same math as Channel Levels' Master Gain at a different scale, so it
         # was removed — Master Gain is the one gain control, and it is also what
@@ -642,9 +657,8 @@ class SlidersPanel(QWidget):
         self.sub_saturation_slider_layout = self.create_slider("Subtracted Sat")
 
         scroll_layout.addLayout(self.color_profile_row)
-        scroll_layout.addLayout(self.balance_r_slider_layout)
-        scroll_layout.addLayout(self.balance_g_slider_layout)
-        scroll_layout.addLayout(self.balance_b_slider_layout)
+        scroll_layout.addLayout(self.temperature_slider_layout)
+        scroll_layout.addLayout(self.tint_slider_layout)
         scroll_layout.addLayout(self.brightness_slider_layout)
         scroll_layout.addLayout(self.gamma_slider_layout)
         scroll_layout.addLayout(self.highlights_slider_layout)
@@ -674,9 +688,9 @@ class SlidersPanel(QWidget):
         scroll_layout.addLayout(sync_layout)
 
         # --- Collapsible sections ---
-        # Display order (top→bottom): Channel Levels (placed far above, right
-        # under the Convert row — it is the first pipeline stage), then Curves
-        # and Subtractive Saturations here. The section WIDGETS are placed in
+        # Display order (top→bottom): Channel Levels and Channel Balance (placed
+        # far above, right under the Convert row — they are the first pipeline
+        # stages), then Curves and Subtractive Saturations here. The WIDGETS are placed in
         # display order, but their SLIDERS are created further below in the
         # strict order that ADJUSTMENT_KEYS requires (Channel Levels before
         # bands). Placement and population are decoupled because each
@@ -706,7 +720,9 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("Input Gain"))
         self.od_section.add_layout(self.create_slider("Master Shift"))
         # Created HERE (third, so the ADJUSTMENT_KEYS zip is unchanged) but placed
-        # OUTSIDE the collapsible, in the slot reserved above — always visible.
+        # OUTSIDE the collapsible, in the slot reserved above — always visible,
+        # and BELOW Channel Balance, where the render applies it. Creation order
+        # and display order are independent; only the former feeds the zip.
         self.master_gain_slider_layout = self.create_slider("Master Gain")
         scroll_layout.insertLayout(_master_gain_slot, self.master_gain_slider_layout)
 
@@ -737,20 +753,39 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("B Gain"))
         self.od_section.add_layout(self.create_slider("B Blackpoint"))
 
-        # Cineon film log → Rec.709 (γ 2.2) display conversion — a FINAL
-        # pipeline stage after every other adjustment (incl. curves/areas),
-        # identical for preview, zoom detail and export. Non-slider flag
+        # Cineon film log → workspace — the decode OUT of log, applied right
+        # after Master Gain, so White Balance and the whole tone chain below it
+        # grade display-referred data instead of log density. Non-slider flag
         # ("cineon_log" in adjustment_settings); whole-image only, so it is
-        # disabled while an area layer is the edit target. See
-        # spec/cineon-display-transform.md.
-        self.cineon_checkbox = QCheckBox("Cineon Log → Rec.709 (γ 2.2)")
+        # disabled while an area layer is the edit target (an area grades the
+        # already-decoded base). See spec/cineon-display-transform.md.
+        self.cineon_checkbox = QCheckBox("Cineon Log → Workspace")
         self.cineon_checkbox.setToolTip(
-            "Interpret the adjusted image as Cineon film log (10-bit black at "
-            "code 95, 90% white at 685 — the levels the Scopes parade marks) "
-            "and convert to Rec.709 video with a 2.2 gamma, as the final step "
-            "before display/export.")
+            "Interpret the value as Cineon film log (10-bit black at code 95, "
+            "90% white at 685 — the levels the Scopes parade marks) and decode "
+            "it into the working space, right after Master Gain. Everything "
+            "below — White Balance, the tone sliders and curves — then grades "
+            "the decoded image instead of log density.")
         self.cineon_checkbox.toggled.connect(self._on_cineon_toggled)
         self.od_section.add_widget(self.cineon_checkbox)
+
+        # --- Populate Channel Balance (the section widget is placed above,
+        # right under Master Gain) ---
+        # Created after the Channel Levels sliders and before the band sliders,
+        # which is where "balance_r/g/b" sit in ADJUSTMENT_KEYS. Labels stay
+        # "<C> Balance" so they never read as Channel Levels' "<C> Shift / Gain
+        # / Blackpoint" — Levels is the tone-uniform control, Balance the
+        # tone-weighted one. See spec/channel-balance.md.
+        self.balance_r_slider_layout = self.create_slider(
+            "R Balance", gradient=theme.BALANCE_R_GRADIENT)
+        self.balance_g_slider_layout = self.create_slider(
+            "G Balance", gradient=theme.BALANCE_G_GRADIENT)
+        self.balance_b_slider_layout = self.create_slider(
+            "B Balance", gradient=theme.BALANCE_B_GRADIENT)
+        for _layout in (self.balance_r_slider_layout,
+                        self.balance_g_slider_layout,
+                        self.balance_b_slider_layout):
+            self.balance_section.add_layout(_layout)
 
         # --- Populate Subtractive Saturations (per-color bands) ---
         # A swatch button per color selects which band's sliders are shown;
@@ -1297,7 +1332,7 @@ class SlidersPanel(QWidget):
         return adjustment
 
     def _on_cineon_toggled(self, checked):
-        """Cineon log → Rec.709 checkbox: a discrete, single-undo edit on the
+        """Cineon log → Workspace checkbox: a discrete, single-undo edit on the
         GLOBAL settings dict. Mirrors _on_curve_edit_finished's settle path —
         regenerate the preview first, then display it."""
         if self.current_idx is None:
@@ -1657,20 +1692,19 @@ class SlidersPanel(QWidget):
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None or not img.converted:
             return
-        from core.awb import compute_awb_balance
-        res = compute_awb_balance(img)
+        from core.awb import compute_awb_wb
+        res = compute_awb_wb(img)
         if res is None:
             self.set_temporary_hint(
                 "<b>AWB:</b> not enough usable image content.", duration=5000)
             return
         self.on_wb_sampled(*res)
 
-    def on_wb_sampled(self, r_value, g_value, b_value):
-        """Apply the auto-computed R/G/B Balance from the WB eyedropper or AWB."""
+    def on_wb_sampled(self, temp_value, tint_value):
+        """Apply the auto-computed Temperature/Tint from the WB eyedropper or AWB."""
         # The WB pick is its own undo step — don't merge it into a slider burst
         self.end_undo_burst()
-        for key, val in (("balance_r", r_value), ("balance_g", g_value),
-                         ("balance_b", b_value)):
+        for key, val in (("temperature", temp_value), ("tint", tint_value)):
             idx = self.adjustment_keys.index(key)
             self.sliders[idx].blockSignals(True)
             self.sliders[idx].setValue(val)
@@ -1681,7 +1715,7 @@ class SlidersPanel(QWidget):
         # of leaving the canvas one render behind until the next interaction.
         self._settle_preview()
         self.set_temporary_hint(
-            f"Auto WB applied — R: {r_value}, G: {g_value}, B: {b_value}.",
+            f"Auto WB applied — Temperature: {temp_value}, Tint: {tint_value}.",
             duration=5000)
 
     # Step for the Channel Balance nudge hotkeys (U/I/O raise R/G/B, J/K/L
@@ -1938,7 +1972,7 @@ class SlidersPanel(QWidget):
             "measuring your film base, so the frame keeps its own cast and "
             "placement. Grade it with <b>Channel Levels</b> (Master Gain, and the "
             "per-channel Shift / Gain / Blackpoint), and enable <b>Cineon Log "
-            "→ Rec.709</b> for the intended display transform.<br><br>"
+            "→ Workspace</b> to decode out of log.<br><br>"
             "Set a <b>Black Point</b> first for a conversion anchored to your "
             "own film base.<br><br>"
             "<i>This warning can be turned off in Settings → General.</i>")

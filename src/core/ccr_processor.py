@@ -1,12 +1,14 @@
 import numpy as np
 import cv2
+import math
 import os
 import threading
 import time
 import tifffile
 import gc
 
-from core.color_management import apply_export_colorspace, inject_jpeg_icc
+from core.color_management import (apply_export_colorspace, inject_jpeg_icc,
+                                   srgb_encode)
 
 # Try to import PyOpenCL, but handle gracefully if not available
 try:
@@ -1316,13 +1318,26 @@ CH_INPUT_GAIN_DIV = 25.0    # input gain: slider +-100 -> 2^+-4 (+-4 stops)
 CH_MIN_RANGE = 0.1          # => at most a 10x per-channel gain
 
 
+def _master_gain_divisor(ch_master_gain: float) -> float:
+    """Master Gain as a single uniform divisor: out = in / max(1 - v/DIV, MIN).
+
+    Split out of _apply_channel_levels because Master Gain no longer runs with
+    the rest of Channel Levels — it is applied AFTER Channel Balance (and, being
+    a pure scalar, commutes with the White Balance multiply that follows). The
+    hidden Auto Gain offset rides this same parameter, so it moves with it.
+    See spec/master-gain-after-balance.md."""
+    mg = float(np.clip(ch_master_gain, -100.0, 100.0)) / CH_SLIDER_DIV
+    return max(1.0 - mg, CH_MIN_RANGE)
+
+
 def _apply_channel_levels(d: np.ndarray,
                           ch_input_gain: float, ch_master_shift: float,
                           ch_master_gain: float,
                           ch_r_shift: float, ch_r_gain: float, ch_r_blackpoint: float,
                           ch_g_shift: float, ch_g_gain: float, ch_g_blackpoint: float,
                           ch_b_shift: float, ch_b_gain: float, ch_b_blackpoint: float,
-                          clamp: bool) -> np.ndarray:
+                          clamp: bool,
+                          include_master_gain: bool = True) -> np.ndarray:
     """Channel Levels, applied to float DISPLAY values `d` (0 = display black,
     1 = display white). Index 0=R, 1=G, 2=B. Modifies `d` in place.
 
@@ -1331,6 +1346,13 @@ def _apply_channel_levels(d: np.ndarray,
       2. Per channel — out = (in + shift - black) / max((1 - gain) - black, MIN).
       3. Master      — a uniform shift + gain AFTER the per-channel work. Master
                        is its own stage, NOT summed into the per-channel values.
+
+    `include_master_gain=False` runs everything EXCEPT the Master Gain divide,
+    which the caller then applies after Channel Balance — Master Gain (and the
+    Auto Gain offset riding it) is an EXPOSURE control, and running it ahead of
+    the tone-weighted Balance node made a gain change move the colour. Master
+    Shift stays here: it is part of placing the histogram in the window, which
+    Balance needs done first. See spec/master-gain-after-balance.md.
 
     `clamp` is the pipeline-position switch:
       False (windowed base) — no clipping at all, so `d` stays un-clamped for the
@@ -1353,7 +1375,6 @@ def _apply_channel_levels(d: np.ndarray,
               float(np.clip(ch_g_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV,
               float(np.clip(ch_b_blackpoint, -100.0, 100.0)) / CH_SLIDER_DIV)
     ms = float(np.clip(ch_master_shift, -100.0, 100.0)) / CH_SLIDER_DIV
-    mg = float(np.clip(ch_master_gain, -100.0, 100.0)) / CH_SLIDER_DIV
 
     # 1. Input Gain (uniform, before everything else)
     if ig != 1.0:
@@ -1372,9 +1393,10 @@ def _apply_channel_levels(d: np.ndarray,
     # 3. Master shift / gain (uniform, after the per-channel work)
     if ms != 0.0:
         d += np.float32(ms)
-    mden = max(1.0 - mg, CH_MIN_RANGE)
-    if mden != 1.0:
-        d /= np.float32(mden)
+    if include_master_gain:
+        mden = _master_gain_divisor(ch_master_gain)
+        if mden != 1.0:
+            d /= np.float32(mden)
 
     if clamp:
         np.clip(d, 0.0, 1.0, out=d)
@@ -1408,7 +1430,8 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                                   ch_b_shift: float = 0.0, ch_b_gain: float = 0.0,
                                   ch_b_blackpoint: float = 0.0,
                                   balance_r: float = 0.0, balance_g: float = 0.0,
-                                  balance_b: float = 0.0) -> np.ndarray:
+                                  balance_b: float = 0.0,
+                                  cineon_log: bool = False) -> np.ndarray:
     """De-window a windowed base, apply the highlight-recovery controls UN-clamped
     (so headroom can be pulled back below white), then clamp to the display window
     and return a normal full-range [0,65535] positive for the look chain. This
@@ -1440,16 +1463,37 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                               ch_r_shift, ch_r_gain, ch_r_blackpoint,
                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                              clamp=False)
+                              clamp=False, include_master_gain=False)
+    # Cineon log -> workspace - the decode OUT of log, immediately after
+    # Channel Levels and BEFORE Channel Balance. Levels is the log-domain
+    # grading (a per-channel shift IS a density offset there); everything
+    # after the decode - Balance's tone-weighted node, Master Gain, White
+    # Balance's flat multiply, the whole tone chain - is built for
+    # display-referred data. Un-clamped like its neighbours: floored at 0,
+    # but headroom above white survives for the White Point recovery below.
+    # See spec/cineon-display-transform.md.
+    if cineon_log:
+        d = apply_cineon_to_workspace(d)
     # Channel Balance - the tone-WEIGHTED per-channel control, right after the
     # tone-uniform one and in the slot Temperature/Tint used to occupy. It runs
-    # AFTER Channel Levels deliberately: on a windowed base much of the data
-    # still sits outside [0,1] (film base below black, headroom above white),
+    # AFTER Channel Levels (and after the Cineon decode, when that is on)
+    # deliberately: on a windowed base much of the data still sits outside
+    # [0,1] (film base below black, headroom above white),
     # where the node is identity, so Levels must place the histogram in the
     # window first for the node to bite where the user actually sees it.
     # Un-clamped like everything else here. See spec/channel-balance.md §4.2.
     if _channel_balance_active(balance_r, balance_g, balance_b):
         _apply_channel_balance(d, balance_r, balance_g, balance_b)
+    # Master Gain (and the hidden Auto Gain offset riding it) - the EXPOSURE
+    # control, deliberately AFTER Channel Balance. Balance is tone-weighted
+    # (its node sits at a fixed display value), so with the gain ahead of it a
+    # brightness change moved the colour; behind it, exposure and colour are
+    # independent. Un-clamped like everything else here, and a pure scalar, so
+    # it commutes with the White Balance multiply below.
+    # See spec/master-gain-after-balance.md.
+    _mden = _master_gain_divisor(ch_master_gain)
+    if _mden != 1.0:
+        d /= np.float32(_mden)
     # White balance - flat per-channel gain in the scene-linear working domain
     # (before the window clamp) so a warm/cool shift lands in headroom (recoverable)
     # instead of clipping, and cooling can pull highlights back. Index 0=R,1=G,2=B.
@@ -2832,6 +2876,9 @@ def adjust_image(
     balance_r: float = 0.0,
     balance_g: float = 0.0,
     balance_b: float = 0.0,
+    # Cineon log -> workspace, applied right after Master Gain. Appended for the
+    # same positional-compatibility reason as balance_*.
+    cineon_log: bool = False,
 ) -> np.ndarray:
     """
     Apply temperature, tint, exposure, brightness, blackpoint, whitepoint, highlights, shadows,
@@ -2851,7 +2898,8 @@ def adjust_image(
                                               ch_r_shift, ch_r_gain, ch_r_blackpoint,
                                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                                              balance_r, balance_g, balance_b)
+                                              balance_r, balance_g, balance_b,
+                                              cineon_log)
         exposure = 0.0       # consumed by the recovery pre-stage
         whitepoint = 0.0     # White Point is the headroom-recovery control here
         kelvin_shift = 0.0   # White Balance consumed (flat per-channel gain, pre-clamp)
@@ -2859,6 +2907,7 @@ def adjust_image(
         # Channel Balance consumed too — it ran inside the recovery, un-clamped,
         # right after Channel Levels. Zero it so the block below can't re-apply it.
         balance_r = balance_g = balance_b = 0.0
+        cineon_log = False   # decoded inside the recovery, after Master Gain
         # Channel Levels consumed too — it ran FIRST, un-clamped, inside the
         # recovery (spec/channel-levels-pre-clamp.md). Zero it so the block
         # below can't apply it a second time.
@@ -2868,31 +2917,42 @@ def adjust_image(
         ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
     img = img16.astype(np.float32)
 
-    # Channel Levels - the FIRST adjustment stage, ahead of White Balance and the
-    # whole look domain. Only reached on a NON-windowed base (reference mode,
-    # positive mode, area layers); a windowed base consumed it above, un-clamped.
-    # Those paths carry no sub-black data, so this runs clamped, as before.
-    if _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
-                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
-                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                              ch_b_shift, ch_b_gain, ch_b_blackpoint):
+    # Channel Levels -> Cineon decode -> Channel Balance -> Master Gain: the
+    # first stages, ahead of White Balance and the whole look domain, in one
+    # normalised pass.
+    # Only reached on a NON-windowed base (reference mode, positive mode, area
+    # layers); a windowed base consumed all three above. Master Gain lands after
+    # Balance so a gain change cannot move the colour through Balance's
+    # tone-weighted node (spec/master-gain-after-balance.md), and the clamp
+    # Channel Levels used to do at its own exit now closes the pass instead —
+    # these paths carry no sub-black data and the later pow() stages must not
+    # see negatives. With Balance neutral that is bit-identical to the old
+    # single clamped Levels call, since nothing between them clips.
+    _levels_on = _channel_levels_active(ch_input_gain, ch_master_shift, ch_master_gain,
+                                        ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                        ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                        ch_b_shift, ch_b_gain, ch_b_blackpoint)
+    _balance_on = _channel_balance_active(balance_r, balance_g, balance_b)
+    _mden = _master_gain_divisor(ch_master_gain)
+    if _levels_on or _balance_on or _mden != 1.0 or cineon_log:
         img /= np.float32(65535.0)
-        _apply_channel_levels(img, ch_input_gain, ch_master_shift, ch_master_gain,
-                              ch_r_shift, ch_r_gain, ch_r_blackpoint,
-                              ch_g_shift, ch_g_gain, ch_g_blackpoint,
-                              ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                              clamp=True)
-        img *= np.float32(65535.0)
-
-    # Channel Balance - the tone-weighted per-channel control, after Channel
-    # Levels and before White Balance, mirroring the windowed order. Only
-    # reached on a NON-windowed base (reference mode, positive mode, area
-    # layers); a windowed base consumed it above. uint16 input means every value
-    # is already inside [0,1] here, so the identity-outside rule is a no-op.
-    # See spec/channel-balance.md.
-    if _channel_balance_active(balance_r, balance_g, balance_b):
-        img /= np.float32(65535.0)
-        _apply_channel_balance(img, balance_r, balance_g, balance_b)
+        if _levels_on:
+            _apply_channel_levels(img, ch_input_gain, ch_master_shift, ch_master_gain,
+                                  ch_r_shift, ch_r_gain, ch_r_blackpoint,
+                                  ch_g_shift, ch_g_gain, ch_g_blackpoint,
+                                  ch_b_shift, ch_b_gain, ch_b_blackpoint,
+                                  clamp=False, include_master_gain=False)
+        # Cineon log -> workspace, between Channel Levels and Channel Balance:
+        # Levels grades in log, everything after the decode grades
+        # display-referred data.
+        if cineon_log:
+            img = apply_cineon_to_workspace(img)
+            cineon_log = False
+        if _balance_on:
+            _apply_channel_balance(img, balance_r, balance_g, balance_b)
+        if _mden != 1.0:
+            img /= np.float32(_mden)
+        np.clip(img, 0.0, 1.0, out=img)
         img *= np.float32(65535.0)
 
     # White balance - flat per-channel gain (spec/working-space-white-balance.md).
@@ -3290,6 +3350,7 @@ def adjust_image_opencl(
     balance_r: float = 0.0,
     balance_g: float = 0.0,
     balance_b: float = 0.0,
+    cineon_log: bool = False,
 ) -> np.ndarray:
     """
     GPU-accelerated (OpenCL) version of adjust_image.
@@ -3309,7 +3370,8 @@ def adjust_image_opencl(
                                               ch_r_shift, ch_r_gain, ch_r_blackpoint,
                                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                                              balance_r, balance_g, balance_b)
+                                              balance_r, balance_g, balance_b,
+                                              cineon_log)
         exposure = 0.0
         whitepoint = 0.0
         ws_windowed = False
@@ -3319,6 +3381,7 @@ def adjust_image_opencl(
         # un-clamped) — zero it so neither the kernel path nor the CPU fallback
         # below can apply it twice. See spec/channel-balance.md.
         balance_r = balance_g = balance_b = 0.0
+        cineon_log = False   # decoded inside the pre-stage, after Master Gain
         # Channel Levels ran FIRST, un-clamped, inside the pre-stage — zero it so
         # the kernel (and the CPU fallback below) can't re-apply it. This is what
         # makes GPU/CPU parity free on the windowed path: the kernel never sees
@@ -3332,7 +3395,7 @@ def adjust_image_opencl(
     # apply it -> exact CPU/GPU parity, and no kernel change at all. ws consumed
     # above; this covers the non-windowed bases. Placed immediately before the
     # WB block so the Balance -> White Balance order matches adjust_image.
-    if _channel_balance_active(balance_r, balance_g, balance_b):
+    if _channel_balance_active(balance_r, balance_g, balance_b) or cineon_log:
         img16 = img16.astype(np.float32)
         img16 /= np.float32(65535.0)
         # Channel Levels runs BEFORE Balance (adjust_image's order, and the
@@ -3349,12 +3412,31 @@ def adjust_image_opencl(
                                   ch_r_shift, ch_r_gain, ch_r_blackpoint,
                                   ch_g_shift, ch_g_gain, ch_g_blackpoint,
                                   ch_b_shift, ch_b_gain, ch_b_blackpoint,
-                                  clamp=True)
-            ch_input_gain = ch_master_shift = ch_master_gain = 0.0
+                                  clamp=False, include_master_gain=False)
+            ch_input_gain = ch_master_shift = 0.0
             ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
             ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
             ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
-        _apply_channel_balance(img16, balance_r, balance_g, balance_b)
+        # Cineon log -> workspace, between Channel Levels and Channel Balance
+        # and before the kernel sees anything, so the decode cannot land after
+        # a stage that is supposed to grade its result.
+        if cineon_log:
+            img16 = apply_cineon_to_workspace(img16)
+            cineon_log = False
+        if _channel_balance_active(balance_r, balance_g, balance_b):
+            _apply_channel_balance(img16, balance_r, balance_g, balance_b)
+        # Master Gain lands AFTER Balance (spec/master-gain-after-balance.md).
+        # Only reachable with Levels consumed above, since ch_master_gain is one
+        # of the values _channel_levels_active tests — but guard on the divisor
+        # anyway so it can never double-apply with the kernel's own copy.
+        _mden = _master_gain_divisor(ch_master_gain)
+        if _mden != 1.0:
+            img16 /= np.float32(_mden)
+            ch_master_gain = 0.0
+        # Same closing clamp as adjust_image's non-windowed pass — the kernel
+        # would otherwise receive negatives its pow() stages cannot take, and
+        # CPU/GPU parity depends on the clamp sitting in the same place.
+        np.clip(img16, 0.0, 1.0, out=img16)
         img16 *= np.float32(65535.0)
         balance_r = balance_g = balance_b = 0.0
 
@@ -3389,7 +3471,7 @@ def adjust_image_opencl(
                           # Consumed in numpy above (zeroed); passed explicitly
                           # so the fallback stays correct if that block moves.
                           balance_r=balance_r, balance_g=balance_g,
-                          balance_b=balance_b)
+                          balance_b=balance_b, cineon_log=cineon_log)
 
     try:
       # Serialize GPU submissions: the hi-res zoom worker may run this
@@ -3459,7 +3541,7 @@ def adjust_image_opencl(
                           # Consumed in numpy above (zeroed); passed explicitly
                           # so the fallback stays correct if that block moves.
                           balance_r=balance_r, balance_g=balance_g,
-                          balance_b=balance_b)
+                          balance_b=balance_b, cineon_log=cineon_log)
 
 
 
@@ -3712,42 +3794,53 @@ def apply_gamma_curve(img16: np.ndarray, gamma: float,
     return apply_curves(img16, {"rgb": gamma_curve_points(gamma)})
 
 
-# --- Cineon film log → Rec.709 (γ 2.2) display conversion -------------------
-# Optional FINAL pipeline stage (the "Cineon Log → Rec.709" checkbox in the
-# Channel Levels section; settings key "cineon_log"): interpret the fully-
-# adjusted image as Cineon printing-density log and convert to Rec.709 video
-# with a plain 2.2 gamma. Standard Kodak constants: 10-bit code 95 = black
-# (Dmin), 685 = 90% white — the same codes the Scopes parade marks — with
-# 0.002 log10 density per code over a 0.6 negative gamma. Values above 685
-# clip to white (the classic video-range conversion, no soft shoulder). See
-# spec/cineon-display-transform.md.
+# --- Cineon film log → workspace ---------------------------------------------
+# The "Cineon Log → Workspace" checkbox in the Channel Levels section (settings
+# key "cineon_log"): interpret the value as Cineon printing-density log and
+# DECODE it into the app's working space. Standard Kodak constants: 10-bit code
+# 95 = black (Dmin), 685 = 90% white — the same codes the Scopes parade marks —
+# with 0.002 log10 density per code over a 0.6 negative gamma.
+#
+# It runs RIGHT AFTER MASTER GAIN, not at the end of the chain, and encodes with
+# the WORKING SPACE's curve (sRGB) rather than a Rec.709 2.2 gamma. Both follow
+# from what the stage is for: it is a decode OUT of log, not a display transform.
+# Everything downstream — White Balance's flat multiply, the tone sliders, the
+# contrast S-curve pivoting on 0.5, saturation's luma weighting, the Curves
+# editor's 0–255 domain — is built for display-referred data, and with the
+# decode at the END they were all grading log values instead.
+#
+# Un-clamped, like every other stage in the working-space recovery: the linear
+# result is floored at 0 (the sRGB power segment is undefined below it) but NOT
+# ceilinged, so highlight headroom survives for White Point to pull back.
+# See spec/cineon-display-transform.md.
 CINEON_BLACK_CODE = 95.0
 CINEON_WHITE_CODE = 685.0
 _CINEON_NEG_GAMMA = 0.6
 _CINEON_DENSITY_PER_CODE = 0.002
-
-_cineon_lut16_cache = None
-
-
-def _cineon_rec709_lut16() -> np.ndarray:
-    """65536-entry uint16 LUT: 16-bit input (≡ 10-bit code · 1023/65535) →
-    Rec.709 gamma-2.2 output. Built once and cached."""
-    global _cineon_lut16_cache
-    if _cineon_lut16_cache is None:
-        code = np.linspace(0.0, 1023.0, 65536, dtype=np.float64)
-        gain = _CINEON_DENSITY_PER_CODE / _CINEON_NEG_GAMMA
-        off = 10.0 ** ((CINEON_BLACK_CODE - CINEON_WHITE_CODE) * gain)
-        lin = (10.0 ** ((code - CINEON_WHITE_CODE) * gain) - off) / (1.0 - off)
-        lin = np.clip(lin, 0.0, 1.0)
-        _cineon_lut16_cache = np.round(
-            np.power(lin, 1.0 / 2.2) * 65535.0).astype(np.uint16)
-    return _cineon_lut16_cache
+_CINEON_CODE_MAX = 1023.0        # display 1.0 == 10-bit full scale
 
 
-def apply_cineon_to_rec709(img16: np.ndarray) -> np.ndarray:
-    """Cineon log → Rec.709 (γ 2.2), per channel. Applied after ALL other
-    adjustments so preview, hi-res zoom and export transform identically."""
-    return _cineon_rec709_lut16()[img16]
+def cineon_decode(code: np.ndarray) -> np.ndarray:
+    """10-bit Cineon printing-density codes -> scene-linear. Not clamped: the
+    caller decides, and the working-space path needs the headroom."""
+    gain = _CINEON_DENSITY_PER_CODE / _CINEON_NEG_GAMMA
+    off = 10.0 ** ((CINEON_BLACK_CODE - CINEON_WHITE_CODE) * gain)
+    # 10**x as exp2(x*log2 10): same value, materially faster over a full frame.
+    lin = np.exp2((code - np.float32(CINEON_WHITE_CODE))
+                  * np.float32(gain * math.log2(10.0)))
+    lin -= np.float32(off)
+    lin *= np.float32(1.0 / (1.0 - off))
+    return lin
+
+
+def apply_cineon_to_workspace(d: np.ndarray) -> np.ndarray:
+    """Cineon log -> working space, per channel, on float DISPLAY values
+    (0 = display black, 1 = display white). Returns the encoded array.
+
+    Decodes the log curve and re-encodes with the working space's transfer
+    function (sRGB), un-clipped above white so headroom survives the stage."""
+    lin = cineon_decode(np.asarray(d, dtype=np.float32) * np.float32(_CINEON_CODE_MAX))
+    return srgb_encode(lin, clip=False).astype(np.float32)
 
 
 # --- Dust removal (spot inpainting) ----------------------------------------

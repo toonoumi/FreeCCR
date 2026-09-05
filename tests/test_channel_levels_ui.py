@@ -143,12 +143,17 @@ def test_master_gain_is_outside_the_collapsible_and_always_visible(panel):
     assert _row_label_in(layout, slider) == "Master Gain"
 
 
-def test_master_gain_sits_directly_below_the_section(panel):
+def test_master_gain_sits_below_channel_levels_and_channel_balance(panel):
+    """The panel reads in render order: Channel Levels, then Channel Balance,
+    then Master Gain — the gain runs after the tone-weighted Balance node
+    (spec/master-gain-after-balance.md). Both sections are above it; the gain is
+    a direct row, so collapsing either never hides it."""
     layout = _scroll_layout(panel)
     slider = panel.sliders[panel.adjustment_keys.index("ch_master_gain")]
-    section = _index_of(layout, panel.od_section)
+    levels = _index_of(layout, panel.od_section)
+    balance = _index_of(layout, panel.balance_section)
     row = _index_of(layout, slider)
-    assert row == section + 1
+    assert (balance, row) == (levels + 1, levels + 2)
     # and still above the WB/AWB row
     assert row < _index_of(layout, panel.auto_wb_btn)
 
