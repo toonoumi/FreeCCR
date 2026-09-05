@@ -53,9 +53,38 @@ spec/trichrome-linear-tiff-export.md).
   it is gated by an explicit confirmation and readback verification.
 - No re-merge after baking (originals are gone); the demosaic mode is baked in.
 - No new export format or change to the existing linear-TIFF export path.
-- No framing at import time: a freshly imported merged image has no slice/crop,
-  so the baked TIFF is the full canonical merge. (`_export_merged_linear` applies
-  `source_ops`/crop, which are identity here.)
+- No crop in the baked file, ever — see "Framing" below. (This started as an
+  assumption that a freshly imported merged image has no slice/crop, so the
+  identity `source_ops`/crop `_export_merged_linear` applies did not matter. The
+  assumption does not hold: a catalog restore brings a previous session's crop
+  back before the bake runs, and the crop was then baked into the only surviving
+  copy. It is now skipped explicitly.)
+
+## Framing
+
+The baked TIFF is the **full canonical merge, through the slice chain but NOT
+through the user crop** (`_export_merged_linear(..., apply_crop=False)`).
+
+The two are treated differently on purpose:
+
+- A **crop** is a framing *preference*. Everywhere else in the app it is
+  non-destructive and re-editable — you can widen it, straighten it, or clear it
+  at any time. This bake deletes the originals, so whatever it writes is the only
+  copy that will ever exist; baking the crop would silently make those discarded
+  pixels unrecoverable. An angled crop would also interpolate, costing the
+  bit-exactness that is the whole point of a linear archival TIFF.
+- A **slice** is what makes this image a *distinct frame* rather than a framing
+  choice. It still applies: drop it and three sliced siblings would each bake the
+  same whole scan (and each try to delete the same three sources).
+
+The deliberate **Linear TIFF export** action still applies the crop — it is a
+"give me this framing" request, and it destroys nothing.
+
+Consequence, stated plainly: after the replace + reload, an image that had a crop
+comes back uncropped. Its edits do not survive the replacement at all (the
+composite merge key dies with the sources — see "No catalog impact" below), so
+the crop is not a special case; carrying edits across the replacement would be a
+separate feature.
 
 ## UX / Interaction
 

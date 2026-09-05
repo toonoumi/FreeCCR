@@ -89,6 +89,62 @@ def test_bake_writes_tiffs_and_deletes_sources(tmp_path, fake_merge):
             assert not os.path.exists(s)
 
 
+# --- framing: the bake keeps the crop OUT, the slice chain IN ----------------
+#
+# The baked TIFF becomes the ONLY copy of the frame, so it must carry every pixel
+# the merge produced: a crop is a reversible setting everywhere else in the app,
+# and baking it here would make the discarded pixels unrecoverable. A slice is
+# different -- it is what makes this image a distinct frame, so it still applies
+# (without it, three sliced siblings would each bake the same whole scan).
+
+def test_bake_ignores_the_user_crop(tmp_path, fake_merge):
+    im = _make_merged(tmp_path, "cropped")
+    im.crop_rect = (0.25, 0.25, 0.75, 0.75)
+    im.crop_angle = 0.0
+    out = ccr_backend.bake_merged_to_linear_tiff([im])["tiff_paths"][0]
+    written = tifffile.imread(out)
+    assert written.shape == MERGED.shape          # not the 50% crop box
+    np.testing.assert_array_equal(written, MERGED)
+
+
+def test_bake_ignores_an_angled_crop_too(tmp_path, fake_merge):
+    """An angled crop also INTERPOLATES, so baking it would lose bit-exactness
+    on top of losing the pixels."""
+    im = _make_merged(tmp_path, "angled")
+    im.crop_rect = (0.2, 0.2, 0.8, 0.8)
+    im.crop_angle = 12.0
+    out = ccr_backend.bake_merged_to_linear_tiff([im])["tiff_paths"][0]
+    np.testing.assert_array_equal(tifffile.imread(out), MERGED)
+
+
+def test_bake_still_applies_the_slice_chain(tmp_path, fake_merge):
+    from types import MethodType
+    from core.ccr_image import CCRImage
+
+    im = _make_merged(tmp_path, "sliced")
+    im.source_ops = [(0, (0.5, 0.0, 1.0, 0.5))]   # right-top quadrant
+    im._apply_source_ops = MethodType(CCRImage._apply_source_ops, im)
+    im.crop_rect = (0.0, 0.0, 0.5, 1.0)           # ...and a crop, ignored
+    out = ccr_backend.bake_merged_to_linear_tiff([im])["tiff_paths"][0]
+    h, w = MERGED.shape[:2]
+    np.testing.assert_array_equal(tifffile.imread(out),
+                                  MERGED[0:h // 2, w // 2:w])
+
+
+def test_deliberate_export_still_applies_the_crop(tmp_path, fake_merge):
+    """Only the REPLACE bake drops the crop. The Linear TIFF export action is a
+    deliberate 'give me this framing', and keeps it."""
+    from core.ccr_processor import apply_crop_to_image
+    im = _make_merged(tmp_path, "export")
+    im.crop_rect = (0.25, 0.25, 0.75, 0.75)
+    im.crop_angle = 0.0
+    ccr_backend.images = [im]
+    out = str(tmp_path / "manual.tiff")
+    assert ccr_backend.export_image_by_index(0, out, linear_merge=True)
+    np.testing.assert_array_equal(
+        tifffile.imread(out), apply_crop_to_image(MERGED, im.crop_rect, 0.0))
+
+
 def test_write_failure_preserves_that_images_sources(tmp_path, monkeypatch):
     good, bad = _make_merged(tmp_path, "good"), _make_merged(tmp_path, "bad")
 

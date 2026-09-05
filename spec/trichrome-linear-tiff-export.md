@@ -44,6 +44,9 @@ inversion look is applied.
   linear interpolation — inherent to the operation, values stay linear.
   Crop coordinates are defined relative to the (sliced) frame, which is why
   `source_ops` must apply whenever the crop does.
+  The **replace-originals bake** is the one caller that opts out of the crop
+  (`apply_crop=False`) — it deletes the source RAWs, so its file must keep every
+  pixel the merge produced. See spec/merge-linear-tiff-replace.md § Framing.
 - **No resize** — the format forces "Original size" (the combo is disabled
   while this format is selected and its stored preference is not overwritten).
 - **No ICC embedding, no colour-space option** — the data is camera-native
