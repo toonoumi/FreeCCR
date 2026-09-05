@@ -33,7 +33,7 @@ Channel Balance to the crossover tool it actually is.
 - **WB Picker** and **AWB** drive Temperature/Tint again — the "normal" white
   balance behaviour.
 - Move the three **R/G/B Balance** sliders into their own **collapsible**
-  section, placed under Channel Levels and Master Gain, **collapsed by default**.
+  section, placed under Channel Levels, **collapsed by default**.
 - Keep every pipeline behaviour byte-identical. Nothing in
   `ccr_processor.py` changes: the Temperature/Tint stage was never removed, only
   its UI, and Channel Balance keeps its stage and its position.
@@ -61,11 +61,11 @@ Panel order, top to bottom (only the changed region shown):
   ...
   Convert Current / Convert All
   [+ Channel Levels]            collapsible, existing position
-  Master Gain                   always visible, outside the collapsible
   [+ Channel Balance]           NEW collapsible, collapsed by default
       R Balance                     "  cyan -> red     groove
       G Balance                     "  magenta -> green
       B Balance                     "  yellow -> blue
+  Master Gain                   always visible, outside both collapsibles
   ------------------------------
   [WB Picker] [AWB] [Crop] [Slice]
   Color Profile
@@ -76,8 +76,11 @@ Panel order, top to bottom (only the changed region shown):
   ...
 ```
 
-This is pipeline order: Channel Levels → Channel Balance → White Balance → tone,
-which is exactly the order `_apply_working_space_recovery` runs them in.
+This is pipeline order: Channel Levels → Channel Balance → Master Gain →
+White Balance → tone, which is exactly the order `_apply_working_space_recovery`
+runs them in (Master Gain moved behind Balance in
+[`spec/master-gain-after-balance.md`](master-gain-after-balance.md); the panel
+follows it).
 
 - The Channel Balance section is a plain `CollapsibleSection`, whose default is
   already collapsed. It is not persisted per image — like Channel Levels and

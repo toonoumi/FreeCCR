@@ -559,21 +559,25 @@ class SlidersPanel(QWidget):
         scroll_layout.addWidget(theme.section_separator())
         self.od_section = CollapsibleSection("Channel Levels")
         scroll_layout.addWidget(self.od_section)
-        # Master Gain sits OUTSIDE the collapsible, directly below it, so it is
-        # always visible: it is the app's one gain control (the general-
-        # adjustments "Gain" slider was the same math and is gone) and the stage
-        # Auto Gain rides. Its row is created later, with the rest of the Channel
-        # Levels sliders, to keep the positional ADJUSTMENT_KEYS zip intact — so
-        # reserve its slot here and insert into it below.
-        _master_gain_slot = scroll_layout.count()
-
-        # Channel Balance sits directly under Master Gain, collapsed by default:
-        # it is the tone-WEIGHTED per-channel control (crossover), where Channel
-        # Levels above it is the tone-uniform one and White Balance below is a
-        # flat multiply. Placed here, POPULATED below with the rest of the
+        # Channel Balance sits directly under Channel Levels, collapsed by
+        # default: it is the tone-WEIGHTED per-channel control (crossover), where
+        # Channel Levels above it is the tone-uniform one and White Balance below
+        # is a flat multiply. Placed here, POPULATED below with the rest of the
         # collapsible sections. See spec/white-balance-restore.md.
         self.balance_section = CollapsibleSection("Channel Balance")
         scroll_layout.addWidget(self.balance_section)
+
+        # Master Gain sits OUTSIDE both collapsibles, directly BELOW Channel
+        # Balance, so it is always visible and the panel reads in pipeline
+        # order: Levels -> Balance -> Master Gain, which is the order the render
+        # applies them (spec/master-gain-after-balance.md — the gain runs after
+        # the tone-weighted node so a brightness change cannot move the colour).
+        # It is the app's one gain control (the general-adjustments "Gain"
+        # slider was the same math and is gone) and the stage Auto Gain rides.
+        # Its row is created later, with the rest of the Channel Levels sliders,
+        # to keep the positional ADJUSTMENT_KEYS zip intact — so reserve its slot
+        # here and insert into it below.
+        _master_gain_slot = scroll_layout.count()
 
         # Separator between B/W Point tools and the adjustment sliders
         scroll_layout.addWidget(theme.section_separator())
@@ -716,7 +720,9 @@ class SlidersPanel(QWidget):
         self.od_section.add_layout(self.create_slider("Input Gain"))
         self.od_section.add_layout(self.create_slider("Master Shift"))
         # Created HERE (third, so the ADJUSTMENT_KEYS zip is unchanged) but placed
-        # OUTSIDE the collapsible, in the slot reserved above — always visible.
+        # OUTSIDE the collapsible, in the slot reserved above — always visible,
+        # and BELOW Channel Balance, where the render applies it. Creation order
+        # and display order are independent; only the former feeds the zip.
         self.master_gain_slider_layout = self.create_slider("Master Gain")
         scroll_layout.insertLayout(_master_gain_slot, self.master_gain_slider_layout)
 

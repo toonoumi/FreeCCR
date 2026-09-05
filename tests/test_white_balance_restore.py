@@ -3,8 +3,8 @@
 (spec/white-balance-restore.md).
 
 Two things are checked here. First the PANEL: Temperature/Tint are back above
-Brightness, the Balance trio moved into a collapsed section under Channel Levels
-and Master Gain, and the positional ADJUSTMENT_KEYS zip survived the move — a
+Brightness, the Balance trio moved into a collapsed section between Channel
+Levels and Master Gain, and the positional ADJUSTMENT_KEYS zip survived the move — a
 mis-zip routes every slider below the change to the wrong key without erroring
 anywhere. Second the SOLVE: the WB picker and AWB drive Temperature/Tint again,
 still by closed loop on the real render, so a picked spot renders neutral under
@@ -125,14 +125,17 @@ def test_wb_sliders_sit_directly_above_brightness(panel):
     assert temp >= 0 and (tint, bright) == (temp + 1, temp + 2)
 
 
-def test_balance_section_sits_under_channel_levels_and_master_gain(panel):
+def test_panel_reads_in_pipeline_order(panel):
+    """Channel Levels -> Channel Balance -> Master Gain -> White Balance, top to
+    bottom, which is the order the render applies them
+    (spec/master-gain-after-balance.md). Master Gain sits outside both
+    collapsibles so it is always visible."""
     sl = _scroll_layout(panel)
     levels = _index_of(sl, panel.od_section)
-    gain = _index_of(sl, panel.master_gain_slider_layout)
     balance = _index_of(sl, panel.balance_section)
-    assert levels >= 0 and (gain, balance) == (levels + 1, levels + 2)
-    # ...and above the White Balance sliders, which is pipeline order.
-    assert balance < _index_of(sl, panel.temperature_slider_layout)
+    gain = _index_of(sl, panel.master_gain_slider_layout)
+    assert levels >= 0 and (balance, gain) == (levels + 1, levels + 2)
+    assert gain < _index_of(sl, panel.temperature_slider_layout)
 
 
 def test_balance_section_is_collapsed_by_default(panel):
