@@ -93,6 +93,13 @@ class CCRBackend:
         # Global, persisted by MainWindow. See spec/auto-white-balance.md.
         self.auto_awb: bool = False
         self.awb_algorithm: str = "gray_world"
+        # Channel Balance nudge keys (U/I/O raise R/G/B, J/K/L lower). OFF by
+        # default: Balance is a collapsed section, so the keys would otherwise
+        # edit sliders the user cannot see — and they hold six single letters
+        # hostage. MainWindow enables/disables the QShortcuts from this flag, so
+        # while it is off the keys are not consumed at all. Global, persisted by
+        # MainWindow. See spec/white-balance-restore.md.
+        self.balance_hotkeys: bool = False
         # Reversal-look sprocket-hole mask: when True, clear-film regions (sprocket
         # holes / rebate, brighter than the sampled black point) are painted white
         # as the LAST render step for B/W-point conversions, on preview and export.

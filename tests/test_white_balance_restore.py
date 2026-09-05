@@ -365,6 +365,94 @@ def test_awb_hook_writes_temperature_and_tint(tmp_path):
 
 # --- the apply path ----------------------------------------------------------
 
+def test_balance_hotkeys_are_off_by_default():
+    """Opt-in: the sliders they move live in a collapsed section, and they claim
+    six single letters."""
+    from core.ccr_backend import CCRBackend
+    assert CCRBackend().balance_hotkeys is False
+
+
+class _FakeShortcut:
+    def __init__(self):
+        self.enabled = True
+
+    def setEnabled(self, value):
+        self.enabled = bool(value)
+
+
+class _FakeSettings:
+    def __init__(self):
+        self.stored = {}
+
+    def setValue(self, key, value):
+        self.stored[key] = value
+
+
+class _FakePanel:
+    def __init__(self):
+        self.hints = []
+
+    def set_temporary_hint(self, text, duration=0):
+        self.hints.append(text)
+
+
+class _FakeWindow:
+    """Enough of MainWindow to exercise the two hotkey methods unbound — a real
+    window would read and write the user's actual QSettings."""
+    def __init__(self):
+        from ui.main_window import MainWindow
+        self._balance_shortcuts = [_FakeShortcut() for _ in range(6)]
+        self._settings = _FakeSettings()
+        self.sliders_panel = _FakePanel()
+        # The real method, bound to the fake — on_balance_hotkeys_toggled calls
+        # it through self, so a stub here would hide the wiring under test.
+        self._apply_balance_hotkey_state = (
+            lambda: MainWindow._apply_balance_hotkey_state(self))
+
+
+@pytest.fixture
+def hotkey_window():
+    from ui.main_window import MainWindow
+    saved = ccr_backend.balance_hotkeys
+    yield MainWindow, _FakeWindow()
+    ccr_backend.balance_hotkeys = saved
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_shortcuts_follow_the_setting(hotkey_window, enabled):
+    """Gated by setEnabled, not by a check in the handler: a disabled QShortcut
+    does not consume its key, so U/I/O/J/K/L stay free while the setting is
+    off."""
+    MainWindow, win = hotkey_window
+    ccr_backend.balance_hotkeys = enabled
+    MainWindow._apply_balance_hotkey_state(win)
+    assert all(sc.enabled is enabled for sc in win._balance_shortcuts)
+
+
+def test_toggle_sets_persists_and_applies(hotkey_window):
+    MainWindow, win = hotkey_window
+    ccr_backend.balance_hotkeys = False
+    MainWindow._apply_balance_hotkey_state(win)
+
+    MainWindow.on_balance_hotkeys_toggled(win, True)
+    assert ccr_backend.balance_hotkeys is True
+    assert win._settings.stored["adjust/balance_hotkeys"] is True
+    assert all(sc.enabled for sc in win._balance_shortcuts)
+
+    MainWindow.on_balance_hotkeys_toggled(win, False)
+    assert ccr_backend.balance_hotkeys is False
+    assert win._settings.stored["adjust/balance_hotkeys"] is False
+    assert not any(sc.enabled for sc in win._balance_shortcuts)
+
+
+def test_nudge_itself_is_unchanged(panel):
+    """The setting gates the SHORTCUTS, not the panel method they call — so the
+    Balance control keeps working from the sliders regardless."""
+    panel.nudge_balance("g", +1)
+    img = ccr_backend.get_image_by_index(0)
+    assert img.adjustment_settings["balance_g"] == SlidersPanel.BALANCE_HOTKEY_STEP
+
+
 def test_on_wb_sampled_writes_both_sliders(panel):
     panel.on_wb_sampled(-30, 12)
     img = ccr_backend.get_image_by_index(0)

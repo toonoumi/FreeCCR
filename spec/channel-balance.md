@@ -5,7 +5,9 @@
 > flat multiply is still the right control wherever the base is not optical
 > density (`ref` conversions, Positive mode). The sliders moved into their own
 > collapsible under Channel Levels + Master Gain, collapsed by default, and the
-> WB Picker / AWB drive Temperature/Tint again. Everything below about the
+> WB Picker / AWB drive Temperature/Tint again, and the `U`/`I`/`O`, `J`/`K`/`L`
+> nudge keys are now opt-in (Settings → General → Keyboard, off by default).
+> Everything below about the
 > control's MATH, its pipeline position, and the closed-loop solve still holds —
 > only the panel slot and what the buttons target changed.
 

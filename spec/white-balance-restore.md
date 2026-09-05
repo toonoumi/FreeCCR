@@ -50,8 +50,8 @@ Channel Balance to the crossover tool it actually is.
   the wrong tool for one base.)
 - No return of the **analytic** neutral inverse (`compute_neutral_temp_tint`).
   See §4.
-- No new hotkeys. U/I/O and J/K/L keep nudging R/G/B Balance; the sliders they
-  move now live in a collapsed section, which does not affect the keys.
+- No new hotkeys, and no change to what U/I/O and J/K/L do. They become
+  **opt-in** (see below), but the nudge behaviour itself is untouched.
 
 ## 1. UX / Interaction
 
@@ -82,6 +82,16 @@ which is exactly the order `_apply_working_space_recovery` runs them in.
 - The Channel Balance section is a plain `CollapsibleSection`, whose default is
   already collapsed. It is not persisted per image — like Channel Levels and
   Curves, it is a panel-level disclosure, not a setting.
+- The **Channel Balance nudge keys** (U/I/O raise R/G/B, J/K/L lower) become
+  **opt-in**, off by default, under a new **Keyboard** group on Settings →
+  General. Two reasons: the sliders they move are now hidden behind a collapsed
+  section, so the keys would edit controls the user cannot see; and six single
+  letters is a large share of the keyboard for one control. The flag is
+  `ccr_backend.balance_hotkeys`, persisted as `adjust/balance_hotkeys`, and it
+  gates the six `QShortcut`s with `setEnabled` rather than an early return in
+  the handler — a disabled `QShortcut` does not consume its key, so while the
+  setting is off those letters are entirely free. `nudge_balance` itself is
+  unchanged, so the sliders still work by hand.
 - **WB Picker** samples a 7×7 neighbourhood and sets Temperature/Tint so that
   spot renders neutral. **AWB** does the same from a whole-frame estimate.
   Tooltips, the Settings → General blurb and the hint text all say
@@ -215,8 +225,9 @@ calls them after this change.
 | `src/core/awb.py` | `compute_awb_wb` added; shared prep factored out of `compute_awb_balance` |
 | `src/core/ccr_backend.py` | `maybe_auto_awb` writes `temperature`/`tint` again |
 | `src/ui/theme.py` | `TEMP_GRADIENT` / `TINT_GRADIENT` restored (Balance gradients kept) |
-| `src/ui/main_window.py` | Auto WB toggle wording |
-| `src/widgets/settings_dialog.py` | Auto WB blurb wording |
+| `src/ui/main_window.py` | Auto WB toggle wording; `balance_hotkeys` restored from QSettings before the shortcuts are built, `_apply_balance_hotkey_state()`, `on_balance_hotkeys_toggled()` |
+| `src/core/ccr_backend.py` | `balance_hotkeys` flag (default False) |
+| `src/widgets/settings_dialog.py` | Auto WB blurb wording; new **Keyboard** group with the nudge-keys checkbox, staged like every other toggle |
 | `src/core/ccr_processor.py` | **none** |
 
 ## 6. Test plan
@@ -246,6 +257,12 @@ New — `tests/test_white_balance_restore.py`:
   `(0, 0)`; more passes never regress; the result is idempotent.
 - **Apply path.** `on_wb_sampled(temp, tint)` writes both sliders, renders
   before it shows, and leaves no pending debounced reprocess.
+- **Nudge keys.** A fresh `CCRBackend` has `balance_hotkeys` False; the six
+  shortcuts follow the flag through `_apply_balance_hotkey_state`;
+  `on_balance_hotkeys_toggled` sets the flag, persists
+  `adjust/balance_hotkeys`, and re-applies the shortcut state; `nudge_balance`
+  itself still works regardless. The dialog's checkbox seeds from the backend
+  and stages until Done, like every other toggle on the page.
 - **AWB.** `compute_awb_wb` corrects a cast end-to-end under every algorithm id,
   returns `None` with no base, and is idempotent. `maybe_auto_awb` writes
   `temperature`/`tint`, never clobbers either when set, and stays inert when the

@@ -174,6 +174,19 @@ class SettingsDialog(QDialog):
             "export, so no adjustment tints it. B/W-point conversions only."))
         lay.addWidget(grp_border)
 
+        grp_keys = QGroupBox("Keyboard")
+        gk = QVBoxLayout(grp_keys)
+        gk.setSpacing(theme.GAP_ROW)
+        self._cb_balance_hotkeys = QCheckBox(
+            "Channel Balance nudge keys (U / I / O and J / K / L)")
+        gk.addWidget(self._cb_balance_hotkeys)
+        gk.addWidget(self._muted(
+            "U, I and O raise the R, G and B Balance sliders; J, K and L lower "
+            "them. Off by default — Channel Balance is a collapsed section, so "
+            "these would edit sliders you cannot see, and they claim six single "
+            "letters. While off the keys are not used at all."))
+        lay.addWidget(grp_keys)
+
         lay.addStretch(1)
         return page
 
@@ -416,7 +429,9 @@ class SettingsDialog(QDialog):
                          getattr(ccr_backend, "warn_no_anchor_convert", True)),
                         (self._cb_auto_awb, ccr_backend.auto_awb),
                         (self._cb_gamma_lum, ccr_backend.gamma_luminance),
-                        (self._cb_sprocket, ccr_backend.sprocket_mask_white)):
+                        (self._cb_sprocket, ccr_backend.sprocket_mask_white),
+                        (self._cb_balance_hotkeys,
+                         getattr(ccr_backend, "balance_hotkeys", False))):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
@@ -465,6 +480,10 @@ class SettingsDialog(QDialog):
             self._mw.on_gamma_mode_toggled(bool(self._cb_gamma_lum.isChecked()))
         if bool(self._cb_sprocket.isChecked()) != bool(ccr_backend.sprocket_mask_white):
             self._mw.on_sprocket_mask_toggled(bool(self._cb_sprocket.isChecked()))
+        if (bool(self._cb_balance_hotkeys.isChecked())
+                != bool(getattr(ccr_backend, "balance_hotkeys", False))):
+            self._mw.on_balance_hotkeys_toggled(
+                bool(self._cb_balance_hotkeys.isChecked()))
 
     def accept(self):
         """Done: commit the staged toggles, then close. (Escape/close → reject,
