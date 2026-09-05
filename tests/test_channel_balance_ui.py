@@ -206,9 +206,13 @@ def test_unknown_channel_is_ignored(panel):
 # Gain offset, gamma, curves, Cineon) was wrong in some configuration. These
 # tests therefore assert on rendered output only.
 
-def _cast_scene(tmp_path, name="scene.png"):
+def _cast_scene(tmp_path, name="scene.png", cast=(1.0, 0.88, 0.55)):
     """A converted, windowed base: a tonal ramp under a yellow cast so Auto Gain
-    has real highlights to normalise against, plus a mid-grey patch to pick."""
+    has real highlights to normalise against, plus a mid-grey patch to pick.
+
+    The default cast is deliberately extreme, to prove the solve's reach. It is
+    extreme in DENSITY terms, so a Cineon decode expands it toward the end of
+    what the Balance node can reach - those tests pass a milder one."""
     from core.ccr_processor import encode_window
     path = str(tmp_path / name)
     cv2.imwrite(path, np.full((60, 90, 3), 20000, np.uint16))
@@ -217,7 +221,7 @@ def _cast_scene(tmp_path, name="scene.png"):
     img._ws_windowed = True
     h, w = 300, 450
     ramp = np.linspace(0.02, 1.0, w, dtype=np.float32)[None, :, None].repeat(h, 0)
-    cast = np.array([1.0, 0.88, 0.55], np.float32)
+    cast = np.asarray(cast, np.float32)
     disp = np.clip(ramp * cast, 0, 1.2)
     disp[140:160, 200:220] = np.array([0.35, 0.35, 0.35], np.float32) * cast
     img.resized_raw = encode_window(disp.copy())
@@ -244,11 +248,20 @@ PRESETS = [
     ("channel levels", {"ch_r_shift": 15, "ch_g_gain": 12, "ch_b_blackpoint": -8}),
     ("master gain", {"ch_master_gain": 35}),
     ("input gain", {"ch_input_gain": -20}),
-    ("cineon log", {"cineon_log": True}),
     ("tone + saturation", {"gamma": 40, "contrast": 30, "saturation": 25}),
     ("per-channel curves", {"curves": {"r": [[0, 0], [128, 150], [255, 255]]}}),
     ("everything", {"ch_r_shift": 10, "ch_master_gain": 25, "gamma": 30,
-                    "contrast": 20, "saturation": 20, "cineon_log": True}),
+                    "contrast": 20, "saturation": 20}),
+]
+
+# Cineon gets its own scene. The decode sits between Channel Levels and
+# Balance, and it turns a cast from a log OFFSET into a linear RATIO -- the
+# extreme cast above then needs more than the node can deliver. See
+# test_the_decoded_base_can_outrun_the_node.
+CINEON_PRESETS = [
+    ("cineon log", {"cineon_log": True}),
+    ("cineon + everything", {"cineon_log": True, "ch_master_gain": 25,
+                             "gamma": 30, "contrast": 20, "saturation": 20}),
 ]
 
 
@@ -264,6 +277,37 @@ def test_picked_spot_renders_neutral(tmp_path, label, preset):
     after = _spot(img, dict(preset, balance_r=r, balance_g=g, balance_b=b))
     assert _spread(before) > 0.2, "test scene should start visibly cast"
     assert _spread(after) < 0.02, f"{label}: {after} spread {_spread(after):.3f}"
+
+
+@pytest.mark.parametrize("label,preset", CINEON_PRESETS,
+                         ids=[p[0] for p in CINEON_PRESETS])
+def test_picked_spot_renders_neutral_on_a_decoded_base(tmp_path, label, preset):
+    """The pick still lands on grey when Cineon has decoded out of log ahead of
+    the Balance node — the position that lets the node grade the tone it names."""
+    img = _cast_scene(tmp_path, cast=(1.0, 0.95, 0.86))
+    img.adjustment_settings = dict(preset)
+    r, g, b = img.solve_neutral_balance(_patch(img))
+    before = _spot(img, dict(preset))
+    after = _spot(img, dict(preset, balance_r=r, balance_g=g, balance_b=b))
+    assert _spread(before) > 0.1, "test scene should start visibly cast"
+    assert _spread(after) < 0.02, f"{label}: {after} spread {_spread(after):.3f}"
+
+
+def test_the_decoded_base_can_outrun_the_node(tmp_path):
+    """The flip side, pinned so it is a known property: the decode turns a cast
+    from a log OFFSET into a linear RATIO, and on the extreme scene (with a gain
+    and the tone chain piled on) blue pegs at +100 with ~3% spread left. The
+    solve is doing the right thing — that cast belongs in Channel Levels BEFORE
+    the decode, where a per-channel shift is a density offset."""
+    img = _cast_scene(tmp_path)
+    preset = {"cineon_log": True, "ch_r_shift": 10, "ch_master_gain": 25,
+              "gamma": 30, "contrast": 20, "saturation": 20}
+    img.adjustment_settings = dict(preset)
+    r, g, b = img.solve_neutral_balance(_patch(img))
+    assert b == 100, "expected the blue node to peg, not to converge"
+    after = _spot(img, dict(preset, balance_r=r, balance_g=g, balance_b=b))
+    assert _spread(after) < 0.05          # ...and it still gets most of the way
+    assert _spread(after) < _spread(_spot(img, dict(preset))) / 4
 
 
 def test_red_slider_is_never_moved(tmp_path):

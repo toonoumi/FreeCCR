@@ -1,9 +1,9 @@
 # Spec: Cineon Film Log → Workspace
 
 Status: REFINED v3 — v1/v2 shipped this as a **final display transform** to
-Rec.709 (γ 2.2). v3 moves it to **right after Master Gain** and encodes into the
-**working space's curve (sRGB)**. §6 records what changed and why; everything
-above it describes the current behaviour.
+Rec.709 (γ 2.2). v3 moves it to **between Channel Levels and Channel Balance**
+and encodes into the **working space's curve (sRGB)**. §6 records what changed
+and why; everything above it describes the current behaviour.
 
 Owner: FreeCCR
 Original branch: `feature/color-scopes` (the parade's 95/685 reference lines mark
@@ -13,15 +13,18 @@ exactly this transform's black/white anchors)
 
 A checkbox in the **Channel Levels** section — "Cineon Log → Workspace" — that
 interprets the value as Cineon printing-density film log and **decodes it into
-the app's working space**, immediately after Master Gain. Standard Kodak
+the app's working space**, immediately after Channel Levels. Standard Kodak
 constants (DaVinci's "Cineon Film Log" flavour): 10-bit code 95 = black (Dmin),
 code 685 = 90% white.
 
-It is a **decode out of log**, not a display transform. Everything below it —
-White Balance's flat per-channel multiply, the tone sliders, the contrast S-curve
-pivoting on 0.5, saturation's luma weighting, the Curves editor's 0–255 domain —
-is built for display-referred data, and with the decode at the end of the chain
-they were all grading log values instead.
+It is a **decode out of log**, not a display transform, and it marks the boundary
+between the two domains. **Above it** is Channel Levels, the log-domain grading:
+a per-channel shift there is a density offset, which is exactly the right tool on
+log data. **Below it** is everything built for display-referred data — Channel
+Balance's node, which sits at a fixed *display* value; Master Gain; White
+Balance's flat per-channel multiply; the contrast S-curve pivoting on 0.5;
+saturation's luma weighting; the Curves editor's 0–255 domain. With the decode at
+the end of the chain, every one of those was grading log values instead.
 
 ## 2. Goals / Non-goals
 
@@ -73,9 +76,9 @@ Two properties matter as much as the curve:
 
 ```
   Channel Levels    Input Gain -> per-channel -> Master Shift    un-clamped
+  Cineon Log -> Workspace   <- HERE                             un-clamped
   Channel Balance                                               un-clamped
   Master Gain (+ Auto Gain)                                     un-clamped
-  Cineon Log -> Workspace   <- HERE                             un-clamped
   White Balance     temperature / tint
   White Point / legacy exposure
   window clamp
@@ -89,15 +92,21 @@ Consequences, all intended:
   log value is a per-channel *gamma* change — the finding that removed
   Temperature/Tint in #130 (see spec/white-balance-restore.md). After the decode
   the multiply lands on display-referred data, which is what it was designed for.
-- **Master Gain stays a log-domain move**, since it sits just above.
-- **A strong cast may exceed what White Balance can reach.** The decode turns a
-  cast from a log *offset* into a linear *ratio*: a 4:1 R/B ratio is reachable
-  after decoding a cast that was mild in log, while the WB gains span at most
-  1.4/0.6 = 2.33:1. That is not a defect of the solve (the WB picker pegs the
-  knob and keeps its closest result); it means a strong cast belongs in **Channel
-  Levels, before the decode**, where a per-channel shift is a density offset —
-  the exact correction for it. Pinned by
-  `test_the_decoded_base_limits_what_wb_can_reach`.
+- **Channel Balance grades the decoded image.** Its node is anchored at a fixed
+  *display* value (`BALANCE_NODE_X = 3/16`), so on log data it lands on a
+  different tone than the one it names.
+- **Master Gain scales the decoded image** too, since it follows Balance.
+  Note that the hidden Auto Gain offset rides it and is still *measured* on the
+  log base, so with the flag on its highlight placement is approximate.
+- **A strong cast may exceed what the colour controls can reach.** The decode
+  turns a cast from a log *offset* into a linear *ratio*: a 4:1 R/B ratio is
+  reachable after decoding a cast that was mild in log, while the WB gains span
+  at most 1.4/0.6 = 2.33:1 and the Balance node runs out at slider 100. Neither
+  is a defect of the solve — both peg the knob and keep their closest result —
+  and both say the same thing: a cast that strong belongs in **Channel Levels,
+  above the decode**, where a per-channel shift is a density offset, the exact
+  correction for it. Pinned by `test_the_decoded_base_limits_what_wb_can_reach`
+  and `test_the_decoded_base_can_outrun_the_node`.
 - **Area layers grade the decoded base**, since they composite after
   `adjust_image` returns.
 
@@ -108,11 +117,11 @@ Consequences, all intended:
    signatures — those are called positionally in tests, so a mid-signature insert
    would shift every later argument (the same rule `balance_*` follows).
 2. **Windowed base**: applied inside `_apply_working_space_recovery`, after the
-   Master Gain divide and before the WB block; the callers then zero the flag so
-   nothing can apply it twice.
+   Channel Levels block and before Channel Balance; the callers then zero the
+   flag so nothing can apply it twice.
 3. **Non-windowed base** (reference mode, positive mode, area layers): applied in
-   `adjust_image`'s single normalised Levels → Balance → Master Gain pass, before
-   its closing clamp.
+   `adjust_image`'s single normalised Levels → decode → Balance → Master Gain
+   pass, before its closing clamp.
 4. **OpenCL**: consumed in the numpy pre-stage, which now runs when Balance is
    active **or** the flag is set — the kernel would otherwise apply Channel
    Levels after the decode and reverse the order.
@@ -128,7 +137,7 @@ Consequences, all intended:
 
 | | v1/v2 | v3 |
 |---|---|---|
-| position | final stage, after curves and areas | right after Master Gain |
+| position | final stage, after curves and areas | between Channel Levels and Channel Balance |
 | output curve | Rec.709 gamma 2.2 | working space (sRGB) |
 | implementation | cached 65536-entry uint16 LUT | float32, un-clamped |
 | clipping | linear clipped to [0,1] in-stage | floored at 0, headroom kept |
@@ -152,9 +161,10 @@ catalog needs migrating, but a frame graded under v2 will need re-grading.
 - **Un-clamped**: a value above white comes out above 1 (headroom survives);
   below-black input is floored, finite, never NaN.
 - **Position**: with nothing else set the render is exactly the decoded image;
-  White Balance applied with the flag equals WB applied *to* the decoded render;
-  Master Gain applied with the flag equals the decode *of* the gained image;
-  contrast likewise grades the decoded image.
+  Channel Levels applied with the flag equals the decode *of* the levelled
+  render (it is above the decode); Channel Balance, Master Gain, White Balance
+  and contrast each equal that stage applied *to* the decoded render (they are
+  below it).
 - **Windowed**: the recovery consumes it (anchors land on black/white through the
   window), and a blown highlight is still recoverable by White Point afterwards.
 - **Flag off** is bit-identical to not passing it.

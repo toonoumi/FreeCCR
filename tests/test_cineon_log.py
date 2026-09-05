@@ -114,14 +114,36 @@ def test_white_balance_runs_AFTER_the_decode():
     np.testing.assert_allclose(both, wb_after, atol=2)
 
 
-def test_master_gain_runs_BEFORE_the_decode():
-    """"Right after Master Gain": the gain is still a log-domain move."""
+def test_master_gain_runs_AFTER_the_decode():
+    """The decode sits between Channel Levels and Channel Balance, so Master
+    Gain — which follows Balance — scales the DECODED image."""
     img = np.full((2, 2, 3), 30000, dtype=np.uint16)
     both = adjust_image(img.copy(), ch_master_gain=30.0, cineon_log=True)
-    gained = np.clip(img / 65535.0 / _master_gain_divisor(30.0), 0.0, 1.0)
-    expected = np.clip(apply_cineon_to_workspace(gained.astype(np.float32)),
-                       0.0, 1.0)
+    decoded = np.clip(apply_cineon_to_workspace(img.astype(np.float32) / 65535.0),
+                      0.0, 1.0)
+    expected = np.clip(decoded / _master_gain_divisor(30.0), 0.0, 1.0)
     np.testing.assert_allclose(both, np.round(expected * 65535.0), atol=2)
+
+
+def test_channel_levels_runs_BEFORE_the_decode():
+    """Channel Levels is the log-domain grading — a per-channel shift there is a
+    density offset, which is the whole reason it stays ahead of the decode."""
+    img = np.full((2, 2, 3), 30000, dtype=np.uint16)
+    both = adjust_image(img.copy(), ch_master_shift=20.0, cineon_log=True)
+    shifted = adjust_image(img.copy(), ch_master_shift=20.0)
+    expected = np.clip(
+        apply_cineon_to_workspace(shifted.astype(np.float32) / 65535.0), 0.0, 1.0)
+    np.testing.assert_allclose(both, np.round(expected * 65535.0), atol=2)
+
+
+def test_channel_balance_grades_the_decoded_image():
+    """Balance's node sits at a fixed DISPLAY value, so it has to see the decode
+    — on log data the node lands on a different tone than the one it names."""
+    img = np.full((2, 2, 3), 30000, dtype=np.uint16)
+    both = adjust_image(img.copy(), balance_g=35.0, cineon_log=True)
+    decoded = adjust_image(img.copy(), cineon_log=True)
+    np.testing.assert_allclose(both, adjust_image(decoded.copy(), balance_g=35.0),
+                               atol=2)
 
 
 def test_contrast_grades_the_decoded_image():

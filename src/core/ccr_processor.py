@@ -1464,10 +1464,21 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
                               ch_g_shift, ch_g_gain, ch_g_blackpoint,
                               ch_b_shift, ch_b_gain, ch_b_blackpoint,
                               clamp=False, include_master_gain=False)
+    # Cineon log -> workspace - the decode OUT of log, immediately after
+    # Channel Levels and BEFORE Channel Balance. Levels is the log-domain
+    # grading (a per-channel shift IS a density offset there); everything
+    # after the decode - Balance's tone-weighted node, Master Gain, White
+    # Balance's flat multiply, the whole tone chain - is built for
+    # display-referred data. Un-clamped like its neighbours: floored at 0,
+    # but headroom above white survives for the White Point recovery below.
+    # See spec/cineon-display-transform.md.
+    if cineon_log:
+        d = apply_cineon_to_workspace(d)
     # Channel Balance - the tone-WEIGHTED per-channel control, right after the
     # tone-uniform one and in the slot Temperature/Tint used to occupy. It runs
-    # AFTER Channel Levels deliberately: on a windowed base much of the data
-    # still sits outside [0,1] (film base below black, headroom above white),
+    # AFTER Channel Levels (and after the Cineon decode, when that is on)
+    # deliberately: on a windowed base much of the data still sits outside
+    # [0,1] (film base below black, headroom above white),
     # where the node is identity, so Levels must place the histogram in the
     # window first for the node to bite where the user actually sees it.
     # Un-clamped like everything else here. See spec/channel-balance.md §4.2.
@@ -1483,13 +1494,6 @@ def _apply_working_space_recovery(img16: np.ndarray, exposure: float,
     _mden = _master_gain_divisor(ch_master_gain)
     if _mden != 1.0:
         d /= np.float32(_mden)
-    # Cineon log -> workspace - the decode OUT of log, right after Master Gain,
-    # so everything below it (White Balance's flat multiply above all, then the
-    # whole tone chain) grades display-referred data instead of log density.
-    # Un-clamped like its neighbours; headroom above white survives for the
-    # White Point recovery just below. See spec/cineon-display-transform.md.
-    if cineon_log:
-        d = apply_cineon_to_workspace(d)
     # White balance - flat per-channel gain in the scene-linear working domain
     # (before the window clamp) so a warm/cool shift lands in headroom (recoverable)
     # instead of clipping, and cooling can pull highlights back. Index 0=R,1=G,2=B.
@@ -2913,8 +2917,9 @@ def adjust_image(
         ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
     img = img16.astype(np.float32)
 
-    # Channel Levels -> Channel Balance -> Master Gain: the first three stages,
-    # ahead of White Balance and the whole look domain, in one normalised pass.
+    # Channel Levels -> Cineon decode -> Channel Balance -> Master Gain: the
+    # first stages, ahead of White Balance and the whole look domain, in one
+    # normalised pass.
     # Only reached on a NON-windowed base (reference mode, positive mode, area
     # layers); a windowed base consumed all three above. Master Gain lands after
     # Balance so a gain change cannot move the colour through Balance's
@@ -2937,15 +2942,16 @@ def adjust_image(
                                   ch_g_shift, ch_g_gain, ch_g_blackpoint,
                                   ch_b_shift, ch_b_gain, ch_b_blackpoint,
                                   clamp=False, include_master_gain=False)
+        # Cineon log -> workspace, between Channel Levels and Channel Balance:
+        # Levels grades in log, everything after the decode grades
+        # display-referred data.
+        if cineon_log:
+            img = apply_cineon_to_workspace(img)
+            cineon_log = False
         if _balance_on:
             _apply_channel_balance(img, balance_r, balance_g, balance_b)
         if _mden != 1.0:
             img /= np.float32(_mden)
-        # Cineon log -> workspace, right after Master Gain, so White Balance and
-        # the whole tone chain below grade display-referred data.
-        if cineon_log:
-            img = apply_cineon_to_workspace(img)
-            cineon_log = False
         np.clip(img, 0.0, 1.0, out=img)
         img *= np.float32(65535.0)
 
@@ -3411,6 +3417,12 @@ def adjust_image_opencl(
             ch_r_shift = ch_r_gain = ch_r_blackpoint = 0.0
             ch_g_shift = ch_g_gain = ch_g_blackpoint = 0.0
             ch_b_shift = ch_b_gain = ch_b_blackpoint = 0.0
+        # Cineon log -> workspace, between Channel Levels and Channel Balance
+        # and before the kernel sees anything, so the decode cannot land after
+        # a stage that is supposed to grade its result.
+        if cineon_log:
+            img16 = apply_cineon_to_workspace(img16)
+            cineon_log = False
         if _channel_balance_active(balance_r, balance_g, balance_b):
             _apply_channel_balance(img16, balance_r, balance_g, balance_b)
         # Master Gain lands AFTER Balance (spec/master-gain-after-balance.md).
@@ -3421,11 +3433,6 @@ def adjust_image_opencl(
         if _mden != 1.0:
             img16 /= np.float32(_mden)
             ch_master_gain = 0.0
-        # Cineon log -> workspace, right after Master Gain and before the
-        # kernel sees anything, so the decode cannot land after White Balance.
-        if cineon_log:
-            img16 = apply_cineon_to_workspace(img16)
-            cineon_log = False
         # Same closing clamp as adjust_image's non-windowed pass — the kernel
         # would otherwise receive negatives its pow() stages cannot take, and
         # CPU/GPU parity depends on the clamp sitting in the same place.
