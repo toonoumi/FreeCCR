@@ -80,11 +80,9 @@ The two are treated differently on purpose:
 The deliberate **Linear TIFF export** action still applies the crop — it is a
 "give me this framing" request, and it destroys nothing.
 
-Consequence, stated plainly: after the replace + reload, an image that had a crop
-comes back uncropped. Its edits do not survive the replacement at all (the
-composite merge key dies with the sources — see "No catalog impact" below), so
-the crop is not a special case; carrying edits across the replacement would be a
-separate feature.
+The crop therefore stays a live setting, and the catalog **re-key** below is what
+carries it (and every other edit) onto the replacement, so the frame comes back
+framed exactly as the user left it — but re-croppable.
 
 ## UX / Interaction
 
@@ -162,9 +160,36 @@ arbitrary third-party TIFF in merge mode is still rejected as a non-RAW input.
 
 - `ccr_backend.rgb_merge_replace: bool = False` (in `_init`, next to
   `rgb_merge_mode`/`rgb_merge_demosaic`).
-- No catalog impact: replaced merged images simply leave the list on reload;
-  their composite-key catalog entries (if any) become stale (sources deleted)
-  and are ignored/pruned. The new TIFFs are normal cataloged files.
+- **Catalog re-key** (`catalog.rekey_merges_to_files(pairs)`): a `merge:` record
+  is validated *source-by-source*, so deleting the three RAWs makes it
+  permanently unmatchable. Every edit the user made would be stranded on a dead
+  key and the reloaded TIFF would come back untouched. The bake therefore moves
+  each replaced frame's record onto its replacement's file key — same edits, new
+  key, signature taken from the TIFF just written — and drops the dead composite
+  record.
+
+  Carried over: the conversion (`converted` + `conversion_inputs`), adjustment
+  settings, curves, areas, dust spots + heal plan, colour profile, orientation,
+  reference frame, the tone bases, **and the crop** (the bake does not apply it —
+  see § Framing).
+
+  Stripped, because the replacement file already CONTAINS it: `source_ops` (the
+  slice chain is in the pixels), `is_merged`/`merge_sources`,
+  `slice_group`/`slice_parent` (no siblings or parent survive the flattening),
+  `is_duplicate` (each duplicate got its own file). `display_name` becomes the
+  new file's basename.
+
+  Only frames whose sources were **actually deleted** are re-keyed: one kept
+  because a sibling failed still has a live merge record, which must not be
+  moved. Siblings share their sources, so a merge key is always all-or-nothing
+  here. The re-key is wrapped in try/except at the call site and logs on
+  failure — bookkeeping must never be able to break the destructive path that
+  called it, and by then the files are already written and deleted.
+
+  This rests on the premise the whole feature rests on: the TIFF is the same
+  pixels, so a future session loading it renders what the merge rendered. A
+  restore that does fail is already handled — `create_images_for_path` is
+  all-or-nothing and falls back to a plain load.
 
 ## Processing
 

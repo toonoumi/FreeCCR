@@ -1575,6 +1575,24 @@ class CCRBackend:
                     deleted.append(sp)
             except OSError as e:
                 failures.append((os.path.basename(sp), f"could not delete: {e}"))
+
+        # Move each replaced frame's cataloged edits onto its replacement. The
+        # "merge:" record is validated source-by-source, so the deletions above
+        # just made it permanently unmatchable — without this re-key the user's
+        # conversion, sliders, curves, crop and dust would be stranded on a dead
+        # key and the reloaded TIFF would come back untouched. Only images whose
+        # sources really went are re-keyed (a frame kept because a sibling
+        # failed still has its live merge record). Bookkeeping never breaks the
+        # bake: a failure here is logged, and the files are already safe.
+        gone = set(deleted)
+        rekeyed = [(im, out) for im, out in written
+                   if all(os.path.normpath(s) in gone for s in im.merge_sources)]
+        try:
+            from core.catalog import rekey_merges_to_files
+            rekey_merges_to_files(rekeyed)
+        except Exception as e:
+            print(f"Catalog re-key after replace failed: {e}")
+
         return {"tiff_paths": [out for _im, out in written], "deleted": deleted,
                 "failures": failures, "cancelled": False}
 

@@ -361,6 +361,74 @@ def update_for_images(images, path: str = None, preserved: dict = None) -> None:
     save_catalog(catalog, path)
 
 
+def rekey_merges_to_files(pairs, path: str = None) -> int:
+    """Move merged images' cataloged edits onto the files that REPLACED them.
+
+    `pairs` is [(merged_image, replacement_file_path), ...] — the output of the
+    replace-originals bake, which writes a linear TIFF per merged frame and then
+    permanently deletes the three source RAWs. A "merge:" record is validated
+    source-by-source, so once those RAWs are gone the composite key can never
+    match again and every edit the user made would be stranded on a dead record.
+    The replacement holds the same pixels, so the edits still apply — under the
+    new file's key. Returns how many records were moved.
+
+    The state is carried over with the geometry that is now BAKED INTO the file
+    stripped out, because the replacement already contains it:
+
+      is_merged / merge_sources   it is a plain single-file image now
+      source_ops                  the slice chain is in the pixels
+      slice_group / slice_parent   ...so it has no siblings or parent left
+      is_duplicate                each duplicate got its own file
+      display_name                the new file names the image
+
+    The user **crop is deliberately kept**: the bake does not apply it
+    (spec/merge-linear-tiff-replace.md § Framing), so it is still a live,
+    reversible setting on the replacement — as are the conversion, adjustments,
+    curves, dust spots, areas and orientation, none of which the bake touches.
+
+    Callers pass only images whose sources were actually deleted; the composite
+    record is dropped for exactly those (siblings share their sources, so a
+    merge key is always all-or-nothing here). Failures are logged and skipped —
+    catalog bookkeeping must never be able to break the destructive path that
+    called it. See spec/merge-linear-tiff-replace.md."""
+    entries = list(pairs or [])
+    if not entries:
+        return 0
+    catalog = load_catalog(path)
+    now = time.time()
+    moved = 0
+    for img, new_path in entries:
+        try:
+            state = serialize_image(img)
+            signature = _file_signature(new_path)
+        except Exception as e:
+            logging.warning(f"Catalog re-key failed for {new_path}: {e}")
+            continue
+        state.update({
+            "is_merged": False,
+            "merge_sources": None,
+            "merge_demosaic": True,
+            "source_ops": [],
+            "slice_group": None,
+            "slice_parent": None,
+            "is_duplicate": False,
+            "display_name": os.path.basename(new_path),
+        })
+        catalog["files"][_file_key(new_path)] = {
+            "signature": signature,
+            "saved_at": now,
+            "images": [state],
+        }
+        sources = getattr(img, "merge_sources", None)
+        if sources:
+            catalog["files"].pop(_merge_key(sources), None)
+        moved += 1
+    if moved:
+        _prune(catalog)
+        save_catalog(catalog, path)
+    return moved
+
+
 def remove_duplicate_entries(removals: dict, path: str = None) -> None:
     """Delete the catalog entries of removed DUPLICATES so a deliberately
     discarded copy does not resurrect on the next open. Entries of actual

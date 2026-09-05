@@ -100,6 +100,91 @@ class TestSerializeMergeFields:
         assert state["merge_demosaic"] is True
 
 
+class TestRekeyToReplacement:
+    """Replacing the originals with a linear TIFF must carry the edits over.
+
+    The "merge:" record is validated source-by-source, so deleting the three
+    RAWs makes it permanently unmatchable. Without a re-key every edit the user
+    made would be stranded on a dead key and the reloaded TIFF would come back
+    untouched. See spec/merge-linear-tiff-replace.md.
+    """
+
+    def _replaced(self, tmp_path, cat, **attrs):
+        """A merged image with edits, cataloged, plus its replacement file."""
+        r, g, b = _triplet(tmp_path)
+        merged = _merged_image([r, g, b])
+        merged.adjustment_settings = {"contrast": 15, "balance_g": 22}
+        merged.crop_rect = (0.1, 0.2, 0.8, 0.9)
+        merged.crop_angle = 3.0
+        merged.rotation_angle = 90
+        merged.dust_spots = [{"x": 0.5, "y": 0.5, "r": 0.01}]
+        for k, v in attrs.items():
+            setattr(merged, k, v)
+        catalog.update_for_images([merged], path=cat)
+        tiff = _png(tmp_path, "shot_RGB.tiff", seed=9)
+        return merged, [r, g, b], tiff
+
+    def test_edits_move_to_the_replacement_file(self, tmp_path):
+        cat = str(tmp_path / "catalog.json")
+        merged, sources, tiff = self._replaced(tmp_path, cat)
+        assert catalog.rekey_merges_to_files([(merged, tiff)], path=cat) == 1
+
+        entries = catalog.entries_for_path(tiff, path=cat)
+        assert entries and len(entries) == 1
+        state = entries[0]
+        assert state["adjustment_settings"] == {"contrast": 15, "balance_g": 22}
+        assert state["rotation_angle"] == 90
+        assert state["dust_spots"] == [{"x": 0.5, "y": 0.5, "r": 0.01}]
+
+    def test_the_crop_comes_with_it(self, tmp_path):
+        """The bake deliberately does NOT apply the crop, so it must survive as
+        a live, reversible setting on the replacement."""
+        cat = str(tmp_path / "catalog.json")
+        merged, _sources, tiff = self._replaced(tmp_path, cat)
+        catalog.rekey_merges_to_files([(merged, tiff)], path=cat)
+        state = catalog.entries_for_path(tiff, path=cat)[0]
+        assert state["crop_rect"] == [0.1, 0.2, 0.8, 0.9]
+        assert state["crop_angle"] == 3.0
+
+    def test_baked_geometry_and_merge_identity_are_stripped(self, tmp_path):
+        """Everything the replacement file already CONTAINS must not be replayed
+        on top of it — the slice chain above all, which is in the pixels."""
+        cat = str(tmp_path / "catalog.json")
+        merged, _sources, tiff = self._replaced(
+            tmp_path, cat, source_ops=[(0, (0.0, 0.0, 0.5, 1.0))],
+            slice_group="grp-1", is_duplicate=True)
+        catalog.rekey_merges_to_files([(merged, tiff)], path=cat)
+        state = catalog.entries_for_path(tiff, path=cat)[0]
+        assert state["source_ops"] == []
+        assert state["is_merged"] is False
+        assert state["merge_sources"] is None
+        assert state["slice_group"] is None
+        assert state["slice_parent"] is None
+        assert state["is_duplicate"] is False
+        assert state["display_name"] == os.path.basename(tiff)
+
+    def test_the_dead_merge_record_is_dropped(self, tmp_path):
+        cat = str(tmp_path / "catalog.json")
+        merged, sources, tiff = self._replaced(tmp_path, cat)
+        assert catalog._merge_key(sources) in catalog.load_catalog(cat)["files"]
+        catalog.rekey_merges_to_files([(merged, tiff)], path=cat)
+        assert catalog._merge_key(sources) not in catalog.load_catalog(cat)["files"]
+
+    def test_a_missing_replacement_is_skipped_not_raised(self, tmp_path):
+        """Bookkeeping must never be able to break the destructive path that
+        calls it — the files are already written and deleted by then."""
+        cat = str(tmp_path / "catalog.json")
+        merged, sources, _tiff = self._replaced(tmp_path, cat)
+        gone = str(tmp_path / "never_written.tiff")
+        assert catalog.rekey_merges_to_files([(merged, gone)], path=cat) == 0
+        # ...and the merge record is left alone, so nothing is lost either.
+        assert catalog._merge_key(sources) in catalog.load_catalog(cat)["files"]
+
+    def test_empty_input_is_a_noop(self, tmp_path):
+        assert catalog.rekey_merges_to_files([], path=str(tmp_path / "c.json")) == 0
+        assert not os.path.exists(str(tmp_path / "c.json"))
+
+
 class TestUpdateRouting:
     def test_stored_under_merge_key_not_red_file(self, tmp_path):
         cat = str(tmp_path / "catalog.json")

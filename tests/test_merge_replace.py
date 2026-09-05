@@ -145,6 +145,70 @@ def test_deliberate_export_still_applies_the_crop(tmp_path, fake_merge):
         tifffile.imread(out), apply_crop_to_image(MERGED, im.crop_rect, 0.0))
 
 
+# --- the catalog record moves with the replacement ---------------------------
+
+def _real_merged(tmp_path, prefix="cat"):
+    """A real CCRImage (decoded from the red source) marked as a merge, so
+    serialize_image has something genuine to work with."""
+    import cv2
+    from core.ccr_image import CCRImage
+    rng = np.random.default_rng(4)
+    sources = []
+    for c in "RGB":
+        path = str(tmp_path / f"{prefix}_{c}.png")
+        cv2.imwrite(path, rng.integers(2000, 60000, (48, 64, 3)).astype(np.uint16))
+        sources.append(path)
+    img = CCRImage(sources[0])
+    img.is_merged = True
+    img.merge_sources = sources
+    img.display_name = f"{prefix}_RGB.png"
+    return img, sources
+
+
+def test_bake_moves_the_catalog_record_to_the_replacement(tmp_path, fake_merge,
+                                                          monkeypatch):
+    """Deleting the sources makes the "merge:" key unmatchable forever, so the
+    edits have to land on the replacement or they are lost."""
+    from core import catalog
+    cat = str(tmp_path / "catalog.json")
+    monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+
+    img, sources = _real_merged(tmp_path)
+    img.adjustment_settings = {"contrast": 15, "balance_g": 22}
+    img.crop_rect = (0.1, 0.2, 0.8, 0.9)
+    catalog.update_for_images([img], path=cat)
+
+    out = ccr_backend.bake_merged_to_linear_tiff([img])["tiff_paths"][0]
+
+    entries = catalog.entries_for_path(out, path=cat)
+    assert entries and len(entries) == 1
+    assert entries[0]["adjustment_settings"] == {"contrast": 15, "balance_g": 22}
+    # The crop survives as a SETTING because the bake no longer bakes it in.
+    assert entries[0]["crop_rect"] == [0.1, 0.2, 0.8, 0.9]
+    assert catalog._merge_key(sources) not in catalog.load_catalog(cat)["files"]
+
+
+def test_a_frame_whose_sources_survive_keeps_its_merge_record(tmp_path,
+                                                              monkeypatch):
+    """A write failure keeps that frame's sources — so its merge record is still
+    live and must NOT be re-keyed onto a replacement that isn't replacing it."""
+    from core import catalog
+    cat = str(tmp_path / "catalog.json")
+    monkeypatch.setattr(catalog, "default_catalog_path", lambda: cat)
+
+    img, sources = _real_merged(tmp_path, "keep")
+    catalog.update_for_images([img], path=cat)
+
+    def _boom(srcs, preview=False, demosaic=False):
+        raise RuntimeError("merge exploded")
+    monkeypatch.setattr(ccr_merge, "merge_raw_channels", _boom)
+
+    res = ccr_backend.bake_merged_to_linear_tiff([img])
+    assert res["failures"] and res["deleted"] == []
+    assert all(os.path.exists(s) for s in sources)
+    assert catalog.entries_for_merge(sources, path=cat) is not None
+
+
 def test_write_failure_preserves_that_images_sources(tmp_path, monkeypatch):
     good, bad = _make_merged(tmp_path, "good"), _make_merged(tmp_path, "bad")
 
