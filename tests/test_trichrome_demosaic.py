@@ -46,7 +46,7 @@ def _clean_backend():
 def capture_merge(monkeypatch):
     calls = []
 
-    def _fake(sources, preview=False, demosaic=False):
+    def _fake(sources, preview=False, demosaic=False, mono=False):
         calls.append({"sources": tuple(sources), "preview": preview,
                       "demosaic": demosaic})
         return np.full((40, 60, 3), 1000, dtype=np.uint16), (40, 60)

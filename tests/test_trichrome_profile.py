@@ -49,10 +49,11 @@ def merged(monkeypatch):
     arr = (rng.uniform(0.05, 0.5, (8, 10, 3)) * 65535).astype(np.uint16)
     calls = {}
 
-    def fake(sources, preview=False, demosaic=False):
+    def fake(sources, preview=False, demosaic=False, mono=False):
         calls["sources"] = list(sources)
         calls["preview"] = preview
         calls["demosaic"] = demosaic
+        calls["mono"] = mono
         return arr.copy(), arr.shape[:2]
 
     monkeypatch.setattr(ccr_merge, "merge_raw_channels", fake)

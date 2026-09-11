@@ -204,6 +204,7 @@ def serialize_image(img) -> dict:
                           if is_merged and getattr(img, "merge_sources", None)
                           else None),
         "merge_demosaic": bool(getattr(img, "merge_demosaic", True)),
+        "merge_mono": bool(getattr(img, "merge_mono", False)),
         "slice_group": getattr(img, "slice_group", None),
         "slice_parent": _slice_parent_to_json(getattr(img, "slice_parent", None)),
         "source_ops": [[int(rot), list(region)] for rot, region in img.source_ops],
@@ -408,6 +409,7 @@ def rekey_merges_to_files(pairs, path: str = None) -> int:
             "is_merged": False,
             "merge_sources": None,
             "merge_demosaic": True,
+            "merge_mono": False,
             "source_ops": [],
             "slice_group": None,
             "slice_parent": None,
@@ -544,7 +546,8 @@ def create_images_for_path(file_path: str, path: str = None,
 
 
 def create_images_for_merge(sources, merge_demosaic: bool = True,
-                            path: str = None, catalog_data: dict = None) -> list:
+                            path: str = None, catalog_data: dict = None,
+                            merge_mono: bool = False) -> list:
     """Create the merged CCRImage(s) for a trichrome triplet, restoring
     cataloged state (conversion, adjustments, crop, dust, slices, duplicates)
     when the same three frames were merged and edited before.
@@ -552,8 +555,9 @@ def create_images_for_merge(sources, merge_demosaic: bool = True,
     All-or-nothing per triplet, like create_images_for_path: any entry failure
     falls back to a fresh merge, flagged so the next save preserves the stored
     record. `sources` are the live (R, G, B) paths of THIS import (they equal
-    the stored ones because the composite key matched); `merge_demosaic` is the
-    current global setting the fresh/re-merge decode uses."""
+    the stored ones because the composite key matched); `merge_demosaic` and
+    `merge_mono` are the current global settings the fresh/re-merge decode
+    uses."""
     from core.ccr_image import CCRImage
     signature = None
     try:
@@ -565,7 +569,7 @@ def create_images_for_merge(sources, merge_demosaic: bool = True,
 
     def _plain(restore_failed=False):
         img = CCRImage(sources[0], is_merged=True, merge_sources=list(sources),
-                       merge_demosaic=merge_demosaic)
+                       merge_demosaic=merge_demosaic, merge_mono=merge_mono)
         img._catalog_signature = signature
         if restore_failed:
             img._catalog_restore_failed = True
@@ -578,7 +582,8 @@ def create_images_for_merge(sources, merge_demosaic: bool = True,
         try:
             images.append(_restore_image(sources[0], state,
                                          live_merge_sources=list(sources),
-                                         live_merge_demosaic=merge_demosaic))
+                                         live_merge_demosaic=merge_demosaic,
+                                         live_merge_mono=merge_mono))
         except Exception as e:
             logging.warning(f"Merge catalog restore failed for "
                             f"{list(sources)}: {e}")
@@ -589,7 +594,7 @@ def create_images_for_merge(sources, merge_demosaic: bool = True,
 
 
 def _restore_image(file_path: str, state: dict, live_merge_sources=None,
-                   live_merge_demosaic=None):
+                   live_merge_demosaic=None, live_merge_mono=None):
     from core.ccr_image import CCRImage
     source_ops = [(int(rot), tuple(region))
                   for rot, region in (state.get("source_ops") or [])]
@@ -603,9 +608,12 @@ def _restore_image(file_path: str, state: dict, live_merge_sources=None,
                          else (state.get("merge_sources") or None))
         merge_demosaic = (live_merge_demosaic if live_merge_demosaic is not None
                           else bool(state.get("merge_demosaic", True)))
+        merge_mono = (live_merge_mono if live_merge_mono is not None
+                      else bool(state.get("merge_mono", False)))
     else:
         merge_sources = None
         merge_demosaic = True
+        merge_mono = False
     img = CCRImage(
         file_path,
         adjustment_settings=dict(state.get("adjustment_settings") or {}),
@@ -622,6 +630,7 @@ def _restore_image(file_path: str, state: dict, live_merge_sources=None,
         is_merged=is_merged,
         merge_sources=merge_sources,
         merge_demosaic=merge_demosaic,
+        merge_mono=merge_mono,
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])

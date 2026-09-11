@@ -44,7 +44,7 @@ def _clean_backend():
 
 @pytest.fixture
 def fake_merge(monkeypatch):
-    def _fake(sources, preview=False, demosaic=False):
+    def _fake(sources, preview=False, demosaic=False, mono=False):
         return MERGED.copy(), MERGED.shape[:2]
     monkeypatch.setattr(ccr_merge, "merge_raw_channels", _fake)
 
@@ -212,7 +212,7 @@ def test_a_frame_whose_sources_survive_keeps_its_merge_record(tmp_path,
 def test_write_failure_preserves_that_images_sources(tmp_path, monkeypatch):
     good, bad = _make_merged(tmp_path, "good"), _make_merged(tmp_path, "bad")
 
-    def _fake(sources, preview=False, demosaic=False):
+    def _fake(sources, preview=False, demosaic=False, mono=False):
         if any("bad" in s for s in sources):
             raise ValueError("boom")
         return MERGED.copy(), MERGED.shape[:2]

@@ -99,6 +99,7 @@ class CCRImage:
         merge_sources: Optional[list] = None,
         merge_demosaic: bool = True,
         ws_windowed: bool = False,
+        merge_mono: bool = False,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -118,6 +119,11 @@ class CCRImage:
         # single-photosite read at half resolution. Monochrome ignores it.
         # See spec/trichrome-demosaic-mode.md.
         self.merge_demosaic = bool(merge_demosaic)
+        # Merge detail → Monochrome, captured at import the same way: each
+        # source's whole mosaic is read as a monochrome sensor (full res, no
+        # demosaic, declared CFA ignored). Overrides merge_demosaic. See
+        # spec/trichrome-mono-read.md.
+        self.merge_mono = bool(merge_mono)
         # Sliced images own a chain of slice operations applied to the source
         # file by read_image in every path (preview load, hi-res zoom,
         # full-res export, B/W sampling). Each op is
@@ -570,7 +576,8 @@ class CCRImage:
         from core import ccr_merge
         rgb, full_decode_size = ccr_merge.merge_raw_channels(
             self.merge_sources, preview=preview,
-            demosaic=getattr(self, "merge_demosaic", True))
+            demosaic=getattr(self, "merge_demosaic", True),
+            mono=getattr(self, "merge_mono", False))
         # Field correction on the full merged frame (camera-native linear, like
         # the RAW branch). The linear-TIFF bake writes merge_raw_channels output
         # directly, NOT through read_image, so a baked replacement stays

@@ -48,6 +48,11 @@ class CCRBackend:
         # import (CCRImage.merge_demosaic); toggling affects the NEXT import.
         # Persisted by MainWindow. See spec/trichrome-demosaic-mode.md.
         self.rgb_merge_demosaic: bool = True
+        # Merge detail → Monochrome: read every source's whole mosaic as a
+        # monochrome sensor (full res, no demosaic). Overrides
+        # rgb_merge_demosaic; captured per image (CCRImage.merge_mono).
+        # Persisted by MainWindow. See spec/trichrome-mono-read.md.
+        self.rgb_merge_mono: bool = False
         # Opt-in: after a successful merge import, bake each merged image to a
         # full-resolution linear TIFF, PERMANENTLY delete its three source RAWs,
         # and reload the list from the TIFFs (flatten a trichrome shoot to one
@@ -345,7 +350,8 @@ class CCRBackend:
                 # or duplicated last session).
                 imgs = create_images_for_merge(
                     list(triplet), merge_demosaic=self.rgb_merge_demosaic,
-                    catalog_data=catalog_data)
+                    catalog_data=catalog_data,
+                    merge_mono=self.rgb_merge_mono)
             except Exception as e:
                 print(f"3-way merge failed for {os.path.basename(red)}: {e}")
                 self.last_merge_error = (
@@ -1447,7 +1453,8 @@ class CCRBackend:
         from core.ccr_processor import apply_crop_to_image, safe_tifffile_imwrite
         merged, _full = ccr_merge.merge_raw_channels(
             image_obj.merge_sources, preview=False,
-            demosaic=getattr(image_obj, "merge_demosaic", True))
+            demosaic=getattr(image_obj, "merge_demosaic", True),
+            mono=getattr(image_obj, "merge_mono", False))
         if getattr(image_obj, "source_ops", None):
             merged = image_obj._apply_source_ops(merged)
         if apply_crop:
@@ -1878,6 +1885,7 @@ class CCRBackend:
                 is_merged=getattr(img, "is_merged", False),
                 merge_sources=getattr(img, "merge_sources", None),
                 merge_demosaic=getattr(img, "merge_demosaic", True),
+                merge_mono=getattr(img, "merge_mono", False),
                 # preloaded_img is a copy of the (possibly windowed) base — set
                 # the flag before the ctor's first preview render.
                 ws_windowed=getattr(img, "_ws_windowed", False),
@@ -2074,6 +2082,7 @@ class CCRBackend:
                     is_merged=getattr(img_obj, "is_merged", False),
                     merge_sources=getattr(img_obj, "merge_sources", None),
                     merge_demosaic=getattr(img_obj, "merge_demosaic", True),
+                    merge_mono=getattr(img_obj, "merge_mono", False),
                     # The crop above replays the parent's conversion, so the
                     # child's base is windowed iff the parent's was — set before
                     # the ctor's first preview render so it de-windows.

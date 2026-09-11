@@ -420,7 +420,8 @@ def decode_target(path: str, sample_max: int = SAMPLE_MAX) -> Optional[np.ndarra
 
 
 def decode_target_merged(sources, demosaic: bool = True,
-                         sample_max: int = SAMPLE_MAX) -> Optional[np.ndarray]:
+                         sample_max: int = SAMPLE_MAX,
+                         mono: bool = False) -> Optional[np.ndarray]:
     """Decode a TRICHROME chart shot — three RAWs merged into one frame — to the
     same bare device space as decode_target, so everything downstream (sampling,
     fit, ICC/DCP synthesis) treats it as if it were a single raw.
@@ -447,6 +448,7 @@ def decode_target_merged(sources, demosaic: bool = True,
     img.is_merged = True
     img.merge_sources = srcs
     img.merge_demosaic = bool(demosaic)
+    img.merge_mono = bool(mono)
     return img.read_image(srcs[0], preview=True, max_long_side=sample_max,
                           positive_override=False, apply_input_icc=False)
 
