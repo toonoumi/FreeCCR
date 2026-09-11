@@ -43,6 +43,18 @@ def _with_square(img, y0, y1, x0, x1, value):
 
 # --- threshold isolates clear film ----------------------------------------
 
+def test_near_base_shadow_not_whitened():
+    """Regression: the deepest scene shadows sit at/just above the sampled base
+    (noise, uneven illumination, a base sampled from a slightly denser spot).
+    A patch 30% of the way from base to clip in every channel must stay unmasked
+    — it was painted white under the old 20% padding."""
+    bp = (30000, 30000, 30000)
+    img = _base_plate(1080, 1080, bp)
+    shadow = 30000 + int(0.30 * (65535 - 30000))
+    img = _with_square(img, 400, 680, 400, 680, (shadow, shadow, shadow))
+    assert compute_sprocket_alpha(img, bp) is None
+
+
 def test_hole_masked_scene_and_base_not():
     bp = (30000, 30000, 30000)
     img = _base_plate(1080, 1080, bp)
