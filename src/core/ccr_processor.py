@@ -1036,8 +1036,12 @@ def _sprocket_cfg():
         except ValueError:
             return default
     return {
-        "pad_frac": _f("FREECCR_SPROCKET_PAD_FRAC", 0.20),
-        "pad_abs":  _f("FREECCR_SPROCKET_PAD_ABS", 0.02),      # fraction of full scale
+        # Threshold sits halfway from base to clip: at 0.20 the deepest scene
+        # shadows (which approach the base, plus noise/uneven illumination) were
+        # crossing it and got painted white. Clear film sits near clip, so the
+        # wider margin costs nothing on real holes.
+        "pad_frac": _f("FREECCR_SPROCKET_PAD_FRAC", 0.50),
+        "pad_abs":  _f("FREECCR_SPROCKET_PAD_ABS", 0.05),      # fraction of full scale
         "min_area_px": _f("FREECCR_SPROCKET_MIN_AREA_PX", 24.0),  # speckle cutoff @1080
         "feather_px": _f("FREECCR_SPROCKET_FEATHER_PX", 1.0),  # anti-alias only @1080
     }

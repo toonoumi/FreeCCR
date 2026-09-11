@@ -110,8 +110,10 @@ staged checkbox in `SettingsDialog`, and membership in
 
 ```python
 # Baked defaults (env-overridable for field calibration)
-PAD_FRAC     = 0.20   # a hole must be >= 20% of the way from base -> clip,
-PAD_ABS      = 0.02   #   or 2% of full scale above base, per channel (max)
+PAD_FRAC     = 0.50   # a hole must be >= 50% of the way from base -> clip,
+PAD_ABS      = 0.05   #   or 5% of full scale above base, per channel (max)
+                      # (was 0.20/0.02: the deepest shadows, which approach the
+                      #  base, crossed it and were whitened)
 MIN_AREA_PX  = 24.0   # speckle cutoff (connected-component area) @ 1080 long side
 FEATHER_PX   = 1.0    # edge feather — anti-aliasing only          @ 1080 long side
 REF_LONG     = 1080   # reference long side the px params are quoted at
