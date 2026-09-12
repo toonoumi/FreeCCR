@@ -43,15 +43,42 @@ def _with_square(img, y0, y1, x0, x1, value):
 
 # --- threshold isolates clear film ----------------------------------------
 
+def test_holes_found_when_base_sits_just_under_clip():
+    """Regression (5207 colour negative, trichrome merge): the decode saturates
+    at 63486 (white level minus black pedestal), the base's blue is 62092 —
+    only 1394 below that — and the holes clip in every channel. A threshold
+    measured against 65535 put blue above the holes and masked nothing; the
+    measured clear level must find them."""
+    bp = (62092, 35455, 43587)
+    img = _base_plate(1080, 1080, bp)
+    img = _with_square(img, 400, 680, 400, 680, (63486, 63486, 63486))
+    alpha = compute_sprocket_alpha(img, bp)
+    assert alpha is not None
+    assert alpha[540, 540] == 255
+    assert alpha[100, 100] == 0                   # base
+
+
 def test_near_base_shadow_not_whitened():
-    """Regression: the deepest scene shadows sit at/just above the sampled base
-    (noise, uneven illumination, a base sampled from a slightly denser spot).
-    A patch 30% of the way from base to clip in every channel must stay unmasked
-    — it was painted white under the old 20% padding."""
+    """Shadows approach the base (noise, uneven light, a base sampled a touch
+    denser): even 40% of the way to the measured clear level they stay
+    unmasked, while the holes are caught."""
     bp = (30000, 30000, 30000)
     img = _base_plate(1080, 1080, bp)
-    shadow = 30000 + int(0.30 * (65535 - 30000))
-    img = _with_square(img, 400, 680, 400, 680, (shadow, shadow, shadow))
+    img = _with_square(img, 100, 300, 100, 300, (62000, 62000, 62000))  # hole
+    shadow = 30000 + int(0.40 * (62000 - 30000))
+    img = _with_square(img, 500, 800, 500, 800, (shadow, shadow, shadow))
+    alpha = compute_sprocket_alpha(img, bp)
+    assert alpha[200, 200] == 255
+    assert alpha[650, 650] == 0
+
+
+def test_no_clear_film_masks_nothing():
+    """Without holes there is no gap to split: a mildly brighter corner
+    (uneven illumination, density gap ~0.05) must not become the clear
+    level and get whitened."""
+    bp = (30000, 30000, 30000)
+    img = _base_plate(1080, 1080, bp)
+    img = _with_square(img, 0, 300, 0, 300, (33600, 33600, 33600))
     assert compute_sprocket_alpha(img, bp) is None
 
 
@@ -212,18 +239,18 @@ def test_apply_shape_mismatch_is_noop():
     assert apply_sprocket_mask(rgb, alpha) is rgb
 
 
-# --- env override tunes the padding ---------------------------------------
+# --- env overrides tune the threshold -------------------------------------
 
-def test_env_pad_override(monkeypatch):
+def test_env_overrides(monkeypatch):
     bp = (30000, 30000, 30000)
     img = _base_plate(1080, 1080, bp)
-    # A square only slightly above base: caught with a small pad, rejected with
-    # a large one.
-    img = _with_square(img, 400, 680, 400, 680, (36000, 36000, 36000))
-    monkeypatch.setenv("FREECCR_SPROCKET_PAD_FRAC", "0.02")
-    monkeypatch.setenv("FREECCR_SPROCKET_PAD_ABS", "0.0")
-    assert compute_sprocket_alpha(img, bp) is not None
-    monkeypatch.setenv("FREECCR_SPROCKET_PAD_FRAC", "0.60")
+    img = _with_square(img, 100, 300, 100, 300, (62000, 62000, 62000))  # hole
+    img = _with_square(img, 500, 800, 500, 800, (40000, 40000, 40000))  # 31% of gap
+    assert compute_sprocket_alpha(img, bp)[650, 650] == 0      # default: half the gap
+    monkeypatch.setenv("FREECCR_SPROCKET_GAP_FRAC", "0.2")
+    assert compute_sprocket_alpha(img, bp)[650, 650] == 255    # lower threshold
+    monkeypatch.delenv("FREECCR_SPROCKET_GAP_FRAC")
+    monkeypatch.setenv("FREECCR_SPROCKET_MIN_CLEAR_D", "0.5")  # gap here is ~0.32
     assert compute_sprocket_alpha(img, bp) is None
 
 

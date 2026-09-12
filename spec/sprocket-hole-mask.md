@@ -110,10 +110,11 @@ staged checkbox in `SettingsDialog`, and membership in
 
 ```python
 # Baked defaults (env-overridable for field calibration)
-PAD_FRAC     = 0.50   # a hole must be >= 50% of the way from base -> clip,
-PAD_ABS      = 0.05   #   or 5% of full scale above base, per channel (max)
-                      # (was 0.20/0.02: the deepest shadows, which approach the
-                      #  base, crossed it and were whitened)
+GAP_FRAC     = 0.50   # a hole must be >= 50% of the way from base -> the
+                      #   MEASURED clear-film level, per channel
+MIN_CLEAR_D  = 0.10   # no channel clears the base by this density -> no clear
+                      #   film in the frame -> mask nothing
+CLEAR_ERODE_PX = 1.0  # erosion radius before taking the clear level @ 1080
 MIN_AREA_PX  = 24.0   # speckle cutoff (connected-component area) @ 1080 long side
 FEATHER_PX   = 1.0    # edge feather — anti-aliasing only          @ 1080 long side
 REF_LONG     = 1080   # reference long side the px params are quoted at
@@ -131,9 +132,10 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr) -> Optional[np.ndarray]:
         return None
     d = raw_bgr astype float32                       # (H,W,3) BGR
     bp   = float32 array(black_point_bgr)            # (3,)
-    head = maximum(65535 - bp, 1.0)                  # per-channel headroom above base
-    pad  = maximum(PAD_FRAC*head, PAD_ABS*65535)
-    thr  = bp + pad
+    scale = max(H,W) / REF_LONG
+    clear = [max(erode(d[...,c], odd(CLEAR_ERODE_PX*scale))) for c in BGR]
+    if max(log10(clear / bp)) < MIN_CLEAR_D: return None   # no clear film here
+    thr  = bp + GAP_FRAC * maximum(clear - bp, 0)
     mask = all(d > thr[None,None,:], axis=2)         # AND across BGR -> clearer than base
     if not mask.any(): return None
     m = uint8(mask)*255
@@ -151,14 +153,29 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr) -> Optional[np.ndarray]:
     return m                                          # uint8 0..255
 ```
 
-Why per-channel **AND** with a headroom-fraction padding: a punched hole is clear
-film → near full transmission in **every** channel → far above `base+pad`
-everywhere. Film-base noise sits at `~base` → below `pad`. Exposed scene content
-(even a deep shadow) is *denser* than the zero-exposure base → **lower** than base
-in every channel → can never exceed it, so scene pixels are structurally excluded.
-The AND biases toward **few false positives** (never whiten real content).
-`PAD_ABS` floors the padding so a base already near clip (tiny headroom) doesn't
-collapse the margin and catch noise.
+Why per-channel **AND** at half the **measured** base → clear gap: a punched hole
+is clear film → the brightest level in **every** channel. Exposed scene content
+(even a deep shadow) is *denser* than the zero-exposure base → at or below base,
+so it sits near 0% of the gap while the holes sit at 100%; the midpoint gives
+both sides the same margin. The AND biases toward **few false positives** (never
+whiten real content).
+
+**Why measured, not a fraction of the headroom to 65535** (history: shipped at
+20% of `65535 − base` with a 2%-of-full-scale floor, briefly raised to 50%/5%,
+then replaced). The decode does not reach 65535: RAW values are black-subtracted
+and scaled by `65535/white_level`, so a 14-bit Sony saturates at **63486**. A
+colour negative's base can sit a sliver below that in one channel — on the
+maintainer's 5207 trichrome scans the base is B=62092 G=35455 R=43587 and the
+holes clip at 63486 in all three, so blue's real gap is 1394, not 3444. At 50%
+(or with the 5% floor) blue's threshold landed above the holes and **no hole was
+masked**. Measured on four frames of that roll, the holes form one cluster at
+100% of the measured gap (~34–36k px at 1080) and near-base content stays under
+20%, with essentially nothing in between. The clear level is each channel's
+maximum after a small erosion (clear film is the brightest thing in a negative
+scan; the erosion drops hot pixels and noise specks). A channel with no gap
+(base and holes both clipped) degenerates to "above base" and the separating
+channels decide. `MIN_CLEAR_D` stops a frame with no clear film from treating
+its brightest near-base patch (uneven illumination) as the clear level.
 
 **Keeping the holes sharp.** Real 135 sprocket holes are crisp rounded rectangles;
 an early build over-softened them with a morphological **open** (rounds corners) +
@@ -288,11 +305,11 @@ only when it differs from the live flag.
 - **Scene highlights / blown skies** → in a negative these are the *densest*
   (darkest scan) regions, structurally below base → never masked. Deep scene
   shadows approach but do not exceed the zero-exposure base; `pad` covers the
-  approach. (Field-tunable via `FREECCR_SPROCKET_PAD_FRAC` if a scan's base is
+  approach. (Field-tunable via `FREECCR_SPROCKET_GAP_FRAC` if a scan's base is
   unusually noisy.)
-- **Uneven scan illumination** (vignetted base dimmer in a corner) → headroom-
-  fraction padding + `SPROCKET_PAD_ABS` floor give margin; the OPEN drops stray
-  corner specks. Documented limitation, not a correctness bug.
+- **Uneven scan illumination** (vignetted base dimmer in a corner) → the
+  midpoint of the measured gap gives margin, and a frame with no clear film at
+  all is caught by `MIN_CLEAR_D`; the area filter drops stray corner specks. Documented limitation, not a correctness bug.
 - **Crop excludes the holes** → export/preview simply have no clear-film region in
   frame; nothing to whiten (expected — user chose to crop them out).
 - **Histogram** reads the PRE-mask adjusted preview (the tones the user edits),

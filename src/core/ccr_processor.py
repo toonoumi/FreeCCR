@@ -1028,20 +1028,20 @@ _DENSITY_FLOOR = 1.0
 # the area cutoff and feather scale with the buffer's long side so the preview,
 # hi-res zoom, and export agree geometrically.
 def _sprocket_cfg():
-    """Read the (env-overridable) mask parameters. Fraction/abs padding are per-
-    channel; min-area/feather are quoted at SPROCKET_REF_LONG and scaled per buffer."""
+    """Read the (env-overridable) mask parameters. The threshold is a fraction of
+    the MEASURED base → clear-film gap per channel; erosion/min-area/feather are
+    quoted at SPROCKET_REF_LONG and scaled per buffer."""
     def _f(name, default):
         try:
             return float(os.environ.get(name, "").strip() or default)
         except ValueError:
             return default
     return {
-        # Threshold sits halfway from base to clip: at 0.20 the deepest scene
-        # shadows (which approach the base, plus noise/uneven illumination) were
-        # crossing it and got painted white. Clear film sits near clip, so the
-        # wider margin costs nothing on real holes.
-        "pad_frac": _f("FREECCR_SPROCKET_PAD_FRAC", 0.50),
-        "pad_abs":  _f("FREECCR_SPROCKET_PAD_ABS", 0.05),      # fraction of full scale
+        "gap_frac": _f("FREECCR_SPROCKET_GAP_FRAC", 0.50),     # of base -> clear gap
+        # Below this density gap (in the best-separated channel) the frame has
+        # no clear film to find, and nothing is masked.
+        "min_clear_d": _f("FREECCR_SPROCKET_MIN_CLEAR_D", 0.10),
+        "clear_erode_px": _f("FREECCR_SPROCKET_CLEAR_ERODE_PX", 1.0),  # @1080
         "min_area_px": _f("FREECCR_SPROCKET_MIN_AREA_PX", 24.0),  # speckle cutoff @1080
         "feather_px": _f("FREECCR_SPROCKET_FEATHER_PX", 1.0),  # anti-alias only @1080
     }
@@ -1086,9 +1086,28 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr):
     if d.ndim != 3 or d.shape[2] < 3:
         return None
     bp = np.asarray(black_point_bgr, dtype=np.float32)[:3]
-    head = np.maximum(65535.0 - bp, 1.0)                 # per-channel headroom above base
-    pad = np.maximum(cfg["pad_frac"] * head, cfg["pad_abs"] * 65535.0)
-    thr = bp + pad                                       # (3,) BGR
+    scale = max(d.shape[0], d.shape[1]) / float(SPROCKET_REF_LONG)
+    # Measure the clear-film level from the frame instead of assuming it sits
+    # at 65535: the decode saturates below full scale (white level minus the
+    # black pedestal — 63486 on a 14-bit Sony), and a colour negative's base
+    # can sit a sliver below that in one channel (blue), so a headroom-to-65535
+    # fraction put that channel's threshold above the holes. Clear film is the
+    # brightest thing in a negative scan, so each channel's clear level is its
+    # maximum after a small erosion (which drops hot pixels and noise specks).
+    k = _odd_ksize(cfg["clear_erode_px"] * scale)
+    kernel = np.ones((k, k), np.uint8)
+    clear = np.array([float(cv2.erode(np.ascontiguousarray(d[..., c]), kernel).max())
+                      for c in range(3)], dtype=np.float32)
+    # No clear film in the frame: nothing stands clear of the base by a
+    # film-base density in ANY channel, so there is no gap to split — mask
+    # nothing rather than whiten the brightest near-base content.
+    gap_d = np.log10(np.maximum(clear, 1.0) / np.maximum(bp, 1.0))
+    if float(gap_d.max()) < cfg["min_clear_d"]:
+        return None
+    # Threshold halfway across the measured base -> clear gap, per channel.
+    # A channel with no gap (base and holes both clipped) degenerates to
+    # "above base" and leaves the decision to the channels that do separate.
+    thr = bp + cfg["gap_frac"] * np.maximum(clear - bp, 0.0)   # (3,) BGR
     # AND across channels: clear film is bright in EVERY channel; exposed scene
     # content (even deep shadow) is denser than the zero-exposure base, so it is
     # lower than base in every channel and structurally excluded.
@@ -1096,7 +1115,6 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr):
     if not mask.any():
         return None
     m = (mask.astype(np.uint8)) * 255
-    scale = max(d.shape[0], d.shape[1]) / float(SPROCKET_REF_LONG)
     # Drop tiny speckles by connected-component AREA — no morphological erosion,
     # so hole edges/corners keep their true (sharp) shape.
     min_area = max(1, int(round(cfg["min_area_px"] * scale * scale)))
