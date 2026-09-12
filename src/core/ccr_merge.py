@@ -23,6 +23,12 @@ Two sensor kinds are supported:
   IS that frame's channel, at FULL sensor resolution. A monochrome sensor is in
   fact the ideal trichrome sensor (no wasted photosites, full resolution).
 
+* **Forced monochrome read** (Merge detail → Monochrome) — the whole visible
+  mosaic is read as a monochrome sensor, one luminance sample per photosite,
+  whatever colour-filter pattern the file declares. For mono-converted bodies
+  whose RAW still reports RGGB, which the metadata-based detection above
+  would otherwise send down the Bayer path. See spec/trichrome-mono-read.md.
+
 Either way each frame contributes exactly one channel (R from the red-light
 frame, G from green, B from blue), scaled to 16-bit by 65535/white_level.
 
@@ -219,11 +225,53 @@ def extract_cfa_channel(mosaic: np.ndarray, colors: np.ndarray, color_desc,
     return acc / len(phases)            # 1 site for R/B; average of 2 for green
 
 
+def mono_plane_from_mosaic(mosaic: np.ndarray, colors=None,
+                           black_levels=None) -> np.ndarray:
+    """Read a raw sensor mosaic as a MONOCHROME frame: every photosite is one
+    luminance sample at full sensor resolution — no demosaic, no phase slice,
+    no colour interpretation of the CFA the file declares.
+
+    The black pedestal is subtracted per site, indexed by the site's CFA colour
+    index in `colors` (the levels are normally equal — then one scalar is
+    subtracted — but honouring them keeps an uneven pedestal from printing a
+    2x2 pattern). Returns float32 clipped at 0; combine_channels scales it by
+    65535/white_level. Pure — unit-testable without rawpy."""
+    m = np.asarray(mosaic)
+    if m.ndim != 2:
+        raise ValueError(f"expected a 2-D sensor mosaic, got shape {m.shape}")
+    plane = m.astype(np.float32)
+    if black_levels is not None and len(black_levels):
+        lut = np.asarray(black_levels, dtype=np.float32).ravel()
+        if colors is None or float(lut.max() - lut.min()) == 0.0:
+            plane -= lut[0]
+        else:
+            plane -= lut[np.clip(np.asarray(colors), 0, lut.size - 1)]
+    np.maximum(plane, 0.0, out=plane)
+    return plane
+
+
+def bin2x2(plane: np.ndarray) -> np.ndarray:
+    """2x2 box-average downsample (an odd trailing row/column is dropped) —
+    the monochrome read's half-size preview, the counterpart of libraw's
+    half_size for the other full-resolution modes."""
+    h = (plane.shape[0] // 2) * 2
+    w = (plane.shape[1] // 2) * 2
+    p = np.asarray(plane[:h, :w], dtype=np.float32)
+    return p.reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3), dtype=np.float32)
+
+
 def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False,
-                        demosaic: bool = False):
+                        demosaic: bool = False, mono: bool = False):
     """Decode one source RAW and return (plane_2d, white_level, is_mono,
     sensor_full) for the single colour this frame contributes (frame_pos
     0=R/1=G/2=B).
+
+    `mono` (Merge detail → Monochrome) overrides everything below: the whole
+    visible mosaic is read as a monochrome frame at full sensor resolution,
+    BEFORE any sensor detection or guard — the declared CFA is ignored, which
+    is the point (a mono-converted body still reports RGGB). `preview` bins
+    2x2; sensor_full is always the unbinned mosaic size. See
+    spec/trichrome-mono-read.md.
 
     `demosaic` (Bayer only; monochrome has no CFA and ignores it) switches the
     channel extraction from the raw-mosaic phase slice to a full-resolution
@@ -255,6 +303,26 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False,
         num_colors = int(getattr(raw, "num_colors", 0) or 0)
         color_desc = getattr(raw, "color_desc", b"")
         pattern = getattr(raw, "raw_pattern", None)
+
+        if mono:
+            mosaic = np.asarray(raw.raw_image_visible)
+            if mosaic.ndim != 2:
+                raise ValueError(
+                    f"Monochrome merge detail needs a raw sensor mosaic; "
+                    f"{os.path.basename(path)} has none (e.g. a linear DNG).")
+            try:
+                colors = np.asarray(raw.raw_colors_visible)
+            except Exception:
+                colors = None
+            try:
+                black_levels = list(raw.black_level_per_channel)
+            except Exception:
+                black_levels = None
+            plane = mono_plane_from_mosaic(mosaic, colors, black_levels)
+            full = (plane.shape[0], plane.shape[1])
+            if preview:
+                plane = bin2x2(plane)
+            return np.ascontiguousarray(plane), white_level, True, full
 
         if is_monochrome_sensor(num_colors, color_desc, pattern):
             rgb = raw.postprocess(
@@ -328,9 +396,13 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False,
 
 
 def merge_raw_channels(sources: Sequence[str], preview: bool = False,
-                       demosaic: bool = False) -> Tuple[np.ndarray, Tuple[int, int]]:
+                       demosaic: bool = False,
+                       mono: bool = False) -> Tuple[np.ndarray, Tuple[int, int]]:
     """Merge a (red, green, blue) triplet of RAW files into one (H, W, 3) uint16
     linear-RGB image, taking only each frame's own colour channel.
+
+    `mono=True` overrides `demosaic`: every frame's whole mosaic is read as a
+    monochrome sensor (full resolution, no demosaic, declared CFA ignored).
 
     `demosaic=False` (single photosite): Bayer frames are mosaic-phase-sliced —
     no demosaic at all — at half-sensor resolution (2x2 bin). `demosaic=True`:
@@ -356,7 +428,7 @@ def merge_raw_channels(sources: Sequence[str], preview: bool = False,
     sensor_full: Optional[Tuple[int, int]] = None
     for frame_pos, path in enumerate(sources):       # 0=red, 1=green, 2=blue
         plane, white_level, mono, sfull = _decode_frame_plane(
-            path, frame_pos, preview, demosaic=demosaic)
+            path, frame_pos, preview, demosaic=demosaic, mono=mono)
         planes.append(plane)
         white_levels.append(white_level)
         monos.append(mono)

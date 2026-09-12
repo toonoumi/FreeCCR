@@ -222,6 +222,10 @@ class MainWindow(QMainWindow):
         # res). Captured per image at import. See spec/trichrome-demosaic-mode.md.
         ccr_backend.rgb_merge_demosaic = self._settings.value(
             "import/rgb_merge_demosaic", True, type=bool)
+        # Merge detail → Monochrome (overrides the demosaic flag). See
+        # spec/trichrome-mono-read.md.
+        ccr_backend.rgb_merge_mono = self._settings.value(
+            "import/rgb_merge_mono", False, type=bool)
         # Restore the "replace originals with linear TIFF" opt-in. When on with
         # merge mode, a successful merge import offers (with confirmation) to bake
         # each frame to a linear TIFF and delete the source RAWs. See
@@ -732,7 +736,8 @@ class MainWindow(QMainWindow):
                 # so "Use current image" works on a loaded 3-way merge.
                 if getattr(img, "is_merged", False) and img.merge_sources:
                     current_merge = (list(img.merge_sources),
-                                     getattr(img, "merge_demosaic", True))
+                                     getattr(img, "merge_demosaic", True),
+                                     getattr(img, "merge_mono", False))
         dlg = IT8ProfileDialog(self, current_path=current_path,
                                current_merge=current_merge)
         if dlg.exec() != QDialog.Accepted or not dlg.saved_path:
@@ -866,18 +871,35 @@ class MainWindow(QMainWindow):
             msg = "3-way RGB merge off."
         self.sliders_panel.set_temporary_hint(msg, duration=5000)
 
-    def on_rgb_merge_demosaic_changed(self, demosaic: bool):
-        """Set how merge imports extract each frame's channel (demosaic at full
-        resolution vs single photosite at half) and persist it. Captured per
-        image at import — already-loaded merges keep their decode; only the
-        NEXT import is affected. See spec/trichrome-demosaic-mode.md."""
-        ccr_backend.rgb_merge_demosaic = bool(demosaic)
-        self._settings.setValue("import/rgb_merge_demosaic", bool(demosaic))
+    _MERGE_DETAIL_LABELS = {
+        "demosaic": "demosaic (full resolution)",
+        "photosite": "single photosite (half resolution)",
+        "mono": "monochrome (full resolution, no demosaic)",
+    }
+
+    def on_rgb_merge_detail_changed(self, mode: str):
+        """Set how merge imports extract each frame's channel — "demosaic"
+        (full res), "photosite" (half res) or "mono" (whole mosaic read as a
+        monochrome sensor) — and persist it. "mono" overrides the demosaic
+        flag and leaves it as it was, so switching back restores the previous
+        Bayer choice. Captured per image at import — already-loaded merges keep
+        their decode; only the NEXT import is affected. See
+        spec/trichrome-demosaic-mode.md and spec/trichrome-mono-read.md."""
+        label = self._MERGE_DETAIL_LABELS[mode]
+        ccr_backend.rgb_merge_mono = (mode == "mono")
+        if mode != "mono":
+            ccr_backend.rgb_merge_demosaic = (mode == "demosaic")
+        self._settings.setValue("import/rgb_merge_mono",
+                                bool(ccr_backend.rgb_merge_mono))
+        self._settings.setValue("import/rgb_merge_demosaic",
+                                bool(ccr_backend.rgb_merge_demosaic))
         self.sliders_panel.set_temporary_hint(
-            ("Trichrome merge detail: demosaic (full resolution)."
-             if demosaic else
-             "Trichrome merge detail: single photosite (half resolution).")
-            + " Applies to the next import.", duration=5000)
+            f"Trichrome merge detail: {label}. Applies to the next import.",
+            duration=5000)
+
+    def on_rgb_merge_demosaic_changed(self, demosaic: bool):
+        """Bool form of on_rgb_merge_detail_changed (demosaic vs photosite)."""
+        self.on_rgb_merge_detail_changed("demosaic" if demosaic else "photosite")
 
     def on_rgb_merge_replace_toggled(self, checked: bool):
         """Flip the global 'replace originals with linear TIFF' opt-in and persist

@@ -322,17 +322,22 @@ class SettingsDialog(QDialog):
         detail_row.setSpacing(theme.GAP_BTN)
         detail_row.addWidget(QLabel("Merge detail:"))
         self._combo_merge_detail = QComboBox()
-        self._combo_merge_detail.addItem("Demosaic (full resolution)", True)
+        self._combo_merge_detail.addItem("Demosaic (full resolution)", "demosaic")
         self._combo_merge_detail.addItem(
-            "Single photosite (half resolution)", False)
+            "Single photosite (half resolution)", "photosite")
+        self._combo_merge_detail.addItem(
+            "Monochrome (full resolution, no demosaic)", "mono")
         detail_row.addWidget(self._combo_merge_detail, 1)
         g3.addLayout(detail_row)
         g3.addWidget(self._muted(
             "Demosaic interpolates each frame's own channel from its own "
             "photosites (bilinear — still no channel mixing) at full sensor "
             "resolution. Single photosite reads only the raw colour sites — "
-            "no interpolation at all — at half resolution. Applies to the "
-            "next import."))
+            "no interpolation at all — at half resolution. Monochrome reads "
+            "every photosite as luminance with no demosaic — for monochrome "
+            "sensors, including mono-converted cameras whose RAW still reports "
+            "a colour filter; on a colour sensor it shows a checkerboard. "
+            "Applies to the next import."))
         self._cb_rgb_replace = QCheckBox(
             "Replace originals with linear TIFF on import")
         g3.addWidget(self._cb_rgb_replace)
@@ -437,8 +442,7 @@ class SettingsDialog(QDialog):
             cb.blockSignals(False)
         self._combo_merge_detail.blockSignals(True)
         self._combo_merge_detail.setCurrentIndex(
-            self._combo_merge_detail.findData(
-                bool(getattr(ccr_backend, "rgb_merge_demosaic", True))))
+            self._combo_merge_detail.findData(self._backend_merge_detail()))
         self._combo_merge_detail.blockSignals(False)
         self._combo_awb_algo.blockSignals(True)
         idx = self._combo_awb_algo.findData(
@@ -446,6 +450,15 @@ class SettingsDialog(QDialog):
         self._combo_awb_algo.setCurrentIndex(
             idx if idx >= 0 else self._combo_awb_algo.findData(AWB_DEFAULT))
         self._combo_awb_algo.blockSignals(False)
+
+    @staticmethod
+    def _backend_merge_detail() -> str:
+        """The live Merge detail mode as the combo's data string. Monochrome
+        overrides the demosaic flag. See spec/trichrome-mono-read.md."""
+        if getattr(ccr_backend, "rgb_merge_mono", False):
+            return "mono"
+        return ("demosaic" if getattr(ccr_backend, "rgb_merge_demosaic", True)
+                else "photosite")
 
     def _apply_pending(self):
         """Apply only the toggles whose checkbox differs from the live backend
@@ -456,9 +469,9 @@ class SettingsDialog(QDialog):
             self._mw.on_positive_mode_toggled(bool(self._cb_positive.isChecked()))
         if bool(self._cb_rgb_merge.isChecked()) != bool(ccr_backend.rgb_merge_mode):
             self._mw.on_rgb_merge_mode_toggled(bool(self._cb_rgb_merge.isChecked()))
-        staged_detail = bool(self._combo_merge_detail.currentData())
-        if staged_detail != bool(getattr(ccr_backend, "rgb_merge_demosaic", True)):
-            self._mw.on_rgb_merge_demosaic_changed(staged_detail)
+        staged_detail = self._combo_merge_detail.currentData()
+        if staged_detail != self._backend_merge_detail():
+            self._mw.on_rgb_merge_detail_changed(staged_detail)
         if (bool(self._cb_rgb_replace.isChecked())
                 != bool(getattr(ccr_backend, "rgb_merge_replace", False))):
             self._mw.on_rgb_merge_replace_toggled(

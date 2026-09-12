@@ -278,7 +278,7 @@ class IT8ProfileDialog(QDialog):
         self._settings = QSettings("FreeCCR", "FreeCCR")
 
         self._current_path = current_path
-        # (sources, demosaic) when the app's current image is a 3-way merge, so
+        # (sources, demosaic, mono) when the app's current image is a 3-way merge, so
         # "Use current image" can profile a trichrome capture without re-picking
         # the three files. See spec/trichrome-camera-profile.md §3.
         self._current_merge = current_merge
@@ -534,9 +534,9 @@ class IT8ProfileDialog(QDialog):
     # ------------------------------------------------------------------ #
     def _use_current(self):
         if self._current_merge:
-            sources, demosaic = self._current_merge
+            sources, demosaic, mono = self._current_merge
             self.trichrome_check.setChecked(True)
-            self._set_target_merge(list(sources), bool(demosaic))
+            self._set_target_merge(list(sources), bool(demosaic), bool(mono))
         elif self._current_path:
             self._set_target(self._current_path)
 
@@ -557,7 +557,8 @@ class IT8ProfileDialog(QDialog):
             sources = self._browse_triplet(
                 start, "Select the 3 trichrome target shots (red, green, blue)")
             if sources:
-                self._set_target_merge(sources, bool(ccr_backend.rgb_merge_demosaic))
+                self._set_target_merge(sources, bool(ccr_backend.rgb_merge_demosaic),
+                                       bool(ccr_backend.rgb_merge_mono))
             return
         path, _ = QFileDialog.getOpenFileName(
             self, "Select IT8 target shot", start,
@@ -589,14 +590,16 @@ class IT8ProfileDialog(QDialog):
             return None
         return ccr_merge.sort_for_merge(paths)
 
-    def _set_target_merge(self, sources, demosaic: bool):
+    def _set_target_merge(self, sources, demosaic: bool, mono: bool = False):
         self._reset_card_accum()           # a new target starts a fresh session
         self._target_merge = list(sources)
         self._target_demosaic = bool(demosaic)
+        self._target_mono = bool(mono)
         self._target_path = sources[0]     # naming / last-dir only
         self._target_img = None            # force re-decode on Next
         names = ", ".join(os.path.basename(x) for x in sources)
-        mode = "linear demosaic" if demosaic else "single photosite"
+        mode = ("monochrome read" if mono
+                else "linear demosaic" if demosaic else "single photosite")
         # The merge mode is shown, not just used: it decides the device space the
         # profile is fitted in, so a silently-baked mode would be undiagnosable.
         self.target_label.setText(
@@ -799,6 +802,7 @@ class IT8ProfileDialog(QDialog):
                 return None
             self._target_merge = list(sources)
             self._target_demosaic = bool(ccr_backend.rgb_merge_demosaic)
+            self._target_mono = bool(ccr_backend.rgb_merge_mono)
             return sources[0]
         path, _ = QFileDialog.getOpenFileName(
             self, "Select the next IT8 card image", start,
@@ -813,7 +817,8 @@ class IT8ProfileDialog(QDialog):
         See spec/trichrome-camera-profile.md section 4."""
         if self._target_merge:
             return it8.decode_target_merged(
-                self._target_merge, getattr(self, "_target_demosaic", True))
+                self._target_merge, getattr(self, "_target_demosaic", True),
+                mono=getattr(self, "_target_mono", False))
         return it8.decode_target(norm_path)
 
     def _load_card_image(self, path: str) -> bool:
