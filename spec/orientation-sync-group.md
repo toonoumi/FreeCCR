@@ -36,6 +36,31 @@ other frames instead of clicking `[` / `]` on every one.
   conversion input, so syncing them must **not** trigger
   `update_thumbnail_and_preview()`.
 
+## Canonical order: rotate, fine-rotate, THEN mirror
+
+Every surface bakes orientation in the order the **canvas** composes it: the
+90° rotation first, then the fine rotation (both about the centre — rotations
+commute, so their relative order is free), and the **mirrors last, in screen
+space**. Pressing mirror flips what is on screen, whatever rotation is already
+applied.
+
+Only the mirrors' position matters, and it is not cosmetic: a flip *before* a
+quarter turn lands **180° away** from the same flip after it, and a flip before
+a fine rotation reverses which way the frame leans. All four export pipelines
+(reference, bwpoint, positive, ref-params) originally flipped FIRST and the
+thumbnails did too, so a mirrored frame exported rotated the wrong way while
+the preview showed it correctly — 4 of the 16 rotation × mirror combinations
+(90°/270° with exactly one mirror), plus every mirrored fine rotation at any
+rotation including 0°. Without a mirror, or with both (a 180° turn, which
+commutes), the orders agree and the output is bit-identical.
+
+The export order lives in ONE place — `ccr_processor.apply_orientation(img,
+rotation_angle, fine_angle_degrees, h_flip, v_flip)` — which all four pipelines
+call; `ThumbnailList.apply_frontend_transformations` mirrors it with
+`QTransform`s. Tests: `tests/test_orientation_order.py` pins every combination
+(with and without fine rotation) to the canvas transform, and asserts the
+no-mirror / both-mirror cases stay bit-identical.
+
 ## UX / interaction
 
 The group is inserted **directly after `crop`**, keeping the two geometry

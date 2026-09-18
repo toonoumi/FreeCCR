@@ -514,7 +514,16 @@ class ThumbnailList(QWidget):
         # Start with the original thumbnail
         transformed_thumbnail = thumbnail
         
-        # Apply flips first using QTransform
+        # Rotate FIRST, then mirror — the canvas's order (and the export's,
+        # see ccr_processor.apply_orientation). Mirroring first would land a
+        # mirrored quarter-turn 180 degrees away from what the preview shows.
+        angle = rotation_angle % 360
+        if angle != 0:
+            transform = QTransform()
+            transform.rotate(angle)
+            transformed_thumbnail = transformed_thumbnail.transformed(transform)
+
+        # Apply 90-degree rotations (but not fine angle rotation)
         if horizontal_flip or vertical_flip:
             transform = QTransform()
             if horizontal_flip:
@@ -522,14 +531,7 @@ class ThumbnailList(QWidget):
             if vertical_flip:
                 transform.scale(1, -1)  # Vertical flip
             transformed_thumbnail = transformed_thumbnail.transformed(transform)
-        
-        # Apply 90-degree rotations (but not fine angle rotation)
-        angle = rotation_angle % 360
-        if angle != 0:
-            transform = QTransform()
-            transform.rotate(angle)
-            transformed_thumbnail = transformed_thumbnail.transformed(transform)
-        
+
         # Ensure the transformed thumbnail fits within the icon size (156x156)
         # while maintaining aspect ratio to prevent overlapping
         icon_size = 156

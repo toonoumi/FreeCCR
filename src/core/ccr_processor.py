@@ -648,6 +648,60 @@ def _load_export_source(ccr_image, output_path, max_long_side):
     return ccr_image.read_image(ccr_image.file_path, preview=False)
 
 
+def apply_orientation(img: np.ndarray, rotation_angle: int = 0,
+                      fine_angle: float = 0.0, h_flip: bool = False,
+                      v_flip: bool = False) -> np.ndarray:
+    """Bake the display orientation into the pixels, in the SAME order the
+    canvas composes it (image_preview's base transform): the 90-degree
+    rotation first, then the fine rotation — both about the centre, and
+    rotations commute, so their relative order is free — and the mirrors
+    LAST, in screen space.
+
+    Where the mirrors sit is the whole point. A flip BEFORE a quarter turn
+    lands 180 degrees away from the same flip after it, and a flip before a
+    fine rotation reverses which way the frame leans. All four export
+    pipelines used to flip first, so a mirrored frame exported rotated the
+    wrong way (and leaning the wrong way) while the preview showed it
+    correctly. The preview is the reference: pressing mirror flips what is on
+    screen, whatever rotation is already applied.
+
+    `fine_angle` is in DEGREES (the stored value is hundredths). A fine
+    rotation expands the canvas to fit the corners. Returns the oriented
+    array; the input is not modified."""
+    angle = int(rotation_angle) % 360
+    if angle == 90:
+        img = np.rot90(img, k=3)
+    elif angle == 180:
+        img = np.rot90(img, k=2)
+    elif angle == 270:
+        img = np.rot90(img, k=1)
+    if angle in (90, 270):
+        # np.rot90 returns a transposed VIEW; cv2 needs real memory layout.
+        img = np.ascontiguousarray(img)
+    if fine_angle:
+        h_r, w_r = img.shape[:2]
+        rot_mat = cv2.getRotationMatrix2D((w_r // 2, h_r // 2), -fine_angle, 1.0)
+        abs_cos = abs(rot_mat[0, 0])
+        abs_sin = abs(rot_mat[0, 1])
+        new_w = int(w_r * abs_cos + h_r * abs_sin)
+        new_h = int(h_r * abs_cos + w_r * abs_sin)
+        rot_mat[0, 2] += (new_w - w_r) / 2
+        rot_mat[1, 2] += (new_h - h_r) / 2
+        try:
+            img = cv2.warpAffine(img, rot_mat, (new_w, new_h),
+                                 flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        except Exception as e:
+            print(f"Warning: warpAffine failed: {e}")
+    if h_flip and v_flip:
+        img = cv2.flip(img, -1)
+    elif h_flip:
+        img = cv2.flip(img, 1)
+    elif v_flip:
+        img = cv2.flip(img, 0)
+    return img
+
+
 def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb",reference_rect=None,fine_rot=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
@@ -908,54 +962,12 @@ def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_qu
             rgb_brightness_normalized, getattr(ccr_image, 'crop_rect', None),
             getattr(ccr_image, 'crop_angle', 0.0))
         step_start = time.time()
-        # Apply flips and rotation to rgb_brightness_normalized before export
-        if h_flip and v_flip:
-            rgb_brightness_normalized = cv2.flip(rgb_brightness_normalized, -1)
-        elif h_flip:
-            rgb_brightness_normalized = cv2.flip(rgb_brightness_normalized, 1)
-        elif v_flip:
-            rgb_brightness_normalized = cv2.flip(rgb_brightness_normalized, 0)
-
-        # --- ADD THIS BLOCK: rotate pixels for 90/180/270 degree rotation ---
-        angle = ccr_image.rotation_angle % 360
-        if angle == 90:
-            # Rotate 90 degrees clockwise
-            rgb_brightness_normalized = np.rot90(rgb_brightness_normalized, k=3)
-        elif angle == 180:
-            # Rotate 180 degrees
-            rgb_brightness_normalized = np.rot90(rgb_brightness_normalized, k=2)
-        elif angle == 270:
-            # Rotate 270 degrees clockwise (or 90 degrees CCW)
-            rgb_brightness_normalized = np.rot90(rgb_brightness_normalized, k=1)
-        # --- END BLOCK ---
+        # Rotation, fine rotation, then the mirrors — the canvas's order.
+        rgb_brightness_normalized = apply_orientation(
+            rgb_brightness_normalized, ccr_image.rotation_angle, fine_angle,
+            h_flip, v_flip)
         print(rgb_brightness_normalized.shape)
-        print(f"Flips and rotation transforms: {time.time() - step_start:.3f}s")
-
-        print(f"Rotated image by {angle} degrees (no crop)")
-        step_start = time.time()
-        if output_path is not None: # this is for output
-            # when outputting rotate original image as well
-            h, w = rgb_brightness_normalized.shape[:2]
-            center = (w // 2, h // 2)
-            rot_mat = cv2.getRotationMatrix2D(center, -fine_angle, 1.0)
-            abs_cos = abs(rot_mat[0, 0])
-            abs_sin = abs(rot_mat[0, 1])
-            new_w = int(w * abs_cos + h * abs_sin)
-            new_h = int(h * abs_cos + w * abs_sin)
-            rot_mat[0, 2] += (new_w - w) / 2
-            rot_mat[1, 2] += (new_h - h) / 2
-            try:
-                rgb_brightness_normalized = cv2.warpAffine(
-                    rgb_brightness_normalized, rot_mat, (new_w, new_h),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0
-                )
-            except Exception as e:
-                print(f"Warning: warpAffine failed due to image size or memory error: {e}")
-            # Clean up rotation variables
-            del rot_mat, center, abs_cos, abs_sin
-        print(f"Final rotation: {time.time() - step_start:.3f}s")
+        print(f"Orientation transforms: {time.time() - step_start:.3f}s")
 
             # angle = ccr_image.rotation_angle
             # if angle != 0:
@@ -1989,40 +2001,9 @@ def ccr_normalize_with_bwpoint(ccr_image, black_point_bgr=None, white_point_bgr=
         # before flips/rotation so it matches the cropped preview orientation.
         rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
                                          getattr(ccr_image, 'crop_angle', 0.0))
-        # Flips
-        if h_flip and v_flip:
-            rgb_result = cv2.flip(rgb_result, -1)
-        elif h_flip:
-            rgb_result = cv2.flip(rgb_result, 1)
-        elif v_flip:
-            rgb_result = cv2.flip(rgb_result, 0)
-
-        # 90-degree rotation
-        angle = ccr_image.rotation_angle % 360
-        if angle == 90:
-            rgb_result = np.rot90(rgb_result, k=3)
-        elif angle == 180:
-            rgb_result = np.rot90(rgb_result, k=2)
-        elif angle == 270:
-            rgb_result = np.rot90(rgb_result, k=1)
-
-        # Fine rotation at full resolution
-        if fine_angle != 0:
-            h_r, w_r = rgb_result.shape[:2]
-            center_r = (w_r // 2, h_r // 2)
-            rot_mat = cv2.getRotationMatrix2D(center_r, -fine_angle, 1.0)
-            abs_cos = abs(rot_mat[0, 0])
-            abs_sin = abs(rot_mat[0, 1])
-            new_w = int(w_r * abs_cos + h_r * abs_sin)
-            new_h = int(h_r * abs_cos + w_r * abs_sin)
-            rot_mat[0, 2] += (new_w - w_r) / 2
-            rot_mat[1, 2] += (new_h - h_r) / 2
-            try:
-                rgb_result = cv2.warpAffine(rgb_result, rot_mat, (new_w, new_h),
-                                             flags=cv2.INTER_LINEAR,
-                                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            except Exception as e:
-                print(f"Warning: warpAffine failed: {e}")
+        # Rotation, fine rotation, then the mirrors — the canvas's order.
+        rgb_result = apply_orientation(rgb_result, ccr_image.rotation_angle,
+                                       fine_angle, h_flip, v_flip)
 
         # Write file
         write_export_image(ccr_image, rgb_result, output_path, jpg_out,
@@ -2068,40 +2049,9 @@ def ccr_export_positive(ccr_image, output_path=None, jpg_out=False,
     # before flips/rotation so it matches the cropped preview orientation.
     rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
                                      getattr(ccr_image, 'crop_angle', 0.0))
-    # Flips
-    if h_flip and v_flip:
-        rgb_result = cv2.flip(rgb_result, -1)
-    elif h_flip:
-        rgb_result = cv2.flip(rgb_result, 1)
-    elif v_flip:
-        rgb_result = cv2.flip(rgb_result, 0)
-
-    # 90-degree rotation
-    angle = ccr_image.rotation_angle % 360
-    if angle == 90:
-        rgb_result = np.rot90(rgb_result, k=3)
-    elif angle == 180:
-        rgb_result = np.rot90(rgb_result, k=2)
-    elif angle == 270:
-        rgb_result = np.rot90(rgb_result, k=1)
-
-    # Fine rotation at full resolution (canvas-expanding, like the other paths)
-    if fine_angle != 0:
-        h_r, w_r = rgb_result.shape[:2]
-        center_r = (w_r // 2, h_r // 2)
-        rot_mat = cv2.getRotationMatrix2D(center_r, -fine_angle, 1.0)
-        abs_cos = abs(rot_mat[0, 0])
-        abs_sin = abs(rot_mat[0, 1])
-        new_w = int(w_r * abs_cos + h_r * abs_sin)
-        new_h = int(h_r * abs_cos + w_r * abs_sin)
-        rot_mat[0, 2] += (new_w - w_r) / 2
-        rot_mat[1, 2] += (new_h - h_r) / 2
-        try:
-            rgb_result = cv2.warpAffine(rgb_result, rot_mat, (new_w, new_h),
-                                        flags=cv2.INTER_LINEAR,
-                                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        except Exception as e:
-            print(f"Warning: warpAffine failed: {e}")
+    # Rotation, fine rotation, then the mirrors — the canvas's order.
+    rgb_result = apply_orientation(rgb_result, ccr_image.rotation_angle,
+                                   fine_angle, h_flip, v_flip)
 
     write_export_image(ccr_image, rgb_result, output_path, jpg_out,
                        jpg_quality, max_long_side, output_colorspace)
@@ -2139,40 +2089,11 @@ def ccr_normalize_with_refparams(ccr_image, p_lo, p_hi, od_factors,
     rgb_result = apply_crop_to_image(rgb_result, getattr(ccr_image, 'crop_rect', None),
                                      getattr(ccr_image, 'crop_angle', 0.0))
 
-    h_flip = ccr_image.horizontal_mirrored
-    v_flip = ccr_image.vertical_mirrored
-    if h_flip and v_flip:
-        rgb_result = cv2.flip(rgb_result, -1)
-    elif h_flip:
-        rgb_result = cv2.flip(rgb_result, 1)
-    elif v_flip:
-        rgb_result = cv2.flip(rgb_result, 0)
-
-    angle = ccr_image.rotation_angle % 360
-    if angle == 90:
-        rgb_result = np.rot90(rgb_result, k=3)
-    elif angle == 180:
-        rgb_result = np.rot90(rgb_result, k=2)
-    elif angle == 270:
-        rgb_result = np.rot90(rgb_result, k=1)
-
-    fine_angle = ccr_image.fine_rotation_angle / 100.0
-    if fine_angle != 0:
-        h_r, w_r = rgb_result.shape[:2]
-        center_r = (w_r // 2, h_r // 2)
-        rot_mat = cv2.getRotationMatrix2D(center_r, -fine_angle, 1.0)
-        abs_cos = abs(rot_mat[0, 0])
-        abs_sin = abs(rot_mat[0, 1])
-        new_w = int(w_r * abs_cos + h_r * abs_sin)
-        new_h = int(h_r * abs_cos + w_r * abs_sin)
-        rot_mat[0, 2] += (new_w - w_r) / 2
-        rot_mat[1, 2] += (new_h - h_r) / 2
-        try:
-            rgb_result = cv2.warpAffine(rgb_result, rot_mat, (new_w, new_h),
-                                        flags=cv2.INTER_LINEAR,
-                                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        except Exception as e:
-            print(f"Warning: warpAffine failed: {e}")
+    # Rotation, fine rotation, then the mirrors — the canvas's order.
+    rgb_result = apply_orientation(rgb_result, ccr_image.rotation_angle,
+                                   ccr_image.fine_rotation_angle / 100.0,
+                                   ccr_image.horizontal_mirrored,
+                                   ccr_image.vertical_mirrored)
 
     write_export_image(ccr_image, rgb_result, output_path, jpg_out,
                        jpg_quality, max_long_side, output_colorspace)
