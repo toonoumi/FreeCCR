@@ -98,13 +98,24 @@ And end-to-end through the real pipeline (`read_image` + `apply_adjustments`):
 ## Baked brightness baseline
 
 Positives also carry a baked `brightness_base`, the way negatives carry their
-`-8` film-look offset. `POSITIVE_BASE_BRIGHTNESS = 20` is expressed in
+`-8` film-look offset. `POSITIVE_BASE_BRIGHTNESS = 15` is expressed in
 Brightness-**slider** units so it reads as the number a user would dial in by
 hand; `apply_adjustments` computes `0.5*slider + base` — the slider is half
 strength while the base is full weight — so the stored value is **half** the
-slider number it reproduces (20 → 10). Verified: a base of 10 renders
-bit-identically to the slider at 20, both with and without the base curve.
-`FREECCR_POSITIVE_BRIGHTNESS` overrides it, also in slider units.
+slider number it reproduces. `FREECCR_POSITIVE_BRIGHTNESS` overrides it, also
+in slider units.
+
+`brightness_base` is an **integer**, so an odd slider value cannot be hit
+exactly. The conversion **truncates** rather than rounds — 15 → 7.5 → stored as
+7, the slider-14 equivalent, half a step *darker* than asked. That direction is
+deliberate: rounding up would quietly return a brighter render than the number
+requested, and the measured difference either way peaks at 0.02, well below
+visible. Even values are exact — 20 → 10 rendered bit-identically to the slider
+at 20.
+
+Keeping it an integer is deliberate too: `catalog.serialize_image` stores
+`int(img.brightness_base)`, so a float base would be truncated on restore and
+the live and restored renders would silently disagree.
 
 This is the third revision of spec/positive-mode.md §4.2a's "neutral baseline":
 measured renders kept landing darker than the user's eye wanted, and the lift

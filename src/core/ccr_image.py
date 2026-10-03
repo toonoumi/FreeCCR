@@ -77,13 +77,16 @@ POSITIVE_BASE_EV = 0.5
 
 # Baked BRIGHTNESS baseline for a positive decode, in Brightness-SLIDER units so
 # it reads as the number you would dial in by hand. Positives opened too dark to
-# use without pushing this every time; 20 is the value that lands a natural
+# use without pushing this every time; 15 is the value that lands a natural
 # baseline across a real set.
 #
 # NOTE the unit conversion: apply_adjustments computes 0.5*slider + base, i.e.
 # the slider is HALF strength while the base is full weight, so the stored base
-# is half the slider number it reproduces (20 -> 10).
-POSITIVE_BASE_BRIGHTNESS = 20
+# is half the slider number it reproduces. brightness_base is an INTEGER, so an
+# odd slider value cannot be hit exactly: 15 -> 7.5 -> stored as 7, i.e. the
+# slider-14 equivalent, half a step darker than asked (measured difference 0.02
+# at its largest, well below visible). Even values are exact: 20 -> 10.
+POSITIVE_BASE_BRIGHTNESS = 15
 
 
 def _positive_base_brightness() -> int:
@@ -97,7 +100,10 @@ def _positive_base_brightness() -> int:
         except ValueError:
             logging.warning(f"FREECCR_POSITIVE_BRIGHTNESS={raw!r} is not a "
                             f"number; using {POSITIVE_BASE_BRIGHTNESS}")
-    return int(round(0.5 * value))
+    # Truncate rather than round: an odd slider value cannot be hit exactly by an
+    # integer base, and erring half a step DARKER is the right direction for a
+    # baseline (rounding 15 up would quietly hand back a slider-16 render).
+    return int(0.5 * value)
 
 
 def _positive_base_ev() -> float:

@@ -525,7 +525,9 @@ class TestBrightnessBaseline:
         from core.ccr_image import POSITIVE_BASE_BRIGHTNESS
         path = _scan_png(tmp_path)
         backend.positive_mode = True
-        assert CCRImage(path).brightness_base == round(0.5 * POSITIVE_BASE_BRIGHTNESS)
+        # Truncated, not rounded: an integer base cannot hit an odd slider value,
+        # and a baseline errs half a step darker rather than brighter.
+        assert CCRImage(path).brightness_base == int(0.5 * POSITIVE_BASE_BRIGHTNESS)
         backend.positive_mode = False
         assert CCRImage(path).brightness_base == -8            # negatives keep the look
 
