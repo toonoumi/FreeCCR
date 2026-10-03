@@ -95,6 +95,25 @@ And end-to-end through the real pipeline (`read_image` + `apply_adjustments`):
 9915  0.705   camera 0.741      (today: 0.579)
 ```
 
+## Baked brightness baseline
+
+Positives also carry a baked `brightness_base`, the way negatives carry their
+`-8` film-look offset. `POSITIVE_BASE_BRIGHTNESS = 20` is expressed in
+Brightness-**slider** units so it reads as the number a user would dial in by
+hand; `apply_adjustments` computes `0.5*slider + base` — the slider is half
+strength while the base is full weight — so the stored value is **half** the
+slider number it reproduces (20 → 10). Verified: a base of 10 renders
+bit-identically to the slider at 20, both with and without the base curve.
+`FREECCR_POSITIVE_BRIGHTNESS` overrides it, also in slider units.
+
+This is the third revision of spec/positive-mode.md §4.2a's "neutral baseline":
+measured renders kept landing darker than the user's eye wanted, and the lift
+needed is a plain brightness offset rather than more curve or more gain.
+
+Known limitation: `catalog._restore_image` restores a stored `brightness_base`,
+so positives already in the catalog keep their previous value and only fresh
+imports pick up the new baseline.
+
 ## Data Model
 
 - `CCRImage.base_curve: int` — strength in percent. Set in `__init__` and

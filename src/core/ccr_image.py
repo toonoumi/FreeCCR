@@ -75,6 +75,31 @@ def _positive_base_curve_strength() -> int:
 POSITIVE_BASE_EV = 0.5
 
 
+# Baked BRIGHTNESS baseline for a positive decode, in Brightness-SLIDER units so
+# it reads as the number you would dial in by hand. Positives opened too dark to
+# use without pushing this every time; 20 is the value that lands a natural
+# baseline across a real set.
+#
+# NOTE the unit conversion: apply_adjustments computes 0.5*slider + base, i.e.
+# the slider is HALF strength while the base is full weight, so the stored base
+# is half the slider number it reproduces (20 -> 10).
+POSITIVE_BASE_BRIGHTNESS = 20
+
+
+def _positive_base_brightness() -> int:
+    """brightness_base for a positive decode, converted from slider units.
+    FREECCR_POSITIVE_BRIGHTNESS overrides it (also in slider units)."""
+    value = POSITIVE_BASE_BRIGHTNESS
+    raw = os.environ.get("FREECCR_POSITIVE_BRIGHTNESS")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            logging.warning(f"FREECCR_POSITIVE_BRIGHTNESS={raw!r} is not a "
+                            f"number; using {POSITIVE_BASE_BRIGHTNESS}")
+    return int(round(0.5 * value))
+
+
 def _positive_base_ev() -> float:
     """Baseline exposure (stops) for a monochrome positive decode."""
     raw = os.environ.get("FREECCR_POSITIVE_EV")
@@ -301,7 +326,11 @@ class CCRImage:
         # Non-destructive base brightness offset (slider shows 0). The -8 is part
         # of the film-NEGATIVE look; positives go straight to user adjustments
         # from a neutral baseline (no darkening), so 0 there. See spec/positive-mode.md.
-        self.brightness_base: int = 0 if self._positive_mode_active() else -8
+        # Positives carry a baked brightness baseline so a fresh one opens at a
+        # natural level instead of needing the slider pushed on every image.
+        # Negatives keep their -8 film-look offset. See _positive_base_brightness.
+        self.brightness_base: int = (_positive_base_brightness()
+                                     if self._positive_mode_active() else -8)
         # Positive-mode BASE RENDER CURVE — the stage that makes a raw developer's
         # default look "normal" (Adobe's ProfileToneCurve, darktable's base
         # curve). A transfer function alone is not a rendering, which is exactly
@@ -398,7 +427,8 @@ class CCRImage:
         self.temperature_base = 0
         # -8 is the negative-look baseline; positives reset to a neutral 0 so the
         # decode goes straight to user adjustments (no darkening / shadow crush).
-        self.brightness_base = 0 if self._positive_mode_active() else -8
+        self.brightness_base = (_positive_base_brightness()
+                                if self._positive_mode_active() else -8)
         # Re-derived from the live mode, like brightness_base above: a reload
         # after toggling Positive mode must pick up (or drop) the base curve.
         self.base_curve = (_positive_base_curve_strength()

@@ -517,10 +517,15 @@ class TestBrightnessBaseline:
         np.testing.assert_array_equal(identity, shadow)        # positive baseline: untouched
         assert darkened.mean() < shadow.mean() * 0.85          # negative baseline: darkened
 
-    def test_fresh_positive_image_uses_neutral_brightness_base(self, tmp_path, backend):
+    def test_fresh_positive_image_uses_the_baked_brightness_baseline(self, tmp_path,
+                                                                     backend):
+        # Positives open at a baked baseline instead of needing the Brightness
+        # slider pushed on every image. The constant is in SLIDER units and the
+        # slider is half strength, so the stored base is half of it.
+        from core.ccr_image import POSITIVE_BASE_BRIGHTNESS
         path = _scan_png(tmp_path)
         backend.positive_mode = True
-        assert CCRImage(path).brightness_base == 0
+        assert CCRImage(path).brightness_base == round(0.5 * POSITIVE_BASE_BRIGHTNESS)
         backend.positive_mode = False
         assert CCRImage(path).brightness_base == -8            # negatives keep the look
 
@@ -533,7 +538,8 @@ class TestBrightnessBaseline:
         path = _scan_png(tmp_path)
         backend.positive_mode = True
         pos = CCRImage(path)
-        out = pos.apply_adjustments(pos.resized_raw, base_curve=0)
+        out = pos.apply_adjustments(pos.resized_raw, base_curve=0,
+                                    brightness_base=0)
         np.testing.assert_array_equal(out, pos.resized_raw)
 
     def test_fresh_positive_starts_from_the_base_render_curve(self, tmp_path, backend):
