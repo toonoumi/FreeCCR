@@ -30,48 +30,27 @@ except ImportError:
     logging.warning("tifffile not available, TIFF reading may be limited")
 
 
-# --- Positive-mode base exposure (EXPERIMENT) ------------------------------- #
-# The positive decode maps SENSOR SATURATION to display white and has no
-# auto-exposure anywhere — libraw's auto-bright is off, the preview stretch is
-# skipped for positives, and Auto Gain is gated on `converted` — so every stop of
-# highlight headroom a shot leaves costs a stop of brightness, with nothing
-# compensating. This is the stage-1 "grey placement" gain every raw developer
-# applies (Adobe's BaselineExposure, darktable's exposure module); it runs in
-# LINEAR light inside libraw, BEFORE the gamma encode, which is the correct
-# place for it.
-#
-# Two libraw details that are easy to get wrong:
-#   * exp_shift is a LINEAR MULTIPLIER, not EV -> 2**EV.
-#   * libraw clamps it to [0.25, 8.0] (-2..+3 EV) and SILENTLY ignores anything
-#     larger (verified: 16.0 and 32.0 produce output identical to 8.0), so the
-#     clamp is done here where it is visible.
-# exp_preserve_highlights rolls the top off instead of clipping it, which this
-# needs: measured on a frame with real headroom, +2 EV clips 29% of all pixels
-# at 0.0 but only 10% at 1.0 (2.6% unshifted).
-#
-# Tunable without a rebuild while we evaluate it: FREECCR_POSITIVE_EV=1.5
-# (0 disables it entirely, restoring the previous byte-for-byte decode).
-POSITIVE_BASE_EV = 2.0
-POSITIVE_PRESERVE_HIGHLIGHTS = 1.0
+# --- Positive-mode base tone curve ------------------------------------------ #
+# Gamma-slider units baked into every positive decode. Measured across a
+# 16-frame roll, the slider value needed to put the median tone at 0.45 was
+# +27..+87 with a median of +54; 50 lands the typical frame close and leaves the
+# slider for per-frame trim. See spec/positive-base-gamma.md.
+POSITIVE_BASE_GAMMA = 50
 
 
-def _positive_exp_shift() -> float:
-    """The positive decode's base-exposure gain as a libraw exp_shift (a LINEAR
-    multiplier, 2**EV), clamped to libraw's usable [0.25, 8.0]. Returns exactly
-    1.0 when disabled, which the caller treats as "add no exposure kwargs at
-    all" so the decode stays identical to before this experiment."""
-    ev = POSITIVE_BASE_EV
-    override = os.environ.get("FREECCR_POSITIVE_EV")
-    if override is not None:
-        try:
-            ev = float(override)
-        except ValueError:
-            logging.warning(
-                f"FREECCR_POSITIVE_EV={override!r} is not a number; "
-                f"using {POSITIVE_BASE_EV} EV")
-    if ev == 0:
-        return 1.0
-    return float(min(max(2.0 ** ev, 0.25), 8.0))
+def _positive_base_gamma() -> int:
+    """The baked Gamma-slider offset a positive decode starts from.
+    FREECCR_POSITIVE_GAMMA overrides it while we evaluate the value; 0 disables
+    it entirely, restoring the previous neutral baseline exactly."""
+    raw = os.environ.get("FREECCR_POSITIVE_GAMMA")
+    if raw is None:
+        return POSITIVE_BASE_GAMMA
+    try:
+        return int(round(float(raw)))
+    except ValueError:
+        logging.warning(f"FREECCR_POSITIVE_GAMMA={raw!r} is not a number; "
+                        f"using {POSITIVE_BASE_GAMMA}")
+        return POSITIVE_BASE_GAMMA
 
 try:
     from PIL import Image as PILImage
@@ -288,6 +267,22 @@ class CCRImage:
         # of the film-NEGATIVE look; positives go straight to user adjustments
         # from a neutral baseline (no darkening), so 0 there. See spec/positive-mode.md.
         self.brightness_base: int = 0 if self._positive_mode_active() else -8
+        # Positive-mode BASE TONE CURVE — the "base curve" every raw developer
+        # applies on top of the transfer function (Adobe's ProfileToneCurve,
+        # darktable's base curve). Non-destructive, slider shows 0, exactly the
+        # shape of brightness_base above.
+        #
+        # Why a curve and not a gain: the positive decode maps SENSOR SATURATION
+        # to white, so a well-exposed frame already has its white point placed —
+        # often with 1-6% of pixels clipped — while the MIDTONES sit low. A gain
+        # multiplies everything, driving those already-clipped highlights further
+        # into the ceiling to drag the midtones up (a measured +2 EV on a real
+        # roll clipped 48-60% of all pixels). A centre-point curve pins black AND
+        # white and bends only the middle, which is the stage actually missing.
+        # 0 for negatives: their look is owned by the conversion and Auto Gain.
+        # See spec/positive-base-gamma.md.
+        self.gamma_base: int = (_positive_base_gamma()
+                                if self._positive_mode_active() else 0)
         # Non-destructive auto-exposure (default-slope mode). Rides the Gain/
         # Exposure argument (NOT ch_input_gain, despite what this comment used
         # to say) → applied as a uniform gain. See spec/auto-exposure-default-slope.md.
@@ -368,6 +363,10 @@ class CCRImage:
         # -8 is the negative-look baseline; positives reset to a neutral 0 so the
         # decode goes straight to user adjustments (no darkening / shadow crush).
         self.brightness_base = 0 if self._positive_mode_active() else -8
+        # Re-derived from the live mode, like brightness_base above: a reload
+        # after toggling Positive mode must pick up (or drop) the base curve.
+        self.gamma_base = (_positive_base_gamma()
+                           if self._positive_mode_active() else 0)
         self.exposure_base = 0.0    # Clear auto-exposure when reverting to original scan
         self._ws_windowed = False   # raw scan is full-range, not a windowed base
         self.conversion_inputs = None
@@ -639,7 +638,7 @@ class CCRImage:
         camera white balance, AHD demosaic, rawpy auto-brightness (no_icc_default
         is ignored on this path). Kept pure so the choice is unit-testable."""
         if positive:
-            kw = dict(
+            return dict(
                 output_bps=16,
                 # Auto-brightness OFF: rawpy's auto-bright scales until ~1% of
                 # the brightest pixels saturate, CLIPPING highlights to white.
@@ -656,14 +655,6 @@ class CCRImage:
                 output_color=rawpy.ColorSpace.sRGB,
                 four_color_rgb=False,
             )
-            # Base exposure: the grey-placement gain, in linear light before the
-            # gamma encode. Omitted entirely when disabled, so EV=0 is the exact
-            # pre-experiment decode. See _positive_exp_shift above.
-            shift = _positive_exp_shift()
-            if shift != 1.0:
-                kw["exp_shift"] = shift
-                kw["exp_preserve_highlights"] = POSITIVE_PRESERVE_HIGHLIGHTS
-            return kw
         return dict(
             output_bps=16,
             no_auto_bright=True,      # Consistent absolute sensor values across all frames
@@ -1578,7 +1569,8 @@ class CCRImage:
                           temperature_base=None, brightness_base=None,
                           color_profile=None, areas_override=None,
                           exposure_base=None, ws_windowed=None,
-                          auto_gain_override=None, skip_dust=False) -> np.ndarray:
+                          auto_gain_override=None, skip_dust=False,
+                          gamma_base=None) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently — and let the
@@ -1604,6 +1596,8 @@ class CCRImage:
         tb = self.temperature_base if temperature_base is None else temperature_base
         bb = self.brightness_base if brightness_base is None else brightness_base
         eb = self.exposure_base if exposure_base is None else exposure_base
+        gmb = (getattr(self, "gamma_base", 0) if gamma_base is None
+               else gamma_base)
         profile = self.color_profile if color_profile is None else color_profile
         # A monochrome DECODE renders grey whatever the Color Profile says, by
         # reusing the Black & White collapse below (both call sites) — so no
@@ -1633,7 +1627,7 @@ class CCRImage:
             ag = compute_auto_gain_offset(image, ws) if auto_on else 0.0
         eb_eff = 0.0 if auto_on else eb        # suppress-overlap with the baked eb
         if (not s and cb == 0 and tb == 0 and bb == 0 and eb_eff == 0 and ag == 0
-                and not has_areas):
+                and gmb == 0 and not has_areas):
             # No slider/base/area adjustments. A windowed working-space base still
             # has to be de-windowed + window-clamped to a normal full-range image
             # before display/export (the base itself is not directly renderable).
@@ -1708,7 +1702,11 @@ class CCRImage:
         # diagonally from center). Applied before the user's manual curves so the
         # two compose predictably. No-op at 0. Per-channel by default; the global
         # gamma_luminance flag switches it to hue-preserving (luminance) mode.
-        gamma = s.get('gamma', 0)
+        # The positive-mode BASE curve rides this same stage: the user's slider
+        # PLUS the baked baseline, clamped to the slider's designed [-100, 100]
+        # domain (the curve stays monotone outside it, but the node geometry is
+        # only calibrated within). See spec/positive-base-gamma.md.
+        gamma = max(-100, min(100, s.get('gamma', 0) + gmb))
         if gamma:
             adjusted = apply_gamma_curve(adjusted, gamma,
                                          luminance=ccr_backend.gamma_luminance)

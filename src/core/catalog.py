@@ -241,6 +241,9 @@ def serialize_image(img) -> dict:
         "temperature_base": int(img.temperature_base),
         "brightness_base": int(img.brightness_base),
         "exposure_base": float(getattr(img, "exposure_base", 0.0)),
+        # Positive-mode base tone curve (0 for negatives). Purely additive: an
+        # absent key restores as whatever the decode set, so no migration.
+        "gamma_base": int(getattr(img, "gamma_base", 0)),
         "tint_balance_factor": float(getattr(img, "tint_balance_factor", 1.0)),
         "reference_frame": list(img.reference_frame) if img.reference_frame else None,
     }
@@ -706,6 +709,7 @@ def _restore_image(file_path: str, state: dict, live_merge_sources=None,
     img.temperature_base = state.get("temperature_base", img.temperature_base)
     img.brightness_base = state.get("brightness_base", img.brightness_base)
     img.exposure_base = state.get("exposure_base", getattr(img, "exposure_base", 0.0))
+    img.gamma_base = state.get("gamma_base", getattr(img, "gamma_base", 0))
     img.update_thumbnail_and_preview()
     return img
 
