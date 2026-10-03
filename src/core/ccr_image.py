@@ -17,7 +17,8 @@ from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 apply_dust_removal, DUST_FEATHER_DEFAULT,
                                 _DUST_PLAN_LONG,
                                 _apply_working_space_recovery,
-                                compute_auto_gain_offset)
+                                compute_auto_gain_offset,
+                                renders_monochrome)
 from core import color_management
 
 # Import optional libraries with fallbacks
@@ -172,6 +173,12 @@ class CCRImage:
         # stamped on every working decode so the thumbnail can flag a mismatch
         # when the active profile changes. Not persisted (a reload re-stamps).
         self.profile_signature = None
+        # True when the LAST decode produced a monochrome frame — the global
+        # "interpret RAW as monochrome" toggle, or a true monochrome sensor
+        # (auto-detected). Drives the forced-grey render and the single-channel
+        # export write. Session state, never persisted: every decode re-stamps
+        # it (like profile_signature). See spec/monochrome-raw-mode.md.
+        self.decoded_mono = False
         self.reference_frame = reference_frame
         self.resized_preview = None  # Placeholder for resized preview, if needed later
         self.adjustment_settings = adjustment_settings if adjustment_settings is not None else {}
@@ -503,6 +510,62 @@ class CCRImage:
             self.profile_signature = None
 
     @staticmethod
+    def _mono_raw_active() -> bool:
+        """Whether the app is set to interpret RAWs as monochrome (every
+        photosite read as one luminance sample, no demosaic). Read lazily from
+        the backend singleton so the decode stays in sync with a live toggle
+        without a per-image copy — the same shape as _positive_mode_active.
+        See spec/monochrome-raw-mode.md."""
+        try:
+            from core.ccr_backend import ccr_backend
+            return bool(getattr(ccr_backend, "mono_raw", False))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _read_mono_mosaic(raw, preview: bool):
+        """Read a RAW's visible sensor mosaic as a MONOCHROME frame: one
+        luminance sample per photosite at full sensor resolution — no demosaic,
+        no phase slice, no interpretation of the colour-filter pattern the file
+        declares (which is the point: a mono-converted body still reports RGGB).
+
+        Returns (plane, unbinned_shape) — `plane` 2x2-binned when `preview`,
+        `unbinned_shape` the canonical full size — or None when this file has no
+        mosaic to read (e.g. a linear DNG), which the caller treats as "fall
+        back to the postprocess decode" rather than a failed import.
+
+        The read itself is ccr_merge's, shared with the trichrome Monochrome
+        merge detail so there is exactly ONE mono mosaic read in the codebase:
+        per-site black pedestal subtracted by CFA colour index, clipped at 0.
+        read_image's usual 65535/white_level scaling then brings it to full
+        range. See spec/monochrome-raw-mode.md §4.1."""
+        from core import ccr_merge
+        try:
+            mosaic = np.asarray(raw.raw_image_visible)
+        except Exception as e:
+            logging.warning(f"Monochrome read: no raw mosaic available ({e}); "
+                            "falling back to the normal decode.")
+            return None
+        if mosaic.ndim != 2:
+            logging.warning(
+                "Monochrome read: this file has no 2-D sensor mosaic (shape "
+                f"{mosaic.shape}); falling back to the normal decode.")
+            return None
+        try:
+            colors = np.asarray(raw.raw_colors_visible)
+        except Exception:
+            colors = None
+        try:
+            black_levels = list(raw.black_level_per_channel)
+        except Exception:
+            black_levels = None
+        plane = ccr_merge.mono_plane_from_mosaic(mosaic, colors, black_levels)
+        full = (int(plane.shape[0]), int(plane.shape[1]))
+        if preview:
+            plane = ccr_merge.bin2x2(plane)
+        return plane, full
+
+    @staticmethod
     def _positive_mode_active() -> bool:
         """Whether the app is in global Positive mode (RAWs decode as normal
         sRGB positives, no negative conversion). Read lazily from the backend
@@ -587,6 +650,11 @@ class CCRImage:
             self.merge_sources, preview=preview,
             demosaic=getattr(self, "merge_demosaic", True),
             mono=getattr(self, "merge_mono", False))
+        # A merge is COLOUR by construction — merge_mono reads each source's
+        # mosaic as a mono plane, but those three planes become R, G and B. So a
+        # merged image is never single-channel, whatever the global monochrome
+        # toggle says. See spec/monochrome-raw-mode.md (Non-Goals).
+        self.decoded_mono = False
         # Field correction on the full merged frame (camera-native linear, like
         # the RAW branch). The linear-TIFF bake writes merge_raw_channels output
         # directly, NOT through read_image, so a baked replacement stays
@@ -658,6 +726,11 @@ class CCRImage:
         # override it (e.g. force the raw-linear decode for IT8 profiling).
         positive_mode = (self._positive_mode_active() if positive_override is None
                          else bool(positive_override))
+        # Likewise the global "interpret RAW as monochrome" toggle, read once so
+        # every branch of this decode agrees. Non-RAW files ignore it (a scan is
+        # already whatever it is; Color Profile -> Black & White is their route).
+        # See spec/monochrome-raw-mode.md.
+        mono_forced = self._mono_raw_active()
 
         if ext in [".cr3", ".cr2", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raf", ".srw", ".pef", ".3fr"]:
             try:
@@ -701,6 +774,17 @@ class CCRImage:
                         logging.warning(f"Error detecting monochrome sensor: {e}")
                         is_monochrome = False
 
+                    # The user's explicit choice overrides the metadata — which
+                    # is the whole point, since a mono-converted body still
+                    # reports a colour filter. Folding it into is_monochrome
+                    # (rather than carrying a parallel flag) inherits the three
+                    # behaviours already correct for a monochrome frame: Positive
+                    # mode yields to it, the camera profile is skipped, and the
+                    # manual white-level scaling still applies.
+                    # See spec/monochrome-raw-mode.md §4.1.
+                    if mono_forced:
+                        is_monochrome = True
+
                     # Global Positive mode decodes color RAWs as normal sRGB
                     # photos (monochrome sensors are left on their own path).
                     positive_decode = positive_mode and not is_monochrome
@@ -709,7 +793,27 @@ class CCRImage:
                     # white-level-scaling guard is valid on the monochrome path.
                     no_icc_default = False
 
-                    if is_monochrome:
+                    mono_read = (self._read_mono_mosaic(raw, preview)
+                                 if mono_forced else None)
+                    if mono_read is not None:
+                        plane, mosaic_full = mono_read
+                        print(f"Monochrome mosaic read for: "
+                              f"{os.path.basename(file_path)}")
+                        # Three identical channels, not a 2-D array: every stage
+                        # downstream (field correction, slice ops, conversion,
+                        # adjustments, histogram, QImage) expects (H, W, 3). The
+                        # collapse to one channel happens only at the export
+                        # writer. See spec/monochrome-raw-mode.md §4.3.
+                        rgb = np.repeat(
+                            np.clip(plane, 0, 65535).astype(np.uint16)[..., None],
+                            3, axis=2)
+                        # raw.sizes describes the POSTPROCESS output, which this
+                        # branch never produced; the mosaic's own unbinned shape
+                        # is the canonical full size. Getting this wrong would
+                        # corrupt original_full_size, which drives zoom and
+                        # export resolution.
+                        full_decode_size = mosaic_full
+                    elif is_monochrome:
                         print(f"Detected monochrome sensor for: {os.path.basename(file_path)}")
                         # Fixed absolute sensor values, like the colour negative
                         # decode (and ccr_merge's mono path): linear gamma, no
@@ -798,6 +902,10 @@ class CCRImage:
                 
                 elapsed_time = time.time() - start_time
                 print(f"RAW processing completed in {elapsed_time:.3f} seconds")
+                # Monochrome-ness of THIS decode, for the forced-grey render and
+                # the single-channel export writer. Covers both the forced read
+                # and a true monochrome sensor (spec/monochrome-raw-mode.md §3).
+                self.decoded_mono = bool(is_monochrome)
                 # Burn in the global camera profile (ICC or DCP, if any) on the
                 # decoded camera-native scan, before negative conversion. Skipped
                 # in positive mode (the decode is already a ready sRGB positive)
@@ -934,6 +1042,10 @@ class CCRImage:
             # self-consistent. See spec/flat-field-correction.md §10.4.
             if apply_input_icc:
                 img = self._apply_field_correction(img, mono=is_gray)
+            # A non-RAW scan is never "interpreted" as monochrome — it is read as
+            # what it is, and Color Profile -> Black & White is the per-image way
+            # to ask for greyscale (which also exports single-channel).
+            self.decoded_mono = False
             # Sliced images read only their region of the source
             img = self._apply_source_ops(img)
             # This branch always reads at full resolution regardless of `preview`
@@ -1081,6 +1193,11 @@ class CCRImage:
     def resized_preview(self, value):
         self._preview_pix = value
         self._preview_np8 = None
+
+    def renders_monochrome(self) -> bool:
+        """Whether this image is monochrome by declaration — decoded as a mono
+        frame, or Color Profile = Black & White. See spec/monochrome-raw-mode.md."""
+        return renders_monochrome(self)
 
     @staticmethod
     def _to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -1436,6 +1553,13 @@ class CCRImage:
         bb = self.brightness_base if brightness_base is None else brightness_base
         eb = self.exposure_base if exposure_base is None else exposure_base
         profile = self.color_profile if color_profile is None else color_profile
+        # A monochrome DECODE renders grey whatever the Color Profile says, by
+        # reusing the Black & White collapse below (both call sites) — so no
+        # colour slider can tint a preview that a single-channel file cannot
+        # reproduce, and preview/thumbnail/zoom/export all agree.
+        # See spec/monochrome-raw-mode.md §4.2.
+        if getattr(self, "decoded_mono", False):
+            profile = "bw"
         areas = (getattr(self, "area_layers", []) if areas_override is None
                  else areas_override)
         has_areas = bool(areas) and any(a.get("enabled") for a in areas)

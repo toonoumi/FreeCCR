@@ -431,6 +431,59 @@ def build_matrix_shaper_icc(desc: str,
     return bytes(header) + table + data
 
 
+def build_gray_icc(desc: str,
+                   trc_para: Tuple[float, float, float, float, float],
+                   wtpt: Tuple[float, float, float] = D50_XYZ,
+                   copyright_text: str = "Public Domain. No rights reserved.") -> bytes:
+    """Build a valid ICC v2.4 GREY profile: a white point plus a single tone
+    curve ('kTRC'), with no colorants. Returns the raw profile bytes.
+
+    This is what a single-channel export must carry — an RGB matrix-shaper
+    profile describes three primaries that a 1-sample-per-pixel file does not
+    have, and pairing one with greyscale data is malformed. `trc_para` is the
+    SAME parametric curve the matching RGB profile uses, so tone is interpreted
+    identically whichever kind of file the user exported.
+    See spec/monochrome-raw-mode.md §4."""
+    tags = {
+        'desc': _desc_type(desc),
+        'wtpt': _xyz_type(*wtpt),
+        'kTRC': _para_type3(*trc_para),
+        'cprt': _text_type(copyright_text),
+    }
+    order = ['desc', 'wtpt', 'kTRC', 'cprt']
+    n = len(order)
+    header_size = 128
+    table_size = 4 + n * 12
+    base = header_size + table_size
+
+    data = b''
+    entries = []
+    for name in order:
+        payload = tags[name]
+        if len(data) % 4:
+            data += b'\x00' * (4 - len(data) % 4)
+        entries.append((name.encode('ascii'), base + len(data), len(payload)))
+        data += payload
+
+    table = struct.pack('>I', n)
+    for tag, off, ln in entries:
+        table += struct.pack('>4sII', tag, off, ln)
+
+    total = header_size + len(table) + len(data)
+    header = bytearray(128)
+    struct.pack_into('>I', header, 0, total)            # profile size
+    struct.pack_into('>4s', header, 4, b'lcms')         # preferred CMM (cosmetic)
+    struct.pack_into('>I', header, 8, 0x02400000)       # version 2.4.0
+    struct.pack_into('>4s', header, 12, b'mntr')        # device class: display
+    struct.pack_into('>4s', header, 16, b'GRAY')        # data colour space
+    struct.pack_into('>4s', header, 20, b'XYZ ')        # PCS
+    struct.pack_into('>4s', header, 36, b'acsp')        # signature
+    struct.pack_into('>i', header, 68, _s15f16(wtpt[0]))  # PCS illuminant (D50)
+    struct.pack_into('>i', header, 72, _s15f16(wtpt[1]))
+    struct.pack_into('>i', header, 76, _s15f16(wtpt[2]))
+    return bytes(header) + table + data
+
+
 def _adapt_columns_d65_to_d50(m_rgb2xyz_d65: np.ndarray):
     """Adapt the primary XYZ columns of a D65 RGB->XYZ matrix to D50, returning
     (r_xyz, g_xyz, b_xyz) tuples suitable for ICC colorant tags."""
@@ -455,6 +508,20 @@ PROPHOTO_ICC_BYTES = build_matrix_shaper_icc(
     tuple(M_PROPHOTO2XYZ[:, 0]),
     tuple(M_PROPHOTO2XYZ[:, 1]),
     tuple(M_PROPHOTO2XYZ[:, 2]),
+    (1.8, 1.0, 0.0, 0.0625, 0.03125),
+)
+
+# Grey counterparts for SINGLE-CHANNEL exports (a monochrome image writes one
+# sample per pixel, which an RGB matrix-shaper profile cannot describe). Each
+# carries the SAME tone curve as the RGB profile above it, so a greyscale and a
+# colour export of the same tones are interpreted identically.
+# See spec/monochrome-raw-mode.md §4.
+GRAY_SRGB_ICC_BYTES = build_gray_icc(
+    "FreeCCR Gray (sRGB tone)",
+    (2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045),
+)
+GRAY_PROPHOTO_ICC_BYTES = build_gray_icc(
+    "FreeCCR Gray (ROMM tone)",
     (1.8, 1.0, 0.0, 0.0625, 0.03125),
 )
 
@@ -484,6 +551,33 @@ def apply_export_colorspace(rgb_u16: np.ndarray, target: str) -> Tuple[np.ndarra
     enc = romm_encode(pro)
     out = np.rint(enc * 65535.0).astype(np.uint16)
     return out, PROPHOTO_ICC_BYTES
+
+
+def gray_icc_bytes(target: str) -> bytes:
+    """The GREY profile matching an export target, for single-channel files."""
+    return GRAY_PROPHOTO_ICC_BYTES if target == "prophoto" else GRAY_SRGB_ICC_BYTES
+
+
+def apply_export_colorspace_gray(gray_u16: np.ndarray, target: str) -> Tuple[np.ndarray, bytes]:
+    """Map a SINGLE-CHANNEL export array (HxW uint16, treated as sRGB-encoded)
+    to the target colour space. Returns (out_uint16, grey_icc_bytes).
+
+    Deliberately TRANSFER-FUNCTION ONLY — no matrix, unlike the RGB path:
+    - 'srgb'     : samples returned unchanged (the file is merely tagged).
+    - 'prophoto' : tone re-encoded to ROMM's curve.
+
+    A grey profile has no primaries, and neutral data has no gamut, so there is
+    nothing for a matrix to do here; applying the RGB one would only raise the
+    question of whether it preserves neutrality. Tone still has to be converted,
+    because that is what the embedded grey profile declares.
+    See spec/monochrome-raw-mode.md §4.
+    """
+    if target != "prophoto":
+        return gray_u16, GRAY_SRGB_ICC_BYTES
+    lin = srgb_decode(gray_u16.astype(np.float32) / np.float32(65535.0))
+    enc = romm_encode(lin)
+    out = np.rint(enc * 65535.0).astype(np.uint16)
+    return out, GRAY_PROPHOTO_ICC_BYTES
 
 
 # --------------------------------------------------------------------------- #

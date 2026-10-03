@@ -37,6 +37,13 @@ class CCRBackend:
         # bypassed — every image is editable/exportable directly. App-wide, like
         # the input ICC profile; persisted by MainWindow. See spec/positive-mode.md.
         self.positive_mode: bool = False
+        # Interpret RAWs as MONOCHROME: read every photosite as one luminance
+        # sample at full sensor resolution, no demosaic, ignoring the CFA the
+        # file declares (for mono-converted bodies whose RAW still reports one).
+        # Such images render grey and export as single-channel greyscale files.
+        # Global, like positive_mode; persisted by MainWindow, and a change
+        # re-decodes everything loaded. See spec/monochrome-raw-mode.md.
+        self.mono_raw: bool = False
         # 3-way RGB-light merge (trichrome): when True, an import sorts files by
         # name, requires a multiple of 3, and merges every (red, green, blue)
         # triplet into one camera-native image (no demosaicing). Global, like
@@ -1298,6 +1305,28 @@ class CCRBackend:
         orientation; we explicitly drop the conversion so a re-decoded scan is
         never left flagged converted. The reference_frame is kept so toggling
         back to negative restores the user's frame."""
+        self._redecode_all_keep_adjustments(progress_callback,
+                                            "positive-mode change")
+
+    def reprocess_all_for_mono_raw_change(self, progress_callback=None) -> None:
+        """Re-decode every loaded image after the global "interpret RAW as
+        monochrome" toggle.
+
+        Same contract as the positive-mode reprocess (KEEP adjustments, DROP
+        conversion) and for the same reason: the DECODE itself changed, so a
+        conversion computed against the old one — a demosaiced colour base
+        versus a raw mono mosaic — is meaningless on the new base.
+        See spec/monochrome-raw-mode.md."""
+        self._redecode_all_keep_adjustments(progress_callback,
+                                            "monochrome-RAW change")
+
+    def _redecode_all_keep_adjustments(self, progress_callback=None,
+                                       what: str = "decode change") -> None:
+        """Re-decode every loaded image under the current global decode settings,
+        keeping adjustments / crop / areas / orientation and dropping the
+        conversion. Shared by the Positive-mode and monochrome-RAW toggles —
+        both change what read_image produces, so neither may replay a stale
+        conversion against the new base."""
         total = len(self.images)
         for i, img in enumerate(self.images):
             # Slices/duplicates INHERIT the parent's tint balance factor; their
@@ -1313,7 +1342,7 @@ class CCRBackend:
                     img.tint_balance_factor = tbf
                 img.update_thumbnail_and_preview()
             except Exception as e:
-                print(f"Reprocess after positive-mode change failed for {img.file_path}: {e}")
+                print(f"Reprocess after {what} failed for {img.file_path}: {e}")
             if progress_callback:
                 progress_callback(i + 1, total)
 

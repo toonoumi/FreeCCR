@@ -1857,6 +1857,9 @@ class ImagePreview(QWidget):
                 # spec/gamma-luminance-mode.md).
                 bool(getattr(ccr_backend, "gamma_luminance", False)),
                 bool(getattr(ccr_backend, "auto_gain", True)),
+                # Monochrome RAW interpretation forces the grey collapse inside
+                # apply_adjustments (spec/monochrome-raw-mode.md §4.2).
+                bool(getattr(ccr_backend, "mono_raw", False)),
                 # Reversal-look sprocket mask is composited last in the hi-res
                 # tile — a toggle must invalidate it (spec/sprocket-hole-mask.md).
                 bool(getattr(ccr_backend, "sprocket_mask_white", False)),

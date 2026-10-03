@@ -215,6 +215,10 @@ class MainWindow(QMainWindow):
         # first batch decodes in the right mode (see spec/positive-mode.md).
         positive_mode = self._settings.value("import/positive_mode", False, type=bool)
         ccr_backend.positive_mode = positive_mode
+        # Monochrome RAW interpretation — also a decode-level global, so restore
+        # it before the first load too. See spec/monochrome-raw-mode.md.
+        ccr_backend.mono_raw = self._settings.value(
+            "import/mono_raw", False, type=bool)
         # Restore the global 3-way RGB merge toggle too (affects the next import).
         ccr_backend.rgb_merge_mode = self._settings.value(
             "import/rgb_merge_mode", False, type=bool)
@@ -861,6 +865,32 @@ class MainWindow(QMainWindow):
             "Positive mode on — adjust any image directly."
             if checked else "Positive mode off — film-negative tools restored.",
             duration=4000)
+
+    # --- Monochrome RAW interpretation (global, persistent) ---------------
+    def on_mono_raw_toggled(self, checked: bool):
+        """Flip the global "interpret RAW as monochrome" flag, persist it, and
+        re-decode all loaded images in the new interpretation (keep adjustments,
+        drop conversion). Mirrors Positive mode, because this likewise changes
+        what read_image produces. See spec/monochrome-raw-mode.md."""
+        ccr_backend.mono_raw = bool(checked)
+        self._settings.setValue("import/mono_raw", bool(checked))
+        if ccr_backend.images:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                ccr_backend.reprocess_all_for_mono_raw_change()
+            finally:
+                QApplication.restoreOverrideCursor()
+            # Every image was re-decoded, so a baked hi-res zoom tile is stale.
+            self.image_preview._release_hires(refresh=False)
+            self.thumbnail_list.update_all_thumbnails()
+            if self.image_preview.current_idx is not None:
+                self.image_preview.update_preview(self.image_preview.current_idx)
+            ccr_backend.save_catalog()
+        self.sliders_panel.set_temporary_hint(
+            "Monochrome RAW interpretation on — RAWs read as greyscale, and "
+            "exports are single-channel." if checked else
+            "Monochrome RAW interpretation off — RAWs read in colour again.",
+            duration=5000)
 
     # --- 3-way RGB merge mode (global, persistent) ------------------------
     def on_rgb_merge_mode_toggled(self, checked: bool):

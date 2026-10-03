@@ -343,6 +343,23 @@ class SettingsDialog(QDialog):
             "only — and they look darker."))
         lay.addWidget(grp2)
 
+        # --- Monochrome ------------------------------------------------ #
+        grp_mono = QGroupBox("Monochrome")
+        gm = QVBoxLayout(grp_mono)
+        gm.setSpacing(theme.GAP_ROW)
+        self._cb_mono_raw = QCheckBox(
+            "Interpret RAW as monochrome (no demosaic)")
+        gm.addWidget(self._cb_mono_raw)
+        gm.addWidget(self._muted(
+            "Read every photosite as one luminance sample at full sensor "
+            "resolution, ignoring the colour-filter pattern the RAW declares — "
+            "for monochrome sensors, including mono-converted cameras whose RAW "
+            "still reports a colour filter. On a colour sensor it shows a "
+            "checkerboard. Loaded RAWs are re-decoded (your adjustments are "
+            "kept, the conversion is dropped). Monochrome images export as "
+            "single-channel greyscale TIFF/JPEG."))
+        lay.addWidget(grp_mono)
+
         # --- Trichrome (3-way RGB-light) capture ----------------------- #
         grp3 = QGroupBox("Trichrome capture")
         g3 = QVBoxLayout(grp3)
@@ -477,7 +494,9 @@ class SettingsDialog(QDialog):
                         (self._cb_gamma_lum, ccr_backend.gamma_luminance),
                         (self._cb_sprocket, ccr_backend.sprocket_mask_white),
                         (self._cb_balance_hotkeys,
-                         getattr(ccr_backend, "balance_hotkeys", False))):
+                         getattr(ccr_backend, "balance_hotkeys", False)),
+                        (self._cb_mono_raw,
+                         getattr(ccr_backend, "mono_raw", False))):
             cb.blockSignals(True)
             cb.setChecked(bool(val))
             cb.blockSignals(False)
@@ -566,6 +585,11 @@ class SettingsDialog(QDialog):
                 != bool(getattr(ccr_backend, "balance_hotkeys", False))):
             self._mw.on_balance_hotkeys_toggled(
                 bool(self._cb_balance_hotkeys.isChecked()))
+        # Monochrome RAW interpretation re-decodes every loaded image, so it is
+        # applied last — after the toggles that only affect the next import.
+        if (bool(self._cb_mono_raw.isChecked())
+                != bool(getattr(ccr_backend, "mono_raw", False))):
+            self._mw.on_mono_raw_toggled(bool(self._cb_mono_raw.isChecked()))
 
     def accept(self):
         """Done: commit the staged toggles, then close. (Escape/close → reject,

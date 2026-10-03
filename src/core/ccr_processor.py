@@ -7,8 +7,9 @@ import time
 import tifffile
 import gc
 
-from core.color_management import (apply_export_colorspace, inject_jpeg_icc,
-                                   srgb_encode)
+from core.color_management import (apply_export_colorspace,
+                                   apply_export_colorspace_gray,
+                                   inject_jpeg_icc, srgb_encode)
 
 # Try to import PyOpenCL, but handle gracefully if not available
 try:
@@ -2109,6 +2110,22 @@ def to_8bit(img16: np.ndarray) -> np.ndarray:
     return img8
 
 
+def renders_monochrome(ccr_image) -> bool:
+    """Whether this image is monochrome BY DECLARATION — it was decoded as a
+    monochrome frame (the global "interpret RAW as monochrome" toggle, or a true
+    monochrome sensor), or its per-image Color Profile is Black & White.
+
+    The single predicate behind both the forced-grey render and the
+    single-channel export write, so the file always matches the preview.
+
+    Deliberately getattr-based rather than a required method: the export writer
+    is called with lightweight image stubs in several places (tests included),
+    and they must read as colour without needing to know about this.
+    See spec/monochrome-raw-mode.md §3."""
+    return (bool(getattr(ccr_image, "decoded_mono", False))
+            or getattr(ccr_image, "color_profile", "color") == "bw")
+
+
 def write_export_image(ccr_image, rgb_u16, output_path, jpg_out, jpg_quality,
                        max_long_side, output_colorspace="srgb"):
     """Single export write chokepoint shared by all three conversion pipelines.
@@ -2117,15 +2134,35 @@ def write_export_image(ccr_image, rgb_u16, output_path, jpg_out, jpg_quality,
     chosen output colour space, then writes a 16-bit TIFF (deflate) or 8-bit
     JPEG with the matching ICC profile embedded so a colour-managed viewer
     interprets the file correctly. Returns the resolved output path.
+
+    A MONOCHROME image (renders_monochrome) is written with ONE channel instead
+    of three identical ones, with the metadata that says so — TIFF
+    photometric=minisblack (PhotometricInterpretation 1, SamplesPerPixel 1), a
+    1-component JPEG, and a grey ICC profile in both — so other software reads
+    it as greyscale. See spec/monochrome-raw-mode.md §4.3.
     """
     if max_long_side:
         rgb_u16 = ccr_image.resize_image_to_max_pixel(rgb_u16, max_long_side)
-    # Re-encode to the target colour space and get the ICC bytes to embed.
-    rgb_u16, icc = apply_export_colorspace(rgb_u16, output_colorspace)
+    mono = renders_monochrome(ccr_image)
+    if mono:
+        # Collapse to one sample per pixel with Rec.601 — the same weights, at
+        # the same point relative to the tone curve, as the render's
+        # _to_grayscale, so the exported luminance equals the previewed one. The
+        # weights sum to 1.0, so this is EXACTLY identity when the channels are
+        # already equal (which the forced-grey render guarantees); it stays
+        # well-defined rather than an arbitrary channel pick otherwise.
+        out_u16, icc = apply_export_colorspace_gray(
+            cv2.cvtColor(rgb_u16, cv2.COLOR_RGB2GRAY), output_colorspace)
+    else:
+        # Re-encode to the target colour space and get the ICC bytes to embed.
+        out_u16, icc = apply_export_colorspace(rgb_u16, output_colorspace)
     output_path = safe_unicode_path(output_path)
     if jpg_out:
         output_path = os.path.splitext(output_path)[0] + ".jpg"
-        img_8 = cv2.cvtColor(to_8bit(rgb_u16), cv2.COLOR_RGB2BGR)  # RGB -> BGR for cv2
+        # Greyscale encodes straight from the 2-D array (cv2 then writes a
+        # 1-component JFIF); colour needs the RGB -> BGR swap for cv2.
+        img_8 = (to_8bit(out_u16) if mono
+                 else cv2.cvtColor(to_8bit(out_u16), cv2.COLOR_RGB2BGR))
         ok, buf = cv2.imencode(".jpg", img_8,
                                [cv2.IMWRITE_JPEG_QUALITY, int(jpg_quality)])
         if not ok:
@@ -2140,7 +2177,8 @@ def write_export_image(ccr_image, rgb_u16, output_path, jpg_out, jpg_quality,
             raise IOError(f"Failed to save image to {output_path}: {e}")
     else:
         output_path = os.path.splitext(output_path)[0] + ".tiff"
-        if not safe_tifffile_imwrite(output_path, rgb_u16, photometric="rgb",
+        if not safe_tifffile_imwrite(output_path, out_u16,
+                                     photometric="minisblack" if mono else "rgb",
                                      compression="deflate", iccprofile=icc):
             raise IOError(f"Failed to save image to {output_path}")
     print(f"Normalized image saved to {output_path}")
