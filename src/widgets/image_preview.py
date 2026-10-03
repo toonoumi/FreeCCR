@@ -1866,7 +1866,37 @@ class ImagePreview(QWidget):
                 bool(getattr(ccr_backend, "sprocket_mask_white", False)),
                 areas_sig, dust_sig)
 
-    HIRES_MAX_LONG_SIDE = 4500   # bounds non-RAW decodes (RAW half-size passes through)
+    # Legacy cap for the detail decode. Also the FLOOR the zoom-driven tier
+    # never goes below, so no zoom level renders softer than it used to
+    # (spec/full-res-zoom.md §3.2).
+    HIRES_MAX_LONG_SIDE = 4500
+
+    def _hires_target_long_side(self):
+        """`(preview, max_long_side)` for the tile the CURRENT zoom needs.
+
+        The whole frame occupies `_current_percent() * source_long` screen
+        pixels, so that is exactly how many source pixels the tile must carry to
+        stop being magnified — at 100% zoom, the source's own resolution. This
+        covers crop magnification for free: a confirmed crop raises the view
+        scale, and tile and preview carry the same crop, so the requirement on
+        the full-frame tile is the same expression. The model turns the request
+        into a decode (and floors it at today's resolution).
+
+        Settings → General → Zoom off ⇒ the legacy request, unchanged.
+        See spec/full-res-zoom.md §3.
+        """
+        img = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        decide = getattr(img, "hires_decode_request", None)
+        if decide is None:
+            return True, self.HIRES_MAX_LONG_SIDE
+        want = None
+        if getattr(ccr_backend, "full_res_zoom", True):
+            pct = self._current_percent()
+            full = getattr(img, "original_full_size", None)
+            if pct and full:
+                want = int(round(pct * max(full)))
+        return decide(want, self.HIRES_MAX_LONG_SIDE)
 
     def _maybe_request_hires(self):
         if not self._zoomed_in_enough() or self.current_idx is None:
@@ -1878,32 +1908,44 @@ class ImagePreview(QWidget):
         if sig is None:
             return  # no color-matched replay possible for this image
         adj_sig = self._current_adj_sig()
+        preview_decode, target = self._hires_target_long_side()
         cache = self._hires
         base = None
         sprocket_alpha = None
+        res = target
         if cache is not None and cache["img"] is img and cache["sig"] == sig:
-            if cache.get("full_pm") is not None and cache.get("adj_sig") == adj_sig:
-                # Cache is current — just make sure it is displayed
-                self._refresh_item_pixmap()
-                self.apply_transformations()
-                return
-            base = cache.get("base")  # re-adjust only; skip decode+convert
-            sprocket_alpha = cache.get("sprocket_alpha")  # reuse with the cached base
+            # A tile rendered for a LOWER zoom carries too few pixels for this
+            # one, so its base has to be re-decoded rather than re-adjusted. A
+            # tile sharper than needed is kept exactly as it is — resolution is
+            # never downgraded on zoom-out (spec/full-res-zoom.md §5.2).
+            if int(cache.get("res") or 0) >= target:
+                if cache.get("full_pm") is not None and cache.get("adj_sig") == adj_sig:
+                    # Cache is current — just make sure it is displayed
+                    self._refresh_item_pixmap()
+                    self.apply_transformations()
+                    return
+                base = cache.get("base")  # re-adjust only; skip decode+convert
+                sprocket_alpha = cache.get("sprocket_alpha")  # reuse with the cached base
+                if base is not None:
+                    res = int(cache["res"])   # the reused base's own resolution
         # A matching render may already be in flight; its result is accepted
-        # by current-state validation, so waiting for it is always safe.
+        # by current-state validation, so waiting for it is always safe — but
+        # only when it is rendering at least as many pixels as we now need.
         for w in self._hires_workers:
             if (w.isRunning() and w.req_img is img
-                    and w.req_sig == sig and w.req_adj_sig == adj_sig):
+                    and w.req_sig == sig and w.req_adj_sig == adj_sig
+                    and getattr(w, "req_res", 0) >= target):
                 return
-        worker = HiResDetailWorker(img, sig, adj_sig, base,
-                                   self.HIRES_MAX_LONG_SIDE,
-                                   sprocket_alpha=sprocket_alpha)
+        worker = HiResDetailWorker(img, sig, adj_sig, base, target,
+                                   sprocket_alpha=sprocket_alpha,
+                                   preview=preview_decode, res=res)
         worker.finished_hires.connect(self._on_hires_ready)
         worker.finished.connect(lambda w=worker: self._hires_workers.discard(w))
         self._hires_workers.add(worker)
         worker.start()
 
-    def _on_hires_ready(self, img_obj, sig, adj_sig, base, sprocket_alpha, display8):
+    def _on_hires_ready(self, img_obj, sig, adj_sig, base, sprocket_alpha,
+                        display8, res=0):
         # Accept by validating against CURRENT state (not a generation
         # counter): the result is useful iff the same image object is still
         # displayed, its conversion snapshot still matches, and we are still
@@ -1922,13 +1964,13 @@ class ImagePreview(QWidget):
             # the adjusted display is not — keep the base, re-render shortly.
             self._hires = {"img": img_obj, "sig": sig, "adj_sig": None,
                            "base": base, "sprocket_alpha": sprocket_alpha,
-                           "full_pm": None,
+                           "full_pm": None, "res": int(res),
                            "display_pm": None, "crop_sig": None}
             self._hires_timer.start(150)
             return
         self._hires = {"img": img_obj, "sig": sig, "adj_sig": adj_sig, "base": base,
                        "sprocket_alpha": sprocket_alpha,
-                       "full_pm": QPixmap.fromImage(qimg),
+                       "full_pm": QPixmap.fromImage(qimg), "res": int(res),
                        "display_pm": None, "crop_sig": None}
         self._refresh_item_pixmap()
         self.apply_transformations()
@@ -4504,20 +4546,20 @@ class SliceProgressDialog(QDialog):
 
 
 class HiResDetailWorker(QThread):
-    """Renders the zoom detail image off the GUI thread: decode the RAW at
-    half size (non-RAW capped at max_long_side), replay the conversion
-    color-matched to the preview, apply the adjustments, and hand back both
-    the pre-adjustment base (cached for fast slider re-renders) and the
-    displayable 8-bit result. ALL mutable display state is snapshotted at
-    construction time (on the GUI thread), so concurrent edits cannot bleed
-    into the render."""
+    """Renders the zoom detail image off the GUI thread: decode at the
+    requested resolution (`preview` picks the RAW half-size decode vs the full
+    one, both capped at max_long_side), replay the conversion color-matched to
+    the preview, apply the adjustments, and hand back both the pre-adjustment
+    base (cached for fast slider re-renders) and the displayable 8-bit result.
+    ALL mutable display state is snapshotted at construction time (on the GUI
+    thread), so concurrent edits cannot bleed into the render."""
 
-    finished_hires = Signal(object, object, object, object, object, object)
+    finished_hires = Signal(object, object, object, object, object, object, object)
     # img_obj, sig, adj_sig, base (uint16 ndarray), sprocket_alpha (uint8|None),
-    # display8 (uint8 ndarray)
+    # display8 (uint8 ndarray), res (long side the tile was rendered for)
 
     def __init__(self, img_obj, sig, adj_sig, base=None, max_long_side=None,
-                 sprocket_alpha=None, parent=None):
+                 sprocket_alpha=None, parent=None, preview=True, res=None):
         super().__init__(parent)
         self._img = img_obj
         self.req_img = img_obj
@@ -4526,6 +4568,11 @@ class HiResDetailWorker(QThread):
         self._base = base
         self._sprocket_alpha = sprocket_alpha
         self._cap = max_long_side
+        # Half-size vs full decode (spec/full-res-zoom.md §3.2), and the long
+        # side the resulting tile stands for — which is the REUSED base's own
+        # resolution when one was handed in, not the request.
+        self._preview = bool(preview)
+        self.req_res = int(res if res is not None else (max_long_side or 0))
         # Snapshots taken on the GUI thread at request time:
         self._settings = dict(img_obj.adjustment_settings)
         # Deep copy: each area nests settings + geometry dicts the GUI thread
@@ -4560,7 +4607,8 @@ class HiResDetailWorker(QThread):
             if base is None:
                 base, sprocket_alpha = self._img.render_hires_base(
                     max_long_side=self._cap,
-                    conversion_inputs=self._conversion_inputs)
+                    conversion_inputs=self._conversion_inputs,
+                    preview=self._preview)
             if base is None or self.isInterruptionRequested():
                 return
             t1 = _time.perf_counter()
@@ -4592,7 +4640,7 @@ class HiResDetailWorker(QThread):
                 return  # app is closing — receiver is being torn down
             self.finished_hires.emit(self.req_img, self.req_sig,
                                      self.req_adj_sig, base, sprocket_alpha,
-                                     display8)
+                                     display8, self.req_res)
         except Exception as e:
             print(f"Hi-res detail render failed: {e}")
 

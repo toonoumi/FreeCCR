@@ -1853,13 +1853,56 @@ class CCRImage:
             adjusted = apply_curves(adjusted, curves)
         return adjusted
 
-    def render_hires_base(self, max_long_side: Optional[int] = None,
-                          conversion_inputs=None):
+    def _honours_half_size(self) -> bool:
+        """True when read_image(preview=True) actually HALVES this image's
+        resolution. RAW does (libraw half_size); a merge does in monochrome and
+        demosaic modes. The single-photosite Bayer merge ignores the flag (its
+        half-sensor read IS its full resolution, and original_full_size reports
+        that), as does every non-RAW decoder — for those, half == full."""
+        if getattr(self, "is_merged", False) and self.merge_sources:
+            return bool(getattr(self, "merge_mono", False)
+                        or getattr(self, "merge_demosaic", True))
+        from core.export_estimator import RAW_EXTS
+        return os.path.splitext(self.file_path or "")[1].lower() in RAW_EXTS
+
+    def hires_decode_request(self, want_long: Optional[int],
+                             legacy_cap: int) -> tuple:
+        """Pick the decode for a zoom detail tile that needs `want_long` source
+        pixels across the long edge; returns `(preview, max_long_side)` to hand
+        to read_image. See spec/full-res-zoom.md §3.2.
+
+        The target is FLOORED at the resolution the legacy request produced
+        (`preview=True` capped at legacy_cap), so no zoom level — including the
+        fitted view in dust mode, which asks for very little — can come back
+        softer than it used to. It is ceilinged at the source's own resolution,
+        since zooming past 100% cannot invent pixels. A half-size decode is
+        requested whenever it still satisfies the target, exactly like
+        ccr_processor._load_export_source.
+
+        want_long None (feature off, or the zoom is unknown) => the legacy
+        request, byte-for-byte unchanged.
         """
-        Re-decode this image and reproduce its conversion at the RAW
-        half-size resolution (capped at max_long_side — important for
-        non-RAW sources, which otherwise decode at FULL resolution),
-        color-matched to the 1080 preview: the conversion is replayed from
+        cap = int(legacy_cap)
+        full = getattr(self, "original_full_size", None)
+        source_long = max(full) if full else 0
+        if not want_long or source_long <= 0:
+            return True, cap
+        half_long = source_long // 2 if self._honours_half_size() else source_long
+        floor = min(half_long, cap) if half_long > 0 else cap
+        target = max(int(floor), min(int(want_long), source_long))
+        return half_long >= target, target
+
+    def render_hires_base(self, max_long_side: Optional[int] = None,
+                          conversion_inputs=None, preview: bool = True):
+        """
+        Re-decode this image and reproduce its conversion at the resolution the
+        caller asks for — `preview=True` is the RAW half-size decode, False the
+        FULL-resolution one (what 100% zoom needs), both capped at
+        max_long_side (important for non-RAW sources, which otherwise decode at
+        full resolution regardless). `preview` is appended LAST so the existing
+        positional callers are unaffected. See spec/full-res-zoom.md.
+
+        The replay is color-matched to the 1080 preview: the conversion comes from
         the snapshot captured at convert time (conversion_inputs), never
         from live editable state, so it always matches what the preview
         shows. Runs on a worker thread for the zoom detail view; never
@@ -1875,7 +1918,8 @@ class CCRImage:
         if self.converted and ci is None:
             return None, None  # converted through an unknown path — no replay possible
         t0 = time.time()
-        img = self.read_image(self.file_path, preview=True, max_long_side=max_long_side)
+        img = self.read_image(self.file_path, preview=preview,
+                              max_long_side=max_long_side)
         if img is None:
             return None, None
         print(f"Hi-res decode: {time.time() - t0:.2f}s, shape {img.shape}")

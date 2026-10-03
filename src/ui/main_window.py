@@ -267,6 +267,11 @@ class MainWindow(QMainWindow):
         # midtone moves don't shift hue. See spec/gamma-luminance-mode.md.
         ccr_backend.gamma_luminance = self._settings.value(
             "adjust/gamma_luminance", False, type=bool)
+        # Restore full-resolution zoom (default ON): the zoom detail tile is
+        # decoded at whatever resolution the zoom needs, up to the source's own,
+        # so 100% shows real source pixels. See spec/full-res-zoom.md.
+        ccr_backend.full_res_zoom = self._settings.value(
+            "view/full_res_zoom", True, type=bool)
         # Restore the Auto WB toggle + algorithm (defaults OFF / Gray World).
         # When on, a fresh conversion writes AWB-estimated temperature/tint into
         # the image's sliders — only when neither is already set. Affects only
@@ -1010,6 +1015,31 @@ class MainWindow(QMainWindow):
             if checked else
             "Converting without a black point will no longer ask — it does a "
             "direct invert; grade it with Channel Levels.",
+            duration=5000)
+
+    # --- Full-resolution zoom (global, persistent) ------------------------
+    def on_full_res_zoom_toggled(self, checked: bool):
+        """Flip the full-resolution zoom flag and persist it. This changes
+        RESOLUTION, not the look — nothing is baked, re-converted or
+        re-rendered, so unlike on_auto_gain_toggled there is no reprocess pass.
+        Turning it on asks the current view for a sharper tile; turning it off
+        frees the oversized one. See spec/full-res-zoom.md §5.4."""
+        ccr_backend.full_res_zoom = bool(checked)
+        self._settings.setValue("view/full_res_zoom", bool(checked))
+        if not checked:
+            # Free the oversized tile. Nothing else would drop it: resolution is
+            # deliberately not part of the adjustment signature.
+            self.image_preview._release_hires(refresh=False)
+        # Re-evaluate the current view either way — on it asks for a sharper
+        # tile (the existing one stays visible meanwhile), off re-requests at
+        # the legacy resolution, so turning it off never leaves the view
+        # blurrier than it would have been with the feature absent.
+        self.image_preview._update_hires_state()
+        self.sliders_panel.set_temporary_hint(
+            "Full-resolution zoom on — 100% shows real source pixels."
+            if checked else
+            "Full-resolution zoom off — zoom detail stays at the half-size "
+            "decode.",
             duration=5000)
 
     # --- Input transfer function (non-RAW / TIFF decode space) ------------

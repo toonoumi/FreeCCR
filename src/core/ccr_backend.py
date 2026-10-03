@@ -113,6 +113,12 @@ class CCRBackend:
         # (hue-preserving). Global display mode, persisted by MainWindow. See
         # spec/gamma-luminance-mode.md.
         self.gamma_luminance: bool = False
+        # Full-resolution zoom: when True, the zoom detail tile is decoded at
+        # whatever resolution the current zoom needs, up to the source's own —
+        # so 100% shows real source pixels instead of a half-size decode scaled
+        # up. Costs a full decode and a whole-frame buffer per zoomed image.
+        # Global display mode, persisted by MainWindow. See spec/full-res-zoom.md.
+        self.full_res_zoom: bool = True
         # Auto white balance: when True, a fresh conversion writes AWB-estimated
         # temperature/tint into the image's sliders — only when neither is
         # already set. The algorithm id selects the estimator (core/awb.py).

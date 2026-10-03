@@ -210,6 +210,20 @@ class SettingsDialog(QDialog):
             "export, so no adjustment tints it. B/W-point conversions only."))
         lay.addWidget(grp_border)
 
+        grp_zoom = QGroupBox("Zoom")
+        gz = QVBoxLayout(grp_zoom)
+        gz.setSpacing(theme.GAP_ROW)
+        self._cb_full_res_zoom = QCheckBox("Load full resolution at 100% zoom")
+        gz.addWidget(self._cb_full_res_zoom)
+        gz.addWidget(self._muted(
+            "Zooming in re-decodes the frame at the resolution the zoom needs, "
+            "up to the file's own — so 100% shows one real source pixel per "
+            "screen pixel instead of a half-size decode scaled up. The current "
+            "detail stays on screen until the sharper render is ready. Turn off "
+            "to keep zoom detail at the half-size decode, which uses "
+            "noticeably less memory and time on large files."))
+        lay.addWidget(grp_zoom)
+
         grp_keys = QGroupBox("Keyboard")
         gk = QVBoxLayout(grp_keys)
         gk.setSpacing(theme.GAP_ROW)
@@ -493,6 +507,8 @@ class SettingsDialog(QDialog):
                         (self._cb_auto_awb, ccr_backend.auto_awb),
                         (self._cb_gamma_lum, ccr_backend.gamma_luminance),
                         (self._cb_sprocket, ccr_backend.sprocket_mask_white),
+                        (self._cb_full_res_zoom,
+                         getattr(ccr_backend, "full_res_zoom", True)),
                         (self._cb_balance_hotkeys,
                          getattr(ccr_backend, "balance_hotkeys", False)),
                         (self._cb_mono_raw,
@@ -560,6 +576,11 @@ class SettingsDialog(QDialog):
                 != bool(getattr(ccr_backend, "warn_no_anchor_convert", True))):
             self._mw.on_warn_no_anchor_toggled(
                 bool(self._cb_warn_no_anchor.isChecked()))
+        # Resolution-only, display-only: no reprocess pass (§5.4).
+        if (bool(self._cb_full_res_zoom.isChecked())
+                != bool(getattr(ccr_backend, "full_res_zoom", True))):
+            self._mw.on_full_res_zoom_toggled(
+                bool(self._cb_full_res_zoom.isChecked()))
         # Input colour space — affects the NEXT import only, so nothing is
         # re-decoded here (spec/input-transfer-function.md §4.2).
         if (bool(self._cb_tiff_ask.isChecked())
