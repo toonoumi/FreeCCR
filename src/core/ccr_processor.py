@@ -3717,6 +3717,41 @@ def apply_curves(img16: np.ndarray, curves) -> np.ndarray:
 _GAMMA_MAX_OFFSET = 63.75   # perpendicular offset (0..255 domain) at slider +-100
 
 
+# --- Positive-mode base render curve ---------------------------------------- #
+# A transfer function (BT.709/sRGB) is not a RENDERING. Every raw developer adds
+# a base curve on top of it -- Adobe's ProfileToneCurve, darktable's base curve --
+# which is why a positive looks flat and dark here while Lightroom looks normal
+# with "no adjustments".
+#
+# Fitted to the camera's OWN embedded JPEG rendering (the manufacturer's intended
+# look, and roughly what Adobe's camera profiles target) across a 16-frame roll:
+# a log-domain sigmoid, pivot 0.300, k 1.80, rmse 0.036. Fitted against the
+# NEUTRAL monochrome decode -- an earlier fit against the colour decode was
+# biased by that path's heavy magenta cast and came out ~0.09 too dark at the
+# median.
+#
+# Deliberately a SMOOTH PARAMETRIC fit rather than the raw histogram match of
+# ours->camera: that match demanded a slope of 3.4 through the midtones, an
+# artifact of the camera's per-frame auto tone acting on bimodal negative
+# histograms. Baking it would posterise the midtones. Max slope here is 2.60.
+#
+# Shape: a toe that deepens the deep shadows, a strong midtone lift, and a
+# shoulder compressing highlights toward white -- measured p10 0.030->0.020,
+# p50 0.243->0.537, p90 0.617->0.820. A single gamma cannot do this (it lifts
+# shadows where the camera darkens them). See spec/positive-base-curve.md.
+POSITIVE_BASE_CURVE = [[0.0, 0.0], [12.8, 2.5], [30.6, 22.6], [63.8, 102.2],
+                       [102.0, 180.6], [153.0, 228.4], [204.0, 246.9],
+                       [255.0, 255.0]]
+
+
+def positive_base_curve_points(strength):
+    """The base render curve at `strength` percent, blended toward the identity
+    diagonal: 0 -> identity (no curve at all), 100 -> the full fitted curve.
+    Blending the control points keeps the result monotone at every strength."""
+    t = max(0, min(100, int(strength))) / 100.0
+    return [[x, x + t * (y - x)] for x, y in POSITIVE_BASE_CURVE]
+
+
 def gamma_curve_points(gamma: float):
     """The 3-point 'rgb' control-point list for a Gamma slider value, in the
     0..255 domain used by the Curves editor. gamma=0 -> identity diagonal."""

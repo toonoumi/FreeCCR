@@ -331,10 +331,18 @@ def test_mono_toggle_reads_the_whole_mosaic_at_full_resolution(fake_rawpy):
     assert out.shape == (6, 8, 3) and out.dtype == np.uint16
     assert img.decoded_mono is True
     assert img.original_full_size == (6, 8)
-    # Three identical channels, each (mosaic - its black) * 65535/white_level.
+    # Three identical channels, each (mosaic - its black), per-phase normalised,
+    # then * 65535/white_level. The normalisation is what removes a converted
+    # sensor's residual checkerboard (spec/mono-positive-render.md); on a real
+    # frame it is a small fixed correction, but this 6x8 fixture is a RAMP, whose
+    # four phases genuinely differ, so it moves these values a lot.
     np.testing.assert_array_equal(out[..., 0], out[..., 1])
     np.testing.assert_array_equal(out[..., 0], out[..., 2])
-    expect = np.clip(value * (65535.0 / raw.white_level), 0, 65535)
+    # The read rounds to uint16 before the white-level scale, so model that
+    # round trip rather than loosening the tolerance — the scale multiplies any
+    # quantisation error by 65535/white_level (~4x here).
+    normalised = np.rint(ccr_merge.normalize_cfa_phases(value)).astype(np.uint16)
+    expect = np.clip(normalised * (65535.0 / raw.white_level), 0, 65535)
     assert np.abs(out[..., 0].astype(np.float32) - expect).max() <= 1.0
     # Exactly the shared ccr_merge read (one implementation, two features).
     plane = ccr_merge.mono_plane_from_mosaic(

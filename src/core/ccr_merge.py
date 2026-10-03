@@ -250,6 +250,38 @@ def mono_plane_from_mosaic(mosaic: np.ndarray, colors=None,
     return plane
 
 
+def normalize_cfa_phases(plane: np.ndarray) -> np.ndarray:
+    """Flatten the fixed 2x2 gain pattern a MONO-CONVERTED sensor leaves behind.
+
+    Stripping a colour filter array is never perfect: each of the four photosite
+    phases keeps a slightly different sensitivity, so a monochrome read prints a
+    fine checkerboard over every flat area. Measured on a converted body, the
+    four phases sat at 1577.7 / 1357.6 / 1350.0 / 1496.8 — a 15.75% spread, with
+    the two greens matching each other to 0.5%.
+
+    The residual is a FIXED, purely multiplicative sensor property, not scene
+    colour: across 16 frames of wildly different subjects the per-phase gains
+    varied by only 0.23-0.64%, and the R/B ratio varied 0.8% across the frame
+    where a live CFA varies ~50%. So scaling each phase to their common mean
+    removes it exactly (measured 15.75% -> 0.00%) without touching image detail.
+
+    Computed per frame rather than baked, so it self-calibrates to any body; it
+    is stable enough that this cannot flicker across a roll. Pure — unit-testable
+    without rawpy. See spec/mono-positive-render.md."""
+    p = np.array(plane, dtype=np.float32, copy=True)
+    if p.ndim != 2:
+        raise ValueError(f"expected a 2-D sensor plane, got shape {p.shape}")
+    means = [float(p[dy::2, dx::2].mean())
+             for dy in (0, 1) for dx in (0, 1)]
+    target = float(np.mean(means))
+    if target <= 0:
+        return p
+    for (dy, dx), m in zip([(0, 0), (0, 1), (1, 0), (1, 1)], means):
+        if m > 0:
+            p[dy::2, dx::2] *= target / m
+    return p
+
+
 def bin2x2(plane: np.ndarray) -> np.ndarray:
     """2x2 box-average downsample (an odd trailing row/column is dropped) —
     the monochrome read's half-size preview, the counterpart of libraw's

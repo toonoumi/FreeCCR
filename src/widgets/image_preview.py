@@ -1851,7 +1851,7 @@ class ImagePreview(QWidget):
         return (tuple(sorted(img.adjustment_settings.items())),
                 img.contrast_base, img.temperature_base, img.brightness_base,
                 getattr(img, "exposure_base", 0.0),
-                getattr(img, "gamma_base", 0),
+                getattr(img, "base_curve", 0),
                 getattr(img, "color_profile", "color"),
                 # Global display modes read live inside apply_adjustments — a
                 # toggle must invalidate the baked hi-res tile (spec/auto-gain.md,
@@ -4535,10 +4535,10 @@ class HiResDetailWorker(QThread):
         self._temperature_base = img_obj.temperature_base
         self._brightness_base = img_obj.brightness_base
         self._exposure_base = getattr(img_obj, "exposure_base", 0.0)
-        # Positive-mode base tone curve: snapshot it like every other base
+        # Positive-mode base render curve: snapshot it like every other base
         # offset, or the zoomed tile renders without the curve the preview has
-        # and the detail layer no longer matches. See spec/positive-base-gamma.md.
-        self._gamma_base = getattr(img_obj, "gamma_base", 0)
+        # and the detail layer no longer matches. See spec/positive-base-curve.md.
+        self._base_curve = getattr(img_obj, "base_curve", 0)
         self._converted = img_obj.converted
         # Captured at request time (thread-safe): positive mode skips the
         # negative display auto-brightness, like update_thumbnail_and_preview.
@@ -4571,7 +4571,7 @@ class HiResDetailWorker(QThread):
                 brightness_base=self._brightness_base,
                 exposure_base=self._exposure_base,
                 areas_override=self._areas,
-                gamma_base=self._gamma_base)
+                base_curve=self._base_curve)
             if not self._converted and not self._positive_mode:
                 # Mirror the preview pipeline: adjustments first, then the
                 # display-only auto-brightness stretch for raw negatives

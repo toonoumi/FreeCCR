@@ -505,10 +505,10 @@ class TestBrightnessBaseline:
     film-negative default) applies a gamma-1.3 darkening that crushes shadows;
     positives must use a neutral 0.
 
-    They do carry their own base TONE CURVE (gamma_base) — a pinned-endpoint
-    midtone lift, which is a different thing from the negative look offset and
-    is what every raw developer applies on top of the transfer function. See
-    spec/positive-base-gamma.md."""
+    They do carry their own base RENDER CURVE (base_curve) — an S-curve with
+    pinned endpoints, which is a different thing from the negative look offset
+    and is what every raw developer applies on top of the transfer function. See
+    spec/positive-base-curve.md."""
 
     def test_negative_brightness_base_crushes_shadows_positive_is_identity(self):
         shadow = np.full((4, 4, 3), 8000, dtype=np.uint16)
@@ -525,28 +525,28 @@ class TestBrightnessBaseline:
         assert CCRImage(path).brightness_base == -8            # negatives keep the look
 
     def test_fresh_positive_preview_pipeline_is_identity(self, tmp_path, backend):
-        # With no user sliders and the base tone curve OFF, the preview pipeline
-        # is an identity on the decoded positive — no clipping/darkening step
-        # sneaks in. Positives now start from a base gamma
-        # (spec/positive-base-gamma.md), so it is disabled explicitly here; the
+        # With no user sliders and the base render curve OFF, the preview
+        # pipeline is an identity on the decoded positive — no clipping/darkening
+        # step sneaks in. Positives now start from a base render curve
+        # (spec/positive-base-curve.md), so it is disabled explicitly here; the
         # guarantee this test exists for is about every OTHER stage.
         path = _scan_png(tmp_path)
         backend.positive_mode = True
         pos = CCRImage(path)
-        out = pos.apply_adjustments(pos.resized_raw, gamma_base=0)
+        out = pos.apply_adjustments(pos.resized_raw, base_curve=0)
         np.testing.assert_array_equal(out, pos.resized_raw)
 
-    def test_fresh_positive_starts_from_the_base_tone_curve(self, tmp_path, backend):
+    def test_fresh_positive_starts_from_the_base_render_curve(self, tmp_path, backend):
         # The flip side of the test above: by default a positive DOES carry the
-        # base curve, because the decode places white at sensor saturation and
-        # leaves the midtones low. See spec/positive-base-gamma.md.
+        # base render curve, because a transfer function is not a rendering —
+        # the decode leaves the midtones low. See spec/positive-base-curve.md.
         path = _scan_png(tmp_path)
         backend.positive_mode = True
         pos = CCRImage(path)
-        assert pos.gamma_base > 0
+        assert pos.base_curve > 0
         assert pos.apply_adjustments(pos.resized_raw).mean() > pos.resized_raw.mean()
         backend.positive_mode = False
-        assert CCRImage(path).gamma_base == 0          # negatives keep none
+        assert CCRImage(path).base_curve == 0          # negatives keep none
 
 
 class TestHiResSignature:
