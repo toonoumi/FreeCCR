@@ -249,6 +249,15 @@ class MainWindow(QMainWindow):
         # Confirm before a no-anchor conversion (spec/no-anchor-convert.md).
         ccr_backend.warn_no_anchor_convert = self._settings.value(
             "convert/warn_no_anchor", True, type=bool)
+        # Input transfer function for non-RAW (TIFF) imports: ask on import by
+        # default, and remember the answer when the user opts out of asking.
+        # Affects the NEXT import only. See spec/input-transfer-function.md.
+        ccr_backend.tiff_transfer_ask = self._settings.value(
+            "input/tiff_transfer_ask", True, type=bool)
+        ccr_backend.tiff_transfer_mode = self._settings.value(
+            "input/tiff_transfer_mode", "linear", type=str)
+        ccr_backend.tiff_transfer_manual = self._settings.value(
+            "input/tiff_transfer_manual", "srgb", type=str)
         # Restore the Gamma application mode (default OFF = per-channel). When on,
         # the Gamma slider is applied to luminance and RGB is scaled together, so
         # midtone moves don't shift hue. See spec/gamma-luminance-mode.md.
@@ -973,6 +982,68 @@ class MainWindow(QMainWindow):
             "direct invert; grade it with Channel Levels.",
             duration=5000)
 
+    # --- Input transfer function (non-RAW / TIFF decode space) ------------
+    def on_tiff_transfer_ask_toggled(self, checked: bool):
+        """Whether an import containing TIFFs asks how to read their encoding.
+        Affects the NEXT import only — nothing loaded is re-decoded, because the
+        transfer is captured per image at import time.
+        See spec/input-transfer-function.md."""
+        ccr_backend.tiff_transfer_ask = bool(checked)
+        self._settings.setValue("input/tiff_transfer_ask", bool(checked))
+
+    def on_tiff_transfer_mode_changed(self, mode: str):
+        """The remembered answer used when the import dialog is suppressed."""
+        ccr_backend.tiff_transfer_mode = str(mode)
+        self._settings.setValue("input/tiff_transfer_mode", str(mode))
+
+    def on_tiff_transfer_manual_changed(self, value: str):
+        """The space forced when the remembered answer is 'manual'."""
+        ccr_backend.tiff_transfer_manual = str(value)
+        self._settings.setValue("input/tiff_transfer_manual", str(value))
+
+    @staticmethod
+    def _folder_tiffs(folder: str) -> list:
+        """The TIFFs an Open Folder import would see — non-recursive, matching
+        that scope, without duplicating the loader's extension list."""
+        from core import input_transfer as it
+        try:
+            names = [e.path for e in os.scandir(folder) if e.is_file()]
+        except OSError:
+            return []
+        return [p for p in names if it.is_tiff(p)]
+
+    def _maybe_ask_input_transfer(self, paths) -> bool:
+        """Settle how this import reads its TIFFs, recording the answer in the
+        transient ccr_backend.import_transfer that the loader reads.
+
+        Returns False when the user cancelled — the import must then not start,
+        because the answer changes every pixel the conversion sees, so "no
+        answer" must never silently mean linear.
+        See spec/input-transfer-function.md §4.1."""
+        from core import input_transfer as it
+        from widgets.input_transfer_dialog import (InputTransferDialog,
+                                                   decision_for)
+        tiffs = it.tiffs_in(paths)
+        if not tiffs:
+            # Nothing to decide (no TIFFs, or only FreeCCR's own baked linear
+            # merge TIFFs). Clear any previous batch's answer.
+            ccr_backend.import_transfer = None
+            return True
+        manual = getattr(ccr_backend, "tiff_transfer_manual", it.SRGB)
+        if not getattr(ccr_backend, "tiff_transfer_ask", True):
+            ccr_backend.import_transfer = decision_for(
+                getattr(ccr_backend, "tiff_transfer_mode", "linear"), manual)
+            return True
+        dlg = InputTransferDialog(tiffs, self, manual_default=manual)
+        if not dlg.exec_():                     # Rejected / closed
+            return False
+        ccr_backend.import_transfer = dlg.decision()
+        if dlg.remember():
+            self.on_tiff_transfer_ask_toggled(False)
+            self.on_tiff_transfer_mode_changed(dlg.mode())
+            self.on_tiff_transfer_manual_changed(dlg.manual())
+        return True
+
     def _rerender_all_for_global_mode(self, hint: str):
         """Re-render every loaded image after a global DISPLAY-mode change (Auto
         gain, Gamma mode) that is read live inside apply_adjustments but is NOT
@@ -1361,6 +1432,12 @@ class MainWindow(QMainWindow):
                     if not ok:
                         QMessageBox.warning(self, "3-way RGB merge", err)
                         return
+            # How this batch's TIFFs should be read (metadata / linear / forced).
+            # Asked BEFORE the loader starts; cancelling aborts the import, since
+            # the answer changes every pixel the conversion sees.
+            # See spec/input-transfer-function.md §4.1.
+            if not self._maybe_ask_input_transfer(valid_files):
+                return
             self._launch_loader(files=valid_files)
         else:  # There were files, but all of them were invalid
             QMessageBox.critical(
@@ -1396,6 +1473,13 @@ class MainWindow(QMainWindow):
                 "Unicode Path Warning",
                 f"The selected folder path contains characters that may cause issues:\n\n{folder}\n\nPlease consider using a folder with a simpler path name."
             )
+            return
+
+        # The same TIFF colour-space question as the file-list import. Open
+        # Folder never sees a file list, so scan the folder for TIFFs — non-
+        # recursively, matching its own scope. See spec/input-transfer-function.md §4.1.
+        if not self._maybe_ask_input_transfer(
+                self._folder_tiffs(normalized_folder)):
             return
 
         self._launch_loader(folder=normalized_folder)

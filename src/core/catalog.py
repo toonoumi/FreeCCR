@@ -225,6 +225,12 @@ def serialize_image(img) -> dict:
         # (0..0.01) and is only ever read back (migrated), never written.
         "dust_feather_r": float(getattr(img, "dust_feather", 0.25)),
         "color_profile": getattr(img, "color_profile", "color"),
+        # How this file's own encoding was interpreted at import (None/"linear"
+        # = read as-is, today's behaviour). Purely additive: an absent key is
+        # already the default, so no catalog migration is needed. A fresh
+        # import's explicit decision overrides this; see
+        # spec/input-transfer-function.md §3.
+        "input_transfer": getattr(img, "input_transfer", None),
         "crop_rect": list(img.crop_rect) if img.crop_rect else None,
         "crop_angle": float(img.crop_angle or 0.0),
         "rotation_angle": int(img.rotation_angle),
@@ -525,7 +531,9 @@ def create_images_for_path(file_path: str, path: str = None,
         entries = None
 
     def _plain(restore_failed=False):
-        img = CCRImage(file_path)
+        # A never-seen file still gets this import's decision (there is no
+        # stored value to fall back to). See spec/input-transfer-function.md §3.4.
+        img = CCRImage(file_path, input_transfer=_import_transfer_override())
         img._catalog_signature = signature
         if restore_failed:
             img._catalog_restore_failed = True
@@ -593,6 +601,21 @@ def create_images_for_merge(sources, merge_demosaic: bool = True,
     return images
 
 
+def _import_transfer_override():
+    """The explicit input-transfer decision for the import now running, or None.
+
+    An answer given for THIS import (the dialog, or the remembered default when
+    it is suppressed) beats a cataloged value, because answering is an explicit
+    act about these files; with no decision the stored value stands. Read lazily
+    from the backend so catalog unit tests need no backend state.
+    See spec/input-transfer-function.md §3.4."""
+    try:
+        from core.ccr_backend import ccr_backend
+        return getattr(ccr_backend, "import_transfer", None)
+    except Exception:
+        return None
+
+
 def _restore_image(file_path: str, state: dict, live_merge_sources=None,
                    live_merge_demosaic=None, live_merge_mono=None):
     from core.ccr_image import CCRImage
@@ -631,6 +654,10 @@ def _restore_image(file_path: str, state: dict, live_merge_sources=None,
         merge_sources=merge_sources,
         merge_demosaic=merge_demosaic,
         merge_mono=merge_mono,
+        # This import's explicit answer wins; the stored value is the fallback
+        # (spec/input-transfer-function.md §3.4).
+        input_transfer=(_import_transfer_override()
+                        or state.get("input_transfer")),
     )
     img.is_duplicate = bool(state.get("is_duplicate", False))
     img.dust_spots = copy.deepcopy(state.get("dust_spots") or [])

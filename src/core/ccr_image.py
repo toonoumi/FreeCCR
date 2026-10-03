@@ -100,6 +100,7 @@ class CCRImage:
         merge_demosaic: bool = True,
         ws_windowed: bool = False,
         merge_mono: bool = False,
+        input_transfer: Optional[str] = None,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -159,6 +160,14 @@ class CCRImage:
         # cause away. The load path chains it onto the ValueError it raises so
         # the loader can explain WHY a file was dropped (see core/load_errors).
         self.last_read_error: Optional[BaseException] = None
+        # How this file's own encoding is interpreted by the non-RAW reader:
+        # None/"linear" reads the decoded values as-is (the historical
+        # behaviour), "embedded" resolves the file's own ICC/EXIF tags on every
+        # read, "srgb"/"gamma:<g>"/"rec709" force one. Captured at import and
+        # persisted, so every re-read (preview, zoom, export, slice, B/W
+        # sampling) reproduces the same decode. RAW ignores it (already linear
+        # by construction). See spec/input-transfer-function.md.
+        self.input_transfer: Optional[str] = input_transfer
         # Camera profile (ICC/DCP/none) this image's decode was graded under;
         # stamped on every working decode so the thumbnail can flag a mismatch
         # when the active profile changes. Not persisted (a reload re-stamps).
@@ -905,6 +914,19 @@ class CCRImage:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # Input transfer function: undo this file's OWN encoding so the
+            # density math downstream sees LINEAR data (in Positive mode, the
+            # consistent sRGB display values that path assumes instead). Runs
+            # BEFORE field correction deliberately — a vignetting falloff is
+            # physically multiplicative in linear light, and an .ffc profile is
+            # built through this same reader, so flat and frame are linearised
+            # consistently. Identity (the same array object) when no transfer is
+            # set, which is what keeps untagged files and every pre-existing
+            # catalog bit-for-bit unchanged. See spec/input-transfer-function.md.
+            from core import input_transfer as _input_transfer
+            img = _input_transfer.apply_transfer(
+                img, getattr(self, "input_transfer", None),
+                file_path=file_path, positive=positive_mode)
             # Field correction on the full frame, before the slice chain. The
             # gain is applied in the file's own space (encoded=False): a
             # multiplicative falloff stays multiplicative through a power-law

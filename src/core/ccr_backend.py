@@ -87,6 +87,20 @@ class CCRBackend:
         # so a forgotten black point can't silently convert a whole roll
         # unanchored. Global, persisted by MainWindow. See spec/no-anchor-convert.md.
         self.warn_no_anchor_convert: bool = True
+        # Input transfer function for non-RAW (TIFF) imports: FreeCCR's density
+        # math assumes LINEAR data, but a scanner TIFF is often gamma-encoded.
+        # `ask` shows the import dialog; `mode` ("embedded"|"linear"|"manual")
+        # and `manual` hold the remembered answer used when it is suppressed.
+        # Global, persisted by MainWindow. See spec/input-transfer-function.md.
+        self.tiff_transfer_ask: bool = True
+        self.tiff_transfer_mode: str = "linear"
+        self.tiff_transfer_manual: str = "srgb"
+        # TRANSIENT decision for the import now starting (not persisted): the
+        # token every non-RAW image of this batch is tagged with, or None for
+        # "no explicit decision" (then a cataloged value wins). Set by the UI
+        # immediately before the loader starts, like rgb_merge_demosaic is read
+        # at import and captured per image. See spec/input-transfer-function.md §3.4.
+        self.import_transfer: Optional[str] = None
         # Gamma slider application mode: False = per-channel (default filmic look,
         # shifts hue), True = apply to luminance and scale RGB together
         # (hue-preserving). Global display mode, persisted by MainWindow. See

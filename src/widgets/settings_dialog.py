@@ -122,6 +122,42 @@ class SettingsDialog(QDialog):
             "confirmation and convert straight away."))
         lay.addWidget(grp_conv)
 
+        # --- Input colour space (non-RAW / TIFF decode space) ------------ #
+        from core.input_transfer import TRANSFER_CHOICES
+        grp_in = QGroupBox("Input colour space")
+        gi = QVBoxLayout(grp_in)
+        gi.setSpacing(theme.GAP_ROW)
+        self._cb_tiff_ask = QCheckBox(
+            "Ask how to read TIFF colour space on import")
+        gi.addWidget(self._cb_tiff_ask)
+        gi.addWidget(self._muted(
+            "FreeCCR's conversion measures optical density, which assumes linear "
+            "data — but a scanner TIFF is often gamma-encoded. When this is on, "
+            "an import containing TIFFs asks whether to use each file's own "
+            "metadata, read them as linear, or force one space."))
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(theme.GAP_BTN)
+        mode_row.addWidget(QLabel("When not asking:"))
+        self._combo_tiff_mode = QComboBox()
+        self._combo_tiff_mode.addItem("Use each file's metadata", "embedded")
+        self._combo_tiff_mode.addItem("Read as linear", "linear")
+        self._combo_tiff_mode.addItem("Specify manually", "manual")
+        mode_row.addWidget(self._combo_tiff_mode, 1)
+        gi.addLayout(mode_row)
+        manual_row = QHBoxLayout()
+        manual_row.setSpacing(theme.GAP_BTN)
+        manual_row.addWidget(QLabel("Manual space:"))
+        self._combo_tiff_manual = QComboBox()
+        for value, label in TRANSFER_CHOICES:
+            self._combo_tiff_manual.addItem(label, value)
+        manual_row.addWidget(self._combo_tiff_manual, 1)
+        gi.addLayout(manual_row)
+        gi.addWidget(self._muted(
+            "Applies to the next import. Images already loaded keep the space "
+            "they were imported with."))
+        self._combo_tiff_mode.currentIndexChanged.connect(self._sync_tiff_rows)
+        lay.addWidget(grp_in)
+
         grp_gamma = QGroupBox("Gamma")
         gg = QVBoxLayout(grp_gamma)
         gg.setSpacing(theme.GAP_ROW)
@@ -198,6 +234,11 @@ class SettingsDialog(QDialog):
         lbl.setWordWrap(True)
         lbl.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         return lbl
+
+    def _sync_tiff_rows(self, *_):
+        """The manual-space combo only applies to the 'Specify manually' default."""
+        self._combo_tiff_manual.setEnabled(
+            self._combo_tiff_mode.currentData() == "manual")
 
     def _build_color_management_page(self) -> QWidget:
         page = QWidget()
@@ -444,6 +485,22 @@ class SettingsDialog(QDialog):
         self._combo_merge_detail.setCurrentIndex(
             self._combo_merge_detail.findData(self._backend_merge_detail()))
         self._combo_merge_detail.blockSignals(False)
+        # Input colour space: the ask toggle, the remembered default, and the
+        # space used when that default is "manual".
+        self._cb_tiff_ask.blockSignals(True)
+        self._cb_tiff_ask.setChecked(
+            bool(getattr(ccr_backend, "tiff_transfer_ask", True)))
+        self._cb_tiff_ask.blockSignals(False)
+        for combo, value in (
+                (self._combo_tiff_mode,
+                 getattr(ccr_backend, "tiff_transfer_mode", "linear")),
+                (self._combo_tiff_manual,
+                 getattr(ccr_backend, "tiff_transfer_manual", "srgb"))):
+            combo.blockSignals(True)
+            idx = combo.findData(value)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        self._sync_tiff_rows()
         self._combo_awb_algo.blockSignals(True)
         idx = self._combo_awb_algo.findData(
             getattr(ccr_backend, "awb_algorithm", AWB_DEFAULT))
@@ -484,6 +541,18 @@ class SettingsDialog(QDialog):
                 != bool(getattr(ccr_backend, "warn_no_anchor_convert", True))):
             self._mw.on_warn_no_anchor_toggled(
                 bool(self._cb_warn_no_anchor.isChecked()))
+        # Input colour space — affects the NEXT import only, so nothing is
+        # re-decoded here (spec/input-transfer-function.md §4.2).
+        if (bool(self._cb_tiff_ask.isChecked())
+                != bool(getattr(ccr_backend, "tiff_transfer_ask", True))):
+            self._mw.on_tiff_transfer_ask_toggled(
+                bool(self._cb_tiff_ask.isChecked()))
+        staged_tiff_mode = self._combo_tiff_mode.currentData()
+        if staged_tiff_mode != getattr(ccr_backend, "tiff_transfer_mode", "linear"):
+            self._mw.on_tiff_transfer_mode_changed(staged_tiff_mode)
+        staged_tiff_manual = self._combo_tiff_manual.currentData()
+        if staged_tiff_manual != getattr(ccr_backend, "tiff_transfer_manual", "srgb"):
+            self._mw.on_tiff_transfer_manual_changed(staged_tiff_manual)
         if bool(self._cb_auto_awb.isChecked()) != bool(ccr_backend.auto_awb):
             self._mw.on_auto_awb_toggled(bool(self._cb_auto_awb.isChecked()))
         staged_algo = self._combo_awb_algo.currentData()

@@ -248,6 +248,51 @@ def romm_encode(x: np.ndarray) -> np.ndarray:
     return np.where(x < Et, 16.0 * x, np.power(x, 1.0 / 1.8))
 
 
+def rec709_decode(v: np.ndarray) -> np.ndarray:
+    """Rec.709 OETF inverse: encoded -> linear. Used by the input-transfer stage
+    (spec/input-transfer-function.md §5.3)."""
+    return np.where(v < 0.081, v / 4.5,
+                    np.power((v + 0.099) / 1.099, 1.0 / 0.45))
+
+
+def transfer_luts_from_icc(icc: bytes) -> "Optional[List[np.ndarray]]":
+    """An embedded profile's TRCs as three device->linear LUTs of 65536 entries
+    (so a uint16 value indexes one directly, no quantisation), or None when the
+    profile carries no usable per-channel curve.
+
+    TRANSFER-FUNCTION ONLY: the colorant matrix is deliberately ignored. The
+    input-transfer stage linearises a non-RAW file's encoding without touching
+    its primaries — a full colorimetric conversion is what the input-ICC path
+    above is for. A grey profile's single kTRC applies to all three channels.
+    See spec/input-transfer-function.md §5.2."""
+    try:
+        tags = _read_tag_table(icc)
+    except Exception:
+        return None
+    rgb = (b'rTRC', b'gTRC', b'bTRC')
+    try:
+        if all(sig in tags for sig in rgb):
+            return [_parse_trc_to_lut(icc, tags[sig][0]) for sig in rgb]
+        if b'kTRC' in tags:
+            lut = _parse_trc_to_lut(icc, tags[b'kTRC'][0])
+            return [lut, lut, lut]
+    except Exception:
+        return None
+    return None
+
+
+def icc_trc_label(icc: bytes) -> str:
+    """Human label for an embedded profile (its description tag when readable),
+    for the import dialog's per-file summary."""
+    try:
+        desc = InputProfile._read_desc(icc, _read_tag_table(icc))
+        if desc:
+            return str(desc).strip()
+    except Exception:
+        pass
+    return "embedded profile"
+
+
 # --------------------------------------------------------------------------- #
 # ICC profile synthesis (matrix-shaper, ICC v2.4 mntr/RGB/XYZ).
 # --------------------------------------------------------------------------- #
