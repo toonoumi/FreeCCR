@@ -29,6 +29,50 @@ except ImportError:
     TIFFFILE_AVAILABLE = False
     logging.warning("tifffile not available, TIFF reading may be limited")
 
+
+# --- Positive-mode base exposure (EXPERIMENT) ------------------------------- #
+# The positive decode maps SENSOR SATURATION to display white and has no
+# auto-exposure anywhere — libraw's auto-bright is off, the preview stretch is
+# skipped for positives, and Auto Gain is gated on `converted` — so every stop of
+# highlight headroom a shot leaves costs a stop of brightness, with nothing
+# compensating. This is the stage-1 "grey placement" gain every raw developer
+# applies (Adobe's BaselineExposure, darktable's exposure module); it runs in
+# LINEAR light inside libraw, BEFORE the gamma encode, which is the correct
+# place for it.
+#
+# Two libraw details that are easy to get wrong:
+#   * exp_shift is a LINEAR MULTIPLIER, not EV -> 2**EV.
+#   * libraw clamps it to [0.25, 8.0] (-2..+3 EV) and SILENTLY ignores anything
+#     larger (verified: 16.0 and 32.0 produce output identical to 8.0), so the
+#     clamp is done here where it is visible.
+# exp_preserve_highlights rolls the top off instead of clipping it, which this
+# needs: measured on a frame with real headroom, +2 EV clips 29% of all pixels
+# at 0.0 but only 10% at 1.0 (2.6% unshifted).
+#
+# Tunable without a rebuild while we evaluate it: FREECCR_POSITIVE_EV=1.5
+# (0 disables it entirely, restoring the previous byte-for-byte decode).
+POSITIVE_BASE_EV = 2.0
+POSITIVE_PRESERVE_HIGHLIGHTS = 1.0
+
+
+def _positive_exp_shift() -> float:
+    """The positive decode's base-exposure gain as a libraw exp_shift (a LINEAR
+    multiplier, 2**EV), clamped to libraw's usable [0.25, 8.0]. Returns exactly
+    1.0 when disabled, which the caller treats as "add no exposure kwargs at
+    all" so the decode stays identical to before this experiment."""
+    ev = POSITIVE_BASE_EV
+    override = os.environ.get("FREECCR_POSITIVE_EV")
+    if override is not None:
+        try:
+            ev = float(override)
+        except ValueError:
+            logging.warning(
+                f"FREECCR_POSITIVE_EV={override!r} is not a number; "
+                f"using {POSITIVE_BASE_EV} EV")
+    if ev == 0:
+        return 1.0
+    return float(min(max(2.0 ** ev, 0.25), 8.0))
+
 try:
     from PIL import Image as PILImage
     PIL_AVAILABLE = True
@@ -595,7 +639,7 @@ class CCRImage:
         camera white balance, AHD demosaic, rawpy auto-brightness (no_icc_default
         is ignored on this path). Kept pure so the choice is unit-testable."""
         if positive:
-            return dict(
+            kw = dict(
                 output_bps=16,
                 # Auto-brightness OFF: rawpy's auto-bright scales until ~1% of
                 # the brightest pixels saturate, CLIPPING highlights to white.
@@ -612,6 +656,14 @@ class CCRImage:
                 output_color=rawpy.ColorSpace.sRGB,
                 four_color_rgb=False,
             )
+            # Base exposure: the grey-placement gain, in linear light before the
+            # gamma encode. Omitted entirely when disabled, so EV=0 is the exact
+            # pre-experiment decode. See _positive_exp_shift above.
+            shift = _positive_exp_shift()
+            if shift != 1.0:
+                kw["exp_shift"] = shift
+                kw["exp_preserve_highlights"] = POSITIVE_PRESERVE_HIGHLIGHTS
+            return kw
         return dict(
             output_bps=16,
             no_auto_bright=True,      # Consistent absolute sensor values across all frames
