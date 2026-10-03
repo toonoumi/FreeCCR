@@ -3664,7 +3664,15 @@ def build_channel_lut(points) -> np.ndarray:
         return x.astype(np.float32)
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
-    y = _monotone_cubic(xs, ys, x)
+    # The endpoints may sit INSIDE the domain — the editor lets them move
+    # horizontally, which is how black-/white-point clipping is expressed. Outside
+    # [xs[0], xs[-1]] the curve HOLDS its endpoint value rather than extrapolating:
+    # that is the levels-style clipping Photoshop gives when you drag the black or
+    # white point inward, and it is also the only safe choice numerically, since
+    # the Hermite polynomial keeps climbing (or turns over, breaking monotonicity)
+    # past the last knot. The 2-point case already holds this way via np.interp;
+    # clamping the query makes n>=3 agree with it.
+    y = _monotone_cubic(xs, ys, np.clip(x, xs[0], xs[-1]))
     return np.clip(y, 0.0, 255.0).astype(np.float32)
 
 

@@ -30,6 +30,13 @@ def _monotone_cubic(xs, ys, xq):
     """Local copy of the Fritsch-Carlson interpolation used for drawing so the
     rendered line matches ccr_processor.apply_curves. Pure-Python, small N."""
     n = len(xs)
+    # Endpoints can be dragged inward, so clamp the query into the endpoint range:
+    # outside it the curve holds its endpoint value. Without this the n==2 branch
+    # below would extrapolate a straight line (np.interp in the processor's copy
+    # holds instead), and the n>=3 branch would extrapolate the polynomial — the
+    # drawn line would disagree with the rendered pixels. See build_channel_lut.
+    lo, hi = xs[0], xs[-1]
+    xq = [min(hi, max(lo, q)) for q in xq]
     if n == 2:
         # Linear
         x0, x1 = xs[0], xs[1]
@@ -241,8 +248,17 @@ class CurveCanvas(QWidget):
                 event.accept()
                 return  # empty space away from the line — do nothing
             # New point sits exactly on the existing curve, strictly between
-            # the endpoints, then the drag reshapes it.
-            x = min(254.0, max(1.0, xc))
+            # the endpoints, then the drag reshapes it. Index 0 and the last
+            # index ARE the endpoints, so a point inserted outside their x range
+            # would silently demote an endpoint into a removable interior point;
+            # clicks on the flat clipped segments therefore add nothing. With
+            # endpoints at 0/255 these bounds are the former 1..254.
+            lo = pts[0][0] + 1.0
+            hi = pts[-1][0] - 1.0
+            if not (lo <= xc <= hi):
+                event.accept()
+                return
+            x = xc
             insert_at = 0
             while insert_at < len(pts) and pts[insert_at][0] < x:
                 insert_at += 1
@@ -263,14 +279,14 @@ class CurveCanvas(QWidget):
         i = self._drag_index
         x, y = self._to_curve(event.position())
         last = len(pts) - 1
-        if i == 0:
-            x = 0.0                      # endpoints: X locked, Y free
-        elif i == last:
-            x = 255.0
-        else:
-            lo = pts[i - 1][0] + 1.0
-            hi = pts[i + 1][0] - 1.0
-            x = min(hi, max(lo, x))
+        # Every point — endpoints included — moves in both axes. Dragging an
+        # endpoint horizontally sets the black/white input point (tones beyond it
+        # clip to its output level). The clamp is therefore uniform: stay strictly
+        # between the neighbours, with the canvas edge standing in for the outer
+        # neighbour an endpoint doesn't have.
+        lo = pts[i - 1][0] + 1.0 if i > 0 else 0.0
+        hi = pts[i + 1][0] - 1.0 if i < last else 255.0
+        x = min(hi, max(lo, x))
         pts[i] = [x, min(255.0, max(0.0, y))]
         self.update()
         self.curveChanged.emit()

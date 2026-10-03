@@ -18,8 +18,9 @@ sections in `SlidersPanel`.
 ### Goals
 - A collapsible "Curves" section in the right panel, **collapsed by default**.
 - An interactive Photoshop-style curve editor widget.
-- 2 fixed, non-removable endpoint control points: bottom-left `(0,0)` and
-  top-right `(255,255)`.
+- 2 non-removable endpoint control points, starting at bottom-left `(0,0)` and
+  top-right `(255,255)`. They are fixed in *identity* only — both are draggable
+  in **X and Y** (see §10), which is what expresses black-/white-point clipping.
 - Left-click on the curve area adds a draggable control point.
 - Drag a control point to reshape the curve.
 - Right-click on a control point removes it (endpoints excepted).
@@ -70,17 +71,19 @@ preceded by a horizontal separator, matching the existing pattern.
   rule).
 - **Left-press on the curve line** (within `CURVE_HIT = 8 px` of the drawn
   curve, vertically) but not on an existing point: create a new control point
-  **on the curve** at that input x and immediately begin dragging it.
+  **on the curve** at that input x and immediately begin dragging it — provided x
+  lies strictly between the two endpoints (§10.3).
 - **Left-press on empty canvas** away from both the curve and any point: does
   nothing (no point is created). New points only come from clicking the line.
 - **Mouse grab**: on starting a drag (create or grab) the canvas calls
   `grabMouse()` and releases it on mouse-release. This is required because the
   curve canvas lives inside the panel's `QScrollArea`, which otherwise steals
   the move events mid-drag (the point would not follow the cursor).
-- **Drag**: moves the grabbed point.
-  - Endpoints (`x==0` and `x==255`): X is locked; Y is draggable `[0,255]`.
-  - Interior points: X clamped to stay strictly between the two neighbour points
-    (with a 1-unit min gap); Y clamped to `[0,255]`.
+- **Drag**: moves the grabbed point. The clamp is **uniform** across all points:
+  X stays strictly between the two neighbours (1-unit min gap), Y clamped to
+  `[0,255]`. An endpoint has no outer neighbour, so the canvas edge (`0` for the
+  first point, `255` for the last) stands in for it — i.e. endpoints move freely
+  in both axes. See §10.
   - Release ends the drag.
 - **Right-press on an existing interior point's hit area**: remove that point.
   Endpoints cannot be removed (right-click on them is ignored).
@@ -238,9 +241,11 @@ Manual:
 ## 9. Refinement (v2) — resolved decisions & added detail
 
 ### 9.1 Resolved open questions
-1. **Endpoint draggability**: endpoints keep X locked (`0` and `255`) but Y is
-   freely draggable in `[0,255]`. This gives black-/white-point lift the same way
-   Photoshop does and keeps the curve a total function over the full input range.
+1. **Endpoint draggability**: ~~endpoints keep X locked (`0` and `255`) but Y is
+   freely draggable in `[0,255]`~~ — **SUPERSEDED by §10**: endpoints are now
+   draggable in X as well. The "total function over the full input range"
+   property is preserved by holding the endpoint value outside the endpoint
+   range, not by pinning X.
 2. **Main "Reset" clears curves**: YES. The rebuilt all-zero adjustment dict
    simply omits `"curves"`, and `on_reset_clicked` also calls
    `curve_editor.set_curves(None)` to sync the widget. The dedicated "Reset
@@ -330,3 +335,59 @@ identity") elsewhere breaks; none found in the slider/preview paths.
 ### 9.9 Out-of-scope confirmations
 Histogram overlay, numeric I/O fields, per-point corner toggles, and a GPU curve
 path remain non-goals for this change.
+
+## 10. Horizontal endpoint movement (supersedes §9.1.1)
+
+### 10.1 What changed
+Both endpoints move in **X and Y**, not Y alone. Dragging the lower-left endpoint
+right sets the **black input point**; dragging the upper-right endpoint left sets
+the **white input point** — the levels-style clipping Photoshop's Curves gives.
+Endpoints remain **non-removable** (identified positionally: index `0` and index
+`len-1`), and the default identity is still `[[0,0],[255,255]]`, so no stored
+catalog changes meaning.
+
+### 10.2 Outside the endpoint range the curve HOLDS (the load-bearing decision)
+Once an endpoint can sit inside the domain, the curve needs defined behaviour on
+`[0, xs[0])` and `(xs[-1], 255]`. It **holds the endpoint's y** there (flat), it
+does not extrapolate. Two independent reasons:
+
+- **Intent**: holding IS the clipping. Inputs below the black point render at the
+  black point's output level, which is what a black-point drag is for.
+- **Numerical safety**: `_monotone_cubic`'s Fritsch–Carlson tangents guarantee
+  monotonicity only *between* knots. Evaluated past the last knot the Hermite
+  polynomial keeps climbing and can turn over, so an extrapolating curve could
+  leave `[0,255]` and invert local contrast in exactly the tones the user was
+  trying to clip.
+
+Implemented by clamping the **query** x into `[xs[0], xs[-1]]` in two places that
+must agree:
+- `ccr_processor.build_channel_lut` — clamps the `arange(256)` ramp. Note the
+  2-point case already held this way (it routes through `np.interp`, which
+  clamps); the clamp is what makes `n>=3` agree with it.
+- `curve_editor._monotone_cubic` (the editor's drawing copy) — clamps `xq`, so
+  the drawn line matches the rendered pixels. Its `n==2` branch is a bare linear
+  formula that *would* have extrapolated, unlike `np.interp`; this is the one
+  real divergence the change had to close.
+
+`ccr_processor._monotone_cubic` itself is deliberately **left alone** — Channel
+Balance calls it directly with its own endpoints pinned at `0`/`1` and handles
+outside-`[0,1]` by passing values through unchanged (see
+`spec/channel-balance.md`). Clamping inside the shared interpolator would reach
+into that stage for no benefit. The other `build_channel_lut` callers (the Gamma
+slider's `gamma_curve_points`, `POSITIVE_BASE_CURVE`) pin 0 and 255, so the clamp
+is a provable no-op for them.
+
+### 10.3 New points stay strictly inside the endpoint range
+Because the endpoints are identified *positionally*, inserting a point outside
+their x range would make it the new endpoint and silently demote the old one to a
+removable interior point. So point creation is bounded to
+`[pts[0].x + 1, pts[-1].x - 1]`; a click on a flat clipped segment adds nothing.
+With endpoints at 0/255 this is exactly the previous `1..254` bound, so default
+behaviour is unchanged.
+
+### 10.4 Tests
+`tests/test_curves.py::TestEndpointHorizontal` — shadow clipping from a black
+point moved right, highlight clipping from a white point moved left, flat hold
+plus retained monotonicity with an interior point present (the `n>=3` Hermite
+path), both endpoints moved inward, and that a horizontally-moved endpoint is not
+mistaken for identity.
