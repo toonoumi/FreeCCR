@@ -54,27 +54,6 @@ def _positive_base_curve_strength() -> int:
         return POSITIVE_BASE_CURVE_STRENGTH
 
 
-# Baseline EXPOSURE for a monochrome positive, in stops, applied in LINEAR light
-# just before the sRGB encode.
-#
-# A gain is the right tool for "the whole thing is too dark" and a curve is not:
-# a curve with both endpoints pinned can only brighten the midtones by steepening
-# (measured max slope 2.63 -> 3.5 at +15 -> 4.3 at +20 -> 13.3 at +30, in BOTH a
-# pivot-shifted and a pre-gamma parameterisation — it is structural, since the
-# area under the curve rises while the ends are fixed). A gain lifts without
-# steepening anything, so the validated curve shape stays intact.
-#
-# An earlier +2 EV experiment was rejected because it clipped 48-60% of pixels —
-# but that was measured on the COLOUR decode, whose magenta cast (R/G ~ 2.9) was
-# already driving channels into the ceiling. On the neutral monochrome decode a
-# gain is cheap: across 16 frames, +0.5 EV moves the mean median 0.45 -> 0.55
-# while mean clipping goes 0.4% -> 1.4%.
-#
-# FREECCR_POSITIVE_EV tunes it in BOTH directions (the curve-strength knob can
-# only go darker); 0 disables it. See spec/mono-positive-render.md.
-POSITIVE_BASE_EV = 0.5
-
-
 # Baked BRIGHTNESS baseline for a positive decode, in Brightness-SLIDER units so
 # it reads as the number you would dial in by hand. Positives opened too dark to
 # use without pushing this every time; 15 is the value that lands a natural
@@ -105,18 +84,6 @@ def _positive_base_brightness() -> int:
     # baseline (rounding 15 up would quietly hand back a slider-16 render).
     return int(0.5 * value)
 
-
-def _positive_base_ev() -> float:
-    """Baseline exposure (stops) for a monochrome positive decode."""
-    raw = os.environ.get("FREECCR_POSITIVE_EV")
-    if raw is None:
-        return POSITIVE_BASE_EV
-    try:
-        return float(raw)
-    except ValueError:
-        logging.warning(f"FREECCR_POSITIVE_EV={raw!r} is not a number; "
-                        f"using {POSITIVE_BASE_EV}")
-        return POSITIVE_BASE_EV
 
 try:
     from PIL import Image as PILImage
@@ -1047,12 +1014,6 @@ class CCRImage:
                     # both full-range and still linear.
                     if mono_positive:
                         lin = rgb.astype(np.float32) / np.float32(65535.0)
-                        # Baseline exposure FIRST, in linear light — that is what
-                        # a gain means physically, and it is the stage that can
-                        # brighten without steepening the tone curve downstream.
-                        ev = _positive_base_ev()
-                        if ev:
-                            lin = lin * np.float32(2.0 ** ev)
                         rgb = np.clip(
                             color_management.srgb_encode(np.clip(lin, 0.0, None))
                             * 65535.0, 0, 65535).astype(np.uint16)

@@ -134,9 +134,6 @@ def test_mono_positive_is_encoded_not_linear(monkeypatch):
             return False
 
     monkeypatch.setattr(mod.rawpy, "imread", lambda *a, **k: _Raw(plane))
-    # Isolate the ENCODE. The baseline exposure is a separate stage with its own
-    # tests; leaving it on would mix a gain into this comparison.
-    monkeypatch.setenv("FREECCR_POSITIVE_EV", "0")
     ccr_backend.mono_raw = True
 
     def decode(positive):
@@ -159,67 +156,6 @@ def test_mono_positive_is_encoded_not_linear(monkeypatch):
     assert pos == pytest.approx(float(_srgb_encode(np.array([lin_level]))[0]),
                                 abs=0.01)
     assert pos > neg * 2
-
-
-# --- baseline exposure ------------------------------------------------------ #
-
-def test_base_ev_default_and_env_override(monkeypatch):
-    import core.ccr_image as mod
-    monkeypatch.delenv("FREECCR_POSITIVE_EV", raising=False)
-    assert mod._positive_base_ev() == mod.POSITIVE_BASE_EV
-    for env, expected in (("0", 0.0), ("0.3", 0.3), ("1", 1.0), ("-0.5", -0.5)):
-        monkeypatch.setenv("FREECCR_POSITIVE_EV", env)
-        assert mod._positive_base_ev() == pytest.approx(expected)
-    # Unlike the curve-strength knob, this one can go brighter AND darker.
-    monkeypatch.setenv("FREECCR_POSITIVE_EV", "nonsense")
-    assert mod._positive_base_ev() == mod.POSITIVE_BASE_EV
-
-
-def _decode(monkeypatch, positive, ev=None):
-    import core.ccr_image as mod
-    if ev is not None:
-        monkeypatch.setenv("FREECCR_POSITIVE_EV", str(ev))
-    plane = np.full((8, 8), 0.08 * 16383.0, dtype=np.float32)
-
-    class _Raw(_FakeRaw):
-        white_level = 16383
-        camera_whitebalance = [1.0, 1.0, 1.0, 1.0]
-        sizes = type("S", (), {"height": 8, "width": 8})()
-        num_colors = 3
-        color_desc = b"RGBG"
-        raw_pattern = np.array([[0, 1], [3, 2]])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(mod.rawpy, "imread", lambda *a, **k: _Raw(plane))
-    ccr_backend.mono_raw = True
-    ccr_backend.positive_mode = positive
-    img = CCRImage.__new__(CCRImage)
-    img.source_ops = []
-    img.decoded_mono = False
-    img.input_transfer = None
-    img.last_read_error = None
-    return float(np.median(img.read_image("x.nef", preview=False))) / 65535.0
-
-
-def test_base_ev_brightens_a_mono_positive(monkeypatch):
-    """A gain lifts without steepening any curve — the reason it is used here
-    instead of pushing the base curve harder."""
-    off = _decode(monkeypatch, positive=True, ev=0)
-    on = _decode(monkeypatch, positive=True, ev=1)
-    assert on > off
-    # One stop in linear light, then the sRGB encode: ~1.9x before encoding.
-    assert on == pytest.approx(float(_srgb_encode(np.array([0.16]))[0]), abs=0.02)
-
-
-def test_base_ev_does_not_touch_negative_mode(monkeypatch):
-    """Negatives must keep scene-linear values for the density math."""
-    assert _decode(monkeypatch, positive=False, ev=1) == pytest.approx(0.08,
-                                                                      abs=0.01)
 
 
 if __name__ == "__main__":

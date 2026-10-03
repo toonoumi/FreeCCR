@@ -80,36 +80,6 @@ The sRGB encode runs **after** the white-level scaling, which is the one point
 where the buffer is both full-range and still linear. Negative mode is
 unchanged: it keeps the scene-linear values the density math requires.
 
-### 2a. Baseline exposure
-
-`POSITIVE_BASE_EV = 0.5`, applied in **linear light immediately before the
-encode** (`FREECCR_POSITIVE_EV`, both directions; 0 disables).
-
-Why a gain and not more curve. A curve with both endpoints pinned can only
-brighten the midtones by **steepening** — measured max slope 2.63 → 3.5 at a
-"+15 Brightness" equivalent → 4.3 at +20 → 13.3 at +30, and identically in both
-a pivot-shifted and a pre-gamma parameterisation. It is structural, not a
-parameterisation artifact: the area under the curve rises while the ends are
-fixed. Since a slope of 3.4 was already rejected as posterising, the curve
-cannot be the vehicle for "the whole image is too dark". A gain lifts without
-steepening anything, leaving the validated shoulder intact.
-
-This **reverses the earlier rejection of a gain**, and the reversal is
-justified by what changed: +2 EV was rejected because it clipped 48–60% of
-pixels, but that was measured on the COLOUR decode, whose magenta cast
-(R/G ≈ 2.9) was already pushing channels into the ceiling. On the neutral
-monochrome decode a gain is cheap — across 16 frames:
-
-| | +0 EV | +0.3 | +0.5 | +0.7 | +1.0 |
-|---|---|---|---|---|---|
-| mean median | 0.45 | 0.51 | **0.55** | 0.59 | 0.65 |
-| mean clipped | 0.4% | 1.1% | **1.4%** | 1.7% | 2.4% |
-
-Known limits of a fixed baseline: `DSC_9912` stays dark regardless (median
-0.01 → 0.02 at +0.5 EV) while its clipping rises to 1.1%, and already-bright
-frames (9914/9915 at 0.67/0.70) may overshoot. Per-frame placement is the
-follow-up, deliberately out of scope here.
-
 ## 3. The re-fitted base curve
 
 The curve in spec/positive-base-curve.md was originally fitted against the
