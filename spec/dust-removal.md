@@ -84,6 +84,18 @@ in the catalog, and undoable.
   `Esc`): hide the red mask overlay, clear `dust_mode`, restore the normal
   (fine-rotated) preview, restore the sliders panel, and re-enable the
   toolbar actions. **Previously applied dust edits remain on the image.**
+- **An image switch KEEPS dust mode** — unlike crop/area, which are per-frame
+  geometry, spotting is a per-ROLL task: selecting another thumbnail renders
+  the new image with the brush still loaded, so the user keeps dusting
+  straight through the roll without re-entering the mode. On the switch
+  `update_preview` drops only the **in-progress stroke** (`_dust_pts`, which
+  belongs to the previous image and must never commit to the new one) and the
+  previous image's overlay items, then rebinds the panel's per-image state via
+  `DustRemovalPanel.bind_image()` (feather value, detector prob cache, AI
+  section, status line). The mode **ends** only when the new image is not
+  dust-eligible — un-converted and not in Positive mode, the same
+  `sliders_enabled` gate as the toolbar action — or when the last image is
+  removed (`clear_preview`).
 
 ### 3.2 DustRemovalPanel layout (top → bottom)
 1. Header: **Dust Removal**.
@@ -776,9 +788,16 @@ The lazy in-function import still means a build *without* onnxruntime runs fine
 8. **Catalog**: `_is_pristine` must include `dust_spots` so dust-only images
    persist; old catalogs restore `dust_spots → []`.
 9. **Cache**: `dust_sig` added to the hi-res *adjustment* signature (§4.4).
-10. **Image switch leaves dust mode** (like crop/area): `update_preview` tears
-    down dust mode on a different image so a half-drawn stroke can't commit to
-    the wrong image and the panel can't drift out of sync.
+10. **Image switch KEEPS dust mode.** (Supersedes the original decision, which
+    tore the mode down like crop/area.) Dusting is a per-roll task, so
+    `update_preview` leaves `dust_mode` set on a different image and only
+    discards the in-progress stroke plus the previous image's overlay items,
+    then rebinds the panel to the new image. A half-drawn stroke still cannot
+    commit to the wrong image (`_dust_pts` is cleared on the switch) and the
+    panel cannot drift out of sync (`bind_image()` re-reads the current image,
+    invalidating the per-image detector cache). The mode still ends on a
+    non-dust-eligible image (un-converted, outside Positive mode) and in
+    `clear_preview` when the last image goes away.
 11. **Fine-rotation slider is disabled in dust mode** (the canvas shows the
     un-fine-rotated image), so it can't show an ignored value or mutate state.
 12. **Detection results are discarded** if the user navigates to a different

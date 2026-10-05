@@ -1124,19 +1124,33 @@ class ImagePreview(QWidget):
             editable = img_obj_now.converted or ccr_backend.positive_mode
             if not same_image or active_gone or not editable:
                 self._exit_area_mode()
-        # Dust mode leaves on an image switch (like crop/area), so a half-drawn
-        # stroke can't commit to the wrong image and the panel can't drift out
-        # of sync. Torn down WITHOUT a recursive update_preview — we're already
-        # rendering the new image; MainWindow restores the sliders panel.
+        # Dust mode PERSISTS across an image switch — unlike crop/area (which
+        # are per-frame geometry), dusting is a per-ROLL task, so the next
+        # image arrives with the brush still loaded. Only the IN-PROGRESS
+        # stroke and the previous image's overlay items are dropped: a
+        # half-drawn stroke belongs to the old image and must never commit to
+        # the new one. The panel's per-image state is rebound at the end of
+        # this method (dust_rebind) — not here, where current_idx still points
+        # at the previous image. See spec/dust-removal.md.
+        dust_rebind = False
         if self.dust_mode and not same_image:
-            self.dust_mode = False
             self._dust_painting = False
             self._dust_pts = []
             self._clear_dust_items()
-            self.view.setCursor(Qt.ArrowCursor)
-            mw = self.window()
-            if hasattr(mw, "_show_sliders_panel"):
-                mw._show_sliders_panel()
+            if img_obj_now.converted or ccr_backend.positive_mode:
+                dust_rebind = True
+                self.view.setCursor(Qt.CrossCursor)
+            else:
+                # Not dust-eligible (un-converted, outside Positive mode) — the
+                # same gate as the toolbar action and the adjustment sliders,
+                # so there is nothing to spot. Leave the mode WITHOUT a
+                # recursive update_preview (we're already rendering the new
+                # image); MainWindow restores the sliders panel.
+                self.dust_mode = False
+                self.view.setCursor(Qt.ArrowCursor)
+                mw = self.window()
+                if hasattr(mw, "_show_sliders_panel"):
+                    mw._show_sliders_panel()
         if not same_image:
             # The fine-rotation burst belongs to the previous image; a switch
             # must end it so the next image's first drag gets its own snapshot.
@@ -1286,6 +1300,13 @@ class ImagePreview(QWidget):
             self.rotation_slider.setEnabled(False)
 
         self._update_unconvert_action_state()
+        # Still dusting after an image switch: point the panel at the image now
+        # on the canvas (feather value, per-image detector cache, AI section).
+        # The stored spots' overlay was already redrawn by
+        # apply_transformations above. Only on a real switch — a same-image
+        # refresh (slider tick, undo, commit) must not reset the panel.
+        if dust_rebind and self.dust_panel is not None:
+            self.dust_panel.bind_image()
         self._sync_zoom_combo()
         self._schedule_scope_update()
 
