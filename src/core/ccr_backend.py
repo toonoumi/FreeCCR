@@ -8,6 +8,7 @@ from core.ccr_processor import (ccr_normalize_with_reference, ccr_normalize_with
 import os
 import glob
 import concurrent.futures
+import math
 import time
 import uuid
 import copy
@@ -1992,6 +1993,73 @@ class CCRBackend:
         except Exception as e:
             print(f"Catalog save failed: {e}")
 
+    def _display_crop_for(self, img_obj):
+        """The crop that is actually ON SCREEN for this image as
+        (rect, angle), or None. Gated exactly like update_preview's
+        display-level crop: an unconverted image (outside Positive mode) shows
+        the whole negative, so slicing one must cut the whole negative too."""
+        rect = getattr(img_obj, "crop_rect", None)
+        if rect is None:
+            return None
+        if not (getattr(img_obj, "converted", False) or self.positive_mode):
+            return None
+        return tuple(rect), float(getattr(img_obj, "crop_angle", 0.0) or 0.0)
+
+    @staticmethod
+    def _crop_source_op(frame_hw, crop_rect, crop_angle):
+        """Express a confirmed crop as ONE source_ops entry — (rotation,
+        region) — so a slice can bake it and still read its pixels from the
+        original file.
+
+        A source op rotates about the FRAME centre and then cuts an
+        axis-aligned rect; a crop rotates about the BOX centre. Rotating the
+        whole frame by -angle about the frame centre F maps a source point p to
+        F + R(-A)(p - F), which for p inside the box equals C' + R(-A)(p - C)
+        with C' = F + R(-A)(C - F) — i.e. the box becomes the axis-aligned
+        bw x bh rect centred at C'. R is Qt's clockwise-positive rotation, the
+        convention crop_angle and fine_rotation_angle both use. See
+        spec/slice-crop-and-slice-all.md §4.1."""
+        h, w = frame_hw
+        fx1, fy1, fx2, fy2 = crop_rect
+        rotation = int(round(-float(crop_angle) * 100.0))
+        if not rotation:
+            return 0, (float(fx1), float(fy1), float(fx2), float(fy2))
+        bw = (fx2 - fx1) * w
+        bh = (fy2 - fy1) * h
+        if bw < 2 or bh < 2 or w <= 0 or h <= 0:
+            return None
+        # The frame centre the rotation actually uses (CCRImage.apply_source_op)
+        fcx, fcy = w // 2, h // 2
+        dx = (fx1 + fx2) / 2.0 * w - fcx
+        dy = (fy1 + fy2) / 2.0 * h - fcy
+        theta = math.radians(float(crop_angle))
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        cx = fcx + dx * cos_t + dy * sin_t
+        cy = fcy - dx * sin_t + dy * cos_t
+        return rotation, ((cx - bw / 2.0) / w, (cy - bh / 2.0) / h,
+                          (cx + bw / 2.0) / w, (cy + bh / 2.0) / h)
+
+    @staticmethod
+    def _region_full_size(full_hw, region) -> tuple:
+        """(height, width) after cutting `region` out of a full-res frame —
+        the same rounding CCRImage._ops_full_size uses, so a child's reported
+        original_full_size matches what a fresh file read produces."""
+        fx1, fy1, fx2, fy2 = region
+        return (max(1, int(round((fy2 - fy1) * full_hw[0]))),
+                max(1, int(round((fx2 - fx1) * full_hw[1]))))
+
+    @staticmethod
+    def can_slice_image(img_obj) -> bool:
+        """Whether cut lines placed on this image's display land where the
+        slicer will actually cut. False only for a B/W-point conversion that
+        baked a fine rotation into the preview pixels: those cuts would be
+        offset in the source file, so the image must be un-converted (or
+        sliced before converting) first."""
+        if img_obj is None:
+            return False
+        ci = getattr(img_obj, "conversion_inputs", None)
+        return not (ci is not None and ci.get("mode") == "bw" and ci.get("fine_rot"))
+
     @staticmethod
     def _clean_slice_cuts(cuts) -> list:
         """Sorted cut fractions with 0/1 boundaries; drops cuts within 1% of
@@ -2010,13 +2078,15 @@ class CCRBackend:
         vertical lines, y_cuts horizontal). The slices replace the original
         in the list, in reading order (left-to-right, top-to-bottom).
 
-        The parent's edits carry over: its fine rotation is BAKED into the
-        slices (cuts are made on the rotated frame, exactly as displayed),
-        its conversion is replayed on each slice with the parent's own
-        constants so colors match, and adjustments/bases/orientation are
-        inherited. Each slice's source_ops chain maps back to the ORIGINAL
-        file, so zoom detail and full-res export read the correct region at
-        full quality. The source is decoded only once.
+        The parent's edits carry over: its confirmed CROP and its fine
+        rotation are BAKED into the slices (cuts are made on the cropped,
+        rotated frame, exactly as displayed — so slicing a cropped image
+        yields pieces of the CROP, not of the whole scan), its conversion is
+        replayed on each slice with the parent's own constants so colors
+        match, and adjustments/bases/orientation are inherited. Each slice's
+        source_ops chain maps back to the ORIGINAL file, so zoom detail and
+        full-res export read the correct region at full quality. The source is
+        decoded only once.
         Returns the number of slices created (0 = nothing done).
         """
         img_obj = self.get_image_by_index(idx)
@@ -2048,6 +2118,23 @@ class CCRBackend:
         elif parent_ci is not None and parent_ci.get("mode") == "ref_params":
             norm_params = (parent_ci["p_lo"], parent_ci["p_hi"], parent_ci["od"])
 
+        # Bake the parent's confirmed crop FIRST — before the fine rotation,
+        # because that is the order the display applies them (crop extracted
+        # from un-fine-rotated pixels, then the canvas micro-rotation on top).
+        # The cuts were placed on the cropped frame, so the slices tile the
+        # kept region. Must run AFTER the reference params above: a "ref"
+        # reference rect lives in the parent's un-cropped frame.
+        h, w = full.shape[:2]
+        parent_full = img_obj.original_full_size or (h, w)
+        crop_ops = []
+        display_crop = self._display_crop_for(img_obj)
+        if display_crop is not None:
+            crop_op = self._crop_source_op((h, w), *display_crop)
+            if crop_op is not None:
+                full = CCRImage.apply_source_op(full, *crop_op)
+                crop_ops = [crop_op]
+                parent_full = self._region_full_size(parent_full, crop_op[1])
+
         # Bake the parent's current fine rotation: the cuts were placed on
         # the rotated display, so the slices are cut from the rotated frame.
         baked_rotation = img_obj.fine_rotation_angle or 0
@@ -2059,7 +2146,6 @@ class CCRBackend:
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
         h, w = full.shape[:2]
-        parent_full = img_obj.original_full_size or (h, w)
         # Nested slices must extend the PARENT's name (scan_s2 -> scan_s2_s1):
         # deriving from the file basename would make cousins collide and
         # exports could silently overwrite each other.
@@ -2075,6 +2161,14 @@ class CCRBackend:
             "display_name": img_obj.display_name,
             "is_duplicate": bool(getattr(img_obj, "is_duplicate", False)),
             "slice_group": getattr(img_obj, "slice_group", None),
+            # How many source_ops entries this round appends (2 when a crop was
+            # baked, since crop-then-rotate cannot collapse into one entry) and
+            # the crop itself, so "Reset Slice" can strip exactly these ops and
+            # hand the parent its crop back. Catalogs written before this carry
+            # neither key; the reader defaults to one op and no crop.
+            "ops_added": 1 + len(crop_ops),
+            "crop_rect": (list(display_crop[0]) if crop_ops else None),
+            "crop_angle": (display_crop[1] if crop_ops else 0.0),
         }
 
         children = []
@@ -2084,13 +2178,9 @@ class CCRBackend:
             for xi in range(len(xs) - 1):
                 fx1, fx2 = xs[xi], xs[xi + 1]
                 fy1, fy2 = ys[yi], ys[yi + 1]
-                cx1 = max(0, min(w - 1, int(round(fx1 * w))))
-                cy1 = max(0, min(h - 1, int(round(fy1 * h))))
-                cx2 = max(cx1 + 1, min(w, int(round(fx2 * w))))
-                cy2 = max(cy1 + 1, min(h, int(round(fy2 * h))))
-                crop = full[cy1:cy2, cx1:cx2]
-                child_full = (max(1, int(round((fy2 - fy1) * parent_full[0]))),
-                              max(1, int(round((fx2 - fx1) * parent_full[1]))))
+                tile = (fx1, fy1, fx2, fy2)
+                crop = CCRImage.apply_source_op(full, 0, tile)
+                child_full = self._region_full_size(parent_full, tile)
 
                 # Replay the parent's conversion on this slice
                 child_ci = None
@@ -2118,7 +2208,8 @@ class CCRBackend:
                     horizontal_mirrored=img_obj.horizontal_mirrored,
                     vertical_mirrored=img_obj.vertical_mirrored,
                     converted=child_ci is not None,
-                    source_ops=img_obj.source_ops + [(baked_rotation, (fx1, fy1, fx2, fy2))],
+                    source_ops=(img_obj.source_ops + crop_ops
+                                + [(baked_rotation, tile)]),
                     preloaded_img=crop,
                     preloaded_full_size=child_full,
                     display_name=f"{stem}_s{index}{ext}",
@@ -2165,6 +2256,38 @@ class CCRBackend:
         print(f"Sliced {os.path.basename(img_obj.file_path)} into {len(children)} images")
         return len(children)
 
+    def slice_all_images(self, x_cuts, y_cuts, progress_callback=None) -> tuple:
+        """Slice EVERY loaded image at the same cut fractions — for a roll
+        scanned at a fixed pitch, where every scan holds its frames in the
+        same place.
+
+        The cuts are fractions of each image's own displayed frame, so each
+        image resolves them against its own aspect ratio, bakes its own crop
+        and rotation, and replays its own conversion. Iterates back to front:
+        replacing image i with n children shifts every later index, so a
+        forward walk would slice the wrong images.
+
+        Images whose cuts would land offset in the source (can_slice_image)
+        are skipped untouched. Returns (images_sliced, pieces_created,
+        skipped); progress_callback reports images, not pieces."""
+        targets = list(range(len(self.images)))
+        total = len(targets)
+        sliced = pieces = skipped = 0
+        if progress_callback:
+            progress_callback(0, total)
+        for done, idx in enumerate(reversed(targets), start=1):
+            img_obj = self.images[idx]
+            if not self.can_slice_image(img_obj):
+                skipped += 1
+            else:
+                count = self.slice_image_by_index(idx, x_cuts, y_cuts)
+                if count > 1:
+                    sliced += 1
+                    pieces += count
+            if progress_callback:
+                progress_callback(done, total)
+        return sliced, pieces, skipped
+
     def reset_slice_by_indices(self, indices) -> Optional[int]:
         """Undo the slicing round each selected slice came from.
 
@@ -2202,7 +2325,12 @@ class CCRBackend:
                                         compute_reference_norm_params,
                                         compute_sprocket_alpha)
         group = template.slice_group
-        parent_ops = list(template.source_ops[:-1])
+        # The round appended one op per slice, or two when it also baked the
+        # parent's crop (crop first, fine rotation last). Strip exactly what it
+        # added; the fine rotation to hand back is always the LAST op's.
+        snapshot_ops = (template.slice_parent or {}).get("ops_added", 1)
+        n_ops = max(1, min(int(snapshot_ops or 1), len(template.source_ops)))
+        parent_ops = list(template.source_ops[:-n_ops])
         baked_rotation = template.source_ops[-1][0]
         # Membership is the shared round id — never geometry or names, both
         # of which collide across duplicated lineages. Collapsing a round
@@ -2292,6 +2420,12 @@ class CCRBackend:
                   f"{template.file_path}: {e}")
             return None
         parent.is_duplicate = parent_is_duplicate
+        # Give the parent its crop back (the round baked it into the slices).
+        # Set before update_thumbnail_and_preview below — the histogram is
+        # computed over the kept region.
+        parent_crop = snapshot.get("crop_rect")
+        parent.crop_rect = tuple(parent_crop) if parent_crop else None
+        parent.crop_angle = float(snapshot.get("crop_angle", 0.0) or 0.0)
         if norm_params is not None:
             parent.resized_raw = apply_reference_normalization(
                 parent.resized_raw, *norm_params)

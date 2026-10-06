@@ -427,26 +427,42 @@ class CCRImage:
         if self.reload_image_decode_only():
             self.update_thumbnail_and_preview()
 
+    @staticmethod
+    def apply_source_op(img: np.ndarray, rotation, region) -> np.ndarray:
+        """One link of a slice chain: rotate the frame about its center by
+        `rotation` (in 1/100 degree, Qt clockwise-positive — the fine rotation
+        or crop straighten that was baked at slice time), then crop to the
+        fractional `region` of that frame.
+
+        Every producer of a source_ops entry must cut its own preview pixels
+        with THIS function, so the clamping and rounding match the replay the
+        hi-res zoom and the full-res export perform from the file.
+        May return a view; callers that keep the result must materialize it."""
+        if rotation:
+            h, w = img.shape[:2]
+            matrix = cv2.getRotationMatrix2D((w // 2, h // 2), -rotation / 100.0, 1.0)
+            img = cv2.warpAffine(img, matrix, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        h, w = img.shape[:2]
+        fx1, fy1, fx2, fy2 = region
+        x1 = max(0, min(w - 1, int(round(fx1 * w))))
+        y1 = max(0, min(h - 1, int(round(fy1 * h))))
+        x2 = max(x1 + 1, min(w, int(round(fx2 * w))))
+        y2 = max(y1 + 1, min(h, int(round(fy2 * h))))
+        return img[y1:y2, x1:x2]
+
     def _apply_source_ops(self, img: Optional[np.ndarray]) -> Optional[np.ndarray]:
         """Apply this image's slice chain to a decoded image: each op rotates
-        the current frame about its center (the fine rotation that was baked
-        at slice time — the same warp the preview displayed) and then crops
-        to a fractional region of that frame. Identity when no ops are set."""
+        the current frame about its center (the fine rotation — or a baked crop
+        straighten — that was recorded at slice time, the same warp the preview
+        displayed) and then crops to a fractional region of that frame.
+        Identity when no ops are set."""
         if not self.source_ops or img is None:
             return img
+        # Reached through the CLASS, not self: the merge/bake tests bind this
+        # method onto a stub object that has no other CCRImage attributes.
         for rotation, region in self.source_ops:
-            if rotation:
-                h, w = img.shape[:2]
-                matrix = cv2.getRotationMatrix2D((w // 2, h // 2), -rotation / 100.0, 1.0)
-                img = cv2.warpAffine(img, matrix, (w, h), flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            h, w = img.shape[:2]
-            fx1, fy1, fx2, fy2 = region
-            x1 = max(0, min(w - 1, int(round(fx1 * w))))
-            y1 = max(0, min(h - 1, int(round(fy1 * h))))
-            x2 = max(x1 + 1, min(w, int(round(fx2 * w))))
-            y2 = max(y1 + 1, min(h, int(round(fy2 * h))))
-            img = img[y1:y2, x1:x2]
+            img = CCRImage.apply_source_op(img, rotation, region)
         # Materialize: returning a view would pin the entire full-frame
         # decode in long-lived holders (hi-res cache, resized_raw).
         return np.ascontiguousarray(img)

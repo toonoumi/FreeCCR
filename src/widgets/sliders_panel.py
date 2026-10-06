@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
                                 QPushButton, QDialog, QMessageBox, QScrollArea,
-                                QCheckBox, QComboBox, QInputDialog)
+                                QCheckBox, QComboBox, QInputDialog, QMenu)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRectF, QSettings
 from PySide6.QtGui import (QKeySequence, QShortcut, QPainter, QColor,
                            QLinearGradient, QPen)
@@ -13,6 +13,7 @@ from core.film_stocks import (decode_film_stocks, encode_film_stocks,
                               remove_film_stock)
 from widgets.curve_editor import CurveEditor
 from widgets.histogram_widget import HistogramWidget
+from widgets.long_press_button import LongPressButton
 from ui import theme
 import copy
 from datetime import date
@@ -604,13 +605,18 @@ class SlidersPanel(QWidget):
         # Slice: split one scan containing several photos into separate
         # images. Not conversion-gated — slicing is most useful BEFORE
         # converting, so each frame gets its own reference/conversion.
-        self.slice_btn = QPushButton("Slice")
+        # Press and hold (or right-click) for the scope menu: slice just this
+        # image, or every loaded image at the same cut positions.
+        self.slice_btn = LongPressButton("Slice")
         self.slice_btn.setToolTip(
             "Split a scan containing multiple photos into separate images. "
             "Move along the top/bottom edge for a vertical cut or the "
             "left/right edge for a horizontal cut; click to place a line, "
             "drag to adjust, right-click to delete, Enter to slice, "
-            "Esc to cancel.")
+            "Esc to cancel.\n"
+            "A cropped image slices into pieces of the crop.\n"
+            "Press and hold for the scope menu (slice every image at the "
+            "same cuts).")
         self.wb_picker_btn.setFixedHeight(theme.CONTROL_H)
         self.auto_wb_btn.setFixedHeight(theme.CONTROL_H)
         self.crop_btn.setFixedHeight(theme.CONTROL_H)
@@ -853,6 +859,7 @@ class SlidersPanel(QWidget):
         self.auto_wb_btn.clicked.connect(self._on_auto_wb)
         self.crop_btn.clicked.connect(self._on_crop_clicked)
         self.slice_btn.clicked.connect(self._on_slice_clicked)
+        self.slice_btn.longPressed.connect(self._on_slice_long_press)
         self.white_point_btn.clicked.connect(self._on_set_white_point)
         self.clear_white_point_btn.clicked.connect(self._on_clear_white_point)
         self.black_point_btn.clicked.connect(self._on_set_black_point)
@@ -1679,11 +1686,43 @@ class SlidersPanel(QWidget):
             self.image_preview.cancel_slice_mode()
             return
         if self.image_preview.enter_slice_mode():
-            self.set_temporary_hint(
-                "<b>Slice:</b> move near the top/bottom rim for a vertical "
-                "cut, the left/right rim for a horizontal cut. Click = place "
-                "line, drag = adjust, right-click = delete, <b>Enter</b> = "
-                "slice, <b>Esc</b> = cancel.", duration=12000)
+            self._slice_hint()
+
+    SLICE_HINT = ("<b>Slice:</b> move near the top/bottom rim for a vertical "
+                  "cut, the left/right rim for a horizontal cut. Click = place "
+                  "line, drag = adjust, right-click = delete, <b>Enter</b> = "
+                  "slice, <b>Esc</b> = cancel.")
+
+    def _slice_hint(self):
+        """Slice-mode hint, naming the armed scope when it is not the default
+        — slicing every image is destructive enough that it must never be
+        silent about what Enter is about to do."""
+        extra = ("<br><b>Scope: all images</b> — Enter cuts every loaded "
+                 "image at these positions."
+                 if getattr(self.image_preview, "slice_scope", "image") == "all"
+                 else "")
+        self.set_temporary_hint(self.SLICE_HINT + extra, duration=12000)
+
+    def _on_slice_long_press(self):
+        """Press-and-hold on Slice: choose what Enter slices."""
+        if not (hasattr(self, 'image_preview') and self.image_preview):
+            return
+        preview = self.image_preview
+        current = getattr(preview, "slice_scope", "image")
+        menu = QMenu(self)
+        this_action = menu.addAction("Slice this image")
+        all_action = menu.addAction("Slice all images at the same cuts")
+        for action, scope in ((this_action, "image"), (all_action, "all")):
+            action.setCheckable(True)
+            action.setChecked(current == scope)
+        all_action.setEnabled(ccr_backend.get_image_count() > 1)
+        chosen = menu.exec_(self.slice_btn.mapToGlobal(
+            self.slice_btn.rect().bottomLeft()))
+        if chosen is None:
+            return
+        scope = "all" if chosen == all_action else "image"
+        if preview.set_slice_scope(scope):
+            self._slice_hint()
 
     def _on_auto_wb(self):
         """Fully automatic white balance: estimate the neutral from the whole

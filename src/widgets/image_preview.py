@@ -939,6 +939,11 @@ class ImagePreview(QWidget):
         self._slice_dim_item = None      # darker cast marking slice mode
         self._slice_drag = None          # line dict being dragged, or None
         self._slice_worker = None
+        # What Enter slices: "image" (the current one) or "all" (every loaded
+        # image at the same cut fractions). Armed from the Slice button's
+        # long-press menu and reset after every slice/cancel, so "all" can
+        # never fire by surprise on a later slice.
+        self.slice_scope = "image"
 
         # Dust removal mode. The canvas keeps the normal display framing (the
         # confirmed crop, when one is set) with coarse rotation/flip only (no
@@ -1174,15 +1179,20 @@ class ImagePreview(QWidget):
         # Dust mode keeps the cropped display (spots are painted on the frame
         # the user actually keeps); strokes map back to full-frame coords via
         # _crop_display_transform in _dust_scene_to_norm.
+        # Slice mode keeps it too: cuts are placed on the cropped frame and the
+        # crop is baked into the slices, so a cropped scan slices into pieces
+        # of the CROP (spec/slice-crop-and-slice-all.md).
         # Skipped for un-converted images: the crop tool is disabled there,
         # and the full negative (incl. film base) is needed to draw frames.
+        # CCRBackend._display_crop_for mirrors that gate exactly — an image
+        # that shows the whole negative must also slice the whole negative.
         prev_display_transform = self._crop_display_transform
         self._crop_display_transform = None
         self._crop_display_angle = 0.0
         crop = getattr(ccr_backend.images[idx], "crop_rect", None)
         crop_angle = getattr(ccr_backend.images[idx], "crop_angle", 0.0) or 0.0
         if (preview_img is not None and not preview_img.isNull()
-                and crop is not None and not self.crop_mode and not self.slice_mode
+                and crop is not None and not self.crop_mode
                 and not self.area_mode
                 and (ccr_backend.images[idx].converted or ccr_backend.positive_mode)):
             if crop_angle:
@@ -1750,7 +1760,9 @@ class ImagePreview(QWidget):
         """At the fitted view a confirmed crop magnifies the kept region. Worth
         a crop-matched hi-res fetch when the crop removes a meaningful slice
         (>15% of a side) and the source carries more detail than the preview.
-        Crop/slice/area modes show the FULL image, so no crop magnification."""
+        Crop/area modes show the FULL image, so no crop magnification; slice
+        mode does show the crop but pins the fitted view and never needs
+        detail, so it opts out too."""
         if self.crop_mode or self.slice_mode or self.area_mode:
             return False
         img = (ccr_backend.get_image_by_index(self.current_idx)
@@ -2199,17 +2211,19 @@ class ImagePreview(QWidget):
     SLICE_GRAB_PX = 10.0        # grab tolerance around a placed line (view px)
 
     def enter_slice_mode(self) -> bool:
-        """Show the whole image at the fitted view and start placing cuts."""
+        """Show the image at the fitted view and start placing cuts. The
+        canvas is the normal display framing — a confirmed crop included, so
+        a cropped scan slices into pieces of the CROP (the backend bakes the
+        same crop before cutting). See spec/slice-crop-and-slice-all.md."""
         if self.current_idx is None:
             return False
         img_obj = ccr_backend.get_image_by_index(self.current_idx)
         if img_obj is None or self.current_pixmap is None or self.current_pixmap.isNull():
             return False
-        ci = getattr(img_obj, "conversion_inputs", None)
-        if ci is not None and ci.get("mode") == "bw" and ci.get("fine_rot"):
-            # The B/W-point conversion baked this fine rotation into the
-            # preview pixels, so cut lines placed here would land offset in
-            # the source file. Steer to the supported workflow instead.
+        if not ccr_backend.can_slice_image(img_obj):
+            # The B/W-point conversion baked a fine rotation into the preview
+            # pixels, so cut lines placed here would land offset in the source
+            # file. Steer to the supported workflow instead.
             try:
                 self.parent().parent().sliders_panel.set_temporary_hint(
                     "This image's B/W conversion has a fine rotation baked "
@@ -2227,12 +2241,14 @@ class ImagePreview(QWidget):
         self.slice_mode = True
         self._slice_lines = []
         self._slice_drag = None
-        # Slice mode always starts at the fitted view of the entire image
+        # Slice mode always starts at the fitted view of the whole canvas
         self._zoom = 1.0
         self._release_hires(refresh=False)
         self._slice_rerender = True
         try:
-            self.update_preview(self.current_idx)  # re-render full image
+            # Re-render at the fitted view (keeps the crop framing, drops any
+            # hi-res detail layer the previous zoom had installed)
+            self.update_preview(self.current_idx)
         finally:
             self._slice_rerender = False
         self._draw_slice_dim()
@@ -2252,8 +2268,21 @@ class ImagePreview(QWidget):
     def _exit_slice_mode(self):
         self.slice_mode = False
         self._slice_drag = None
+        self.slice_scope = "image"
         self._teardown_slice_items()
         self.view.setCursor(Qt.ArrowCursor)
+
+    def set_slice_scope(self, scope) -> bool:
+        """Arm what Enter will slice ("image" or "all") and enter slice mode
+        if it isn't already active. Re-arming inside the mode keeps the lines
+        already placed, so the scope can be switched after positioning the
+        cuts. Returns False when slice mode could not be entered."""
+        if scope not in ("image", "all"):
+            return False
+        if not self.slice_mode and not self.enter_slice_mode():
+            return False
+        self.slice_scope = scope
+        return True
 
     def _slice_display_transform(self):
         """Transform the PIXMAP and dim cast are displayed with in slice
@@ -2467,6 +2496,7 @@ class ImagePreview(QWidget):
         x_cuts = [l["frac"] for l in self._slice_lines if l["orient"] == 'v']
         y_cuts = [l["frac"] for l in self._slice_lines if l["orient"] == 'h']
         idx = self.current_idx
+        all_images = self.slice_scope == "all"
         self._exit_slice_mode()
         if (not x_cuts and not y_cuts) or idx is None:
             if idx is not None:
@@ -2477,26 +2507,37 @@ class ImagePreview(QWidget):
             except AttributeError:
                 pass
             return
-        dialog = SliceProgressDialog(self)
-        self._slice_worker = SliceWorker(idx, x_cuts, y_cuts)
+        dialog = SliceProgressDialog(self, all_images=all_images)
+        self._slice_worker = SliceWorker(idx, x_cuts, y_cuts,
+                                         all_images=all_images)
         self._slice_worker.progress.connect(dialog.set_progress)
         self._slice_worker.finished_slice.connect(
-            lambda count: self._on_slice_done(dialog, idx, count))
+            lambda count, skipped: self._on_slice_done(
+                dialog, idx, count, skipped, all_images))
         self._slice_worker.start()
         dialog.exec_()
 
-    def _on_slice_done(self, dialog, idx, count):
+    def _on_slice_done(self, dialog, idx, count, skipped=0, all_images=False):
         dialog.accept()
         mw = self.parent().parent()
         if count > 0:
             # Rebuild the whole thumbnail list (the image count changed) and
-            # land on the first slice.
+            # land on the first slice. Slicing every image replaces the list
+            # wholesale, so the current row is just the top.
             mw.thumbnail_list.load_thumbnails()
-            if idx < ccr_backend.get_image_count():
-                mw.thumbnail_list.thumbnail_list.setCurrentRow(idx)
-            mw.sliders_panel.set_temporary_hint(
-                f"Sliced into {count} images. Each can now be framed, "
-                f"converted, and exported separately.", duration=6000)
+            row = 0 if all_images else idx
+            if row < ccr_backend.get_image_count():
+                mw.thumbnail_list.thumbnail_list.setCurrentRow(row)
+            if all_images:
+                extra = (f" {skipped} skipped (convert with a baked straighten)."
+                         if skipped else "")
+                mw.sliders_panel.set_temporary_hint(
+                    f"Sliced every image at the same cuts — {count} images "
+                    f"in all.{extra}", duration=7000)
+            else:
+                mw.sliders_panel.set_temporary_hint(
+                    f"Sliced into {count} images. Each can now be framed, "
+                    f"converted, and exported separately.", duration=6000)
             ccr_backend.save_catalog()
         else:
             self.update_preview(idx)
@@ -4504,29 +4545,43 @@ class ImagePreview(QWidget):
 
 class SliceWorker(QThread):
     """Runs the backend slice (one shared decode + per-slice previews) off
-    the GUI thread."""
-    finished_slice = Signal(int)
+    the GUI thread. With all_images set, every loaded image is sliced at the
+    same cut fractions and `progress` counts images instead of pieces."""
+    finished_slice = Signal(int, int)   # resulting image count, skipped images
     progress = Signal(int, int)
 
-    def __init__(self, idx, x_cuts, y_cuts, parent=None):
+    def __init__(self, idx, x_cuts, y_cuts, all_images=False, parent=None):
         super().__init__(parent)
         self._idx = idx
         self._x_cuts = list(x_cuts)
         self._y_cuts = list(y_cuts)
+        self._all_images = bool(all_images)
 
     def run(self):
+        count = skipped = 0
+
+        def emit(current, total):
+            self.progress.emit(current, total)
+
         try:
-            count = ccr_backend.slice_image_by_index(
-                self._idx, self._x_cuts, self._y_cuts,
-                progress_callback=lambda c, t: self.progress.emit(c, t))
+            if self._all_images:
+                sliced, _pieces, skipped = ccr_backend.slice_all_images(
+                    self._x_cuts, self._y_cuts, progress_callback=emit)
+                # Nothing sliced => report 0 so the caller shows the
+                # "no pieces" hint rather than a bogus success.
+                count = ccr_backend.get_image_count() if sliced else 0
+            else:
+                count = ccr_backend.slice_image_by_index(
+                    self._idx, self._x_cuts, self._y_cuts,
+                    progress_callback=emit)
         except Exception as e:
             print(f"Slice failed: {e}")
             count = 0
-        self.finished_slice.emit(count)
+        self.finished_slice.emit(count, skipped)
 
 
 class SliceProgressDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, all_images=False):
         super().__init__(parent)
         self.setWindowTitle("Slicing...")
         self.setModal(True)
@@ -4534,7 +4589,9 @@ class SliceProgressDialog(QDialog):
         self.setWindowModality(Qt.ApplicationModal)
         self.setMinimumWidth(240)
 
-        self.label = QLabel("Slicing image", self)
+        self._base_text = "Slicing all images" if all_images else "Slicing image"
+        self._unit = "images" if all_images else ""
+        self.label = QLabel(self._base_text, self)
         self.label.setAlignment(Qt.AlignCenter)
         self.progress_label = QLabel("", self)
         self.progress_label.setAlignment(Qt.AlignCenter)
@@ -4551,10 +4608,11 @@ class SliceProgressDialog(QDialog):
 
     def _animate(self):
         self._dot_count = (self._dot_count + 1) % 4
-        self.label.setText("Slicing image" + "." * self._dot_count)
+        self.label.setText(self._base_text + "." * self._dot_count)
 
     def set_progress(self, current, total):
-        self.progress_label.setText(f"{current} / {total}")
+        suffix = f" {self._unit}" if self._unit else ""
+        self.progress_label.setText(f"{current} / {total}{suffix}")
 
     def closeEvent(self, event):
         event.ignore()

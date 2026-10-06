@@ -200,6 +200,225 @@ class TestSliceImage:
         np.testing.assert_array_equal(reread, rotated[:, 200:400])
 
 
+class TestSliceCroppedImage:
+    """A confirmed crop is baked into the slices: cuts are placed on the
+    cropped frame the user sees, so the pieces tile the KEPT region.
+    See spec/slice-crop-and-slice-all.md."""
+
+    def _load_cropped(self, tmp_path, crop, angle=0.0, fine=0, **png_kwargs):
+        path, img = _coordinate_png(tmp_path, **png_kwargs)
+        obj = CCRImage(path)
+        # The display-level crop is only shown (and so only baked) for a
+        # converted image — mark it converted without touching the pixels.
+        obj.converted = True
+        obj.crop_rect = crop
+        obj.crop_angle = angle
+        obj.fine_rotation_angle = fine
+        ccr_backend.images = [obj]
+        ccr_backend.file_paths = [path]
+        return path, img, obj
+
+    def test_children_tile_the_crop(self, tmp_path):
+        path, img, _ = self._load_cropped(tmp_path, (0.25, 0.25, 0.75, 0.75))
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        # Two ops: the crop, then the (un-rotated) tile
+        for child in ccr_backend.images:
+            assert len(child.source_ops) == 2
+            assert child.source_ops[0] == (0, (0.25, 0.25, 0.75, 0.75))
+            assert child.crop_rect is None
+            assert child.crop_angle == 0.0
+        assert ccr_backend.images[0].source_ops[1] == (0, (0.0, 0.0, 0.5, 1.0))
+        assert ccr_backend.images[1].source_ops[1] == (0, (0.5, 0.0, 1.0, 1.0))
+        # Pixels: the crop of a 600x400 frame is x 150..450, y 100..300;
+        # its halves are x 150..300 and x 300..450.
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw,
+                                      img[100:300, 150:300])
+        np.testing.assert_array_equal(ccr_backend.images[1].resized_raw,
+                                      img[100:300, 300:450])
+        # original_full_size matches the region actually held
+        assert ccr_backend.images[0].original_full_size == (200, 150)
+
+    def test_export_read_reproduces_the_crop_tile(self, tmp_path):
+        """The full-res path replays the chain from the file — it must land on
+        the same pixels the preview shows."""
+        path, img, _ = self._load_cropped(tmp_path, (0.25, 0.25, 0.75, 0.75))
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        child = ccr_backend.images[1]
+        full = child.read_image(child.file_path, preview=False)
+        np.testing.assert_array_equal(full, img[100:300, 300:450])
+
+    def test_unconverted_crop_is_not_baked(self, tmp_path):
+        """The crop isn't displayed on an un-converted negative, so slicing
+        one must still cut the whole frame — otherwise the cuts the user
+        placed and the pieces produced disagree."""
+        path, img = _coordinate_png(tmp_path)
+        obj = CCRImage(path)
+        obj.crop_rect = (0.25, 0.25, 0.75, 0.75)
+        ccr_backend.images = [obj]
+        ccr_backend.file_paths = [path]
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        assert all(len(im.source_ops) == 1 for im in ccr_backend.images)
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw,
+                                      img[:, 0:300])
+
+    def test_straightened_crop_matches_reference_extraction(self, tmp_path):
+        """With a crop_angle the bake is a frame rotation plus an axis-aligned
+        box; it must reproduce apply_crop_to_image's rotated branch."""
+        from core.ccr_processor import apply_crop_to_image
+        crop = (0.2, 0.2, 0.8, 0.8)
+        path, img, _ = self._load_cropped(tmp_path, crop, angle=7.0,
+                                          w=400, h=400)
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        rot = ccr_backend.images[0].source_ops[0][0]
+        assert rot == -700           # -angle, in 1/100 degree
+        reference = apply_crop_to_image(img, crop, 7.0)
+        half = reference.shape[1] // 2
+        # Both do exactly one bilinear resample, on grids that agree to the
+        # pixel; compare the interior (the rims differ by sub-pixel sampling
+        # of the black border). An un-rotated crop scores ~570 here, so this
+        # really does pin the rotation down.
+        got = ccr_backend.images[0].resized_raw
+        assert got.shape[1] == pytest.approx(half, abs=1)
+        a = got[20:-20, 20:half - 20].astype(np.int64)
+        b = reference[20:-20, 20:half - 20].astype(np.int64)
+        diff = np.abs(a - b)
+        assert diff.mean() < 1.0       # the ramp steps by 100/150 per pixel
+        assert diff.max() <= 100
+
+    def test_crop_and_fine_rotation_bake_in_display_order(self, tmp_path):
+        """The display crops first and micro-rotates the cropped canvas; the
+        slice chain must carry the two ops in that order."""
+        path, img, _ = self._load_cropped(tmp_path, (0.2, 0.2, 0.8, 0.8),
+                                          fine=300, w=400, h=400)
+        n = ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert n == 2
+        ops = ccr_backend.images[0].source_ops
+        assert len(ops) == 2
+        assert ops[0] == (0, (0.2, 0.2, 0.8, 0.8))   # crop first
+        assert ops[1][0] == 300                      # then the micro-rotation
+        # The children consumed the rotation
+        assert all(im.fine_rotation_angle == 0 for im in ccr_backend.images)
+        # Independent replay of crop-then-rotate-then-cut
+        cropped = img[80:320, 80:320]
+        m = cv2.getRotationMatrix2D((120, 120), -3.0, 1.0)
+        rotated = cv2.warpAffine(cropped, m, (240, 240), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw,
+                                      rotated[:, 0:120])
+
+    def test_reset_restores_the_parent_crop(self, tmp_path, monkeypatch):
+        from core import catalog
+        monkeypatch.setattr(catalog, "default_catalog_path",
+                            lambda: str(tmp_path / "catalog.json"))
+        ccr_backend._catalog_preserved = {}
+        crop = (0.25, 0.25, 0.75, 0.75)
+        path, img, _ = self._load_cropped(tmp_path, crop, angle=4.0)
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        assert ccr_backend.get_image_count() == 2
+        assert ccr_backend.reset_slice_by_indices([0]) == 0
+        assert ccr_backend.get_image_count() == 1
+        parent = ccr_backend.images[0]
+        assert parent.source_ops == []
+        assert parent.crop_rect == pytest.approx(crop)
+        assert parent.crop_angle == pytest.approx(4.0)
+        assert parent.fine_rotation_angle == 0
+
+    def test_reset_of_legacy_round_without_ops_added(self, tmp_path, monkeypatch):
+        """Rounds sliced before this feature have no `ops_added` key; reset
+        must still strip exactly the one op they appended."""
+        from core import catalog
+        monkeypatch.setattr(catalog, "default_catalog_path",
+                            lambda: str(tmp_path / "catalog.json"))
+        ccr_backend._catalog_preserved = {}
+        path, img = _coordinate_png(tmp_path)
+        ccr_backend.images = [CCRImage(path)]
+        ccr_backend.file_paths = [path]
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        for im in ccr_backend.images:
+            im.slice_parent.pop("ops_added", None)
+            im.slice_parent.pop("crop_rect", None)
+            im.slice_parent.pop("crop_angle", None)
+        assert ccr_backend.reset_slice_by_indices([0]) == 0
+        assert ccr_backend.get_image_count() == 1
+        assert ccr_backend.images[0].source_ops == []
+        assert ccr_backend.images[0].crop_rect is None
+        np.testing.assert_array_equal(ccr_backend.images[0].resized_raw, img)
+
+    def test_nested_slice_of_a_cropped_slice(self, tmp_path):
+        """A slice has no crop of its own, so re-slicing it appends one op —
+        on top of the two the cropped round left."""
+        path, img, _ = self._load_cropped(tmp_path, (0.25, 0.25, 0.75, 0.75))
+        ccr_backend.slice_image_by_index(0, [0.5], [])
+        ccr_backend.slice_image_by_index(1, [], [0.5])
+        assert ccr_backend.get_image_count() == 3
+        child = ccr_backend.images[2]
+        assert len(child.source_ops) == 3
+        # Bottom-right quadrant of the crop: x 300..450, y 200..300
+        np.testing.assert_array_equal(child.resized_raw, img[200:300, 300:450])
+        np.testing.assert_array_equal(
+            child.read_image(path, preview=True), img[200:300, 300:450])
+
+
+class TestSliceAllImages:
+    def _load_many(self, tmp_path, n=3):
+        paths = []
+        for i in range(n):
+            path, _ = _coordinate_png(tmp_path, name=f"scan{i}.png")
+            paths.append(path)
+        ccr_backend.images = [CCRImage(p) for p in paths]
+        ccr_backend.file_paths = list(paths)
+        return paths
+
+    def test_every_image_sliced_at_the_same_cuts(self, tmp_path):
+        self._load_many(tmp_path, 3)
+        sliced, pieces, skipped = ccr_backend.slice_all_images([1 / 3, 2 / 3], [])
+        assert (sliced, pieces, skipped) == (3, 9, 0)
+        assert ccr_backend.get_image_count() == 9
+        # Order preserved: each scan's three slices stay together, in order
+        names = [im.display_name for im in ccr_backend.images]
+        assert names == [f"scan{i}_s{j}.png" for i in range(3) for j in (1, 2, 3)]
+        # Every child carries its own parent's region, not the first parent's
+        for im in ccr_backend.images:
+            assert len(im.source_ops) == 1
+        assert ccr_backend.file_paths == [im.file_path for im in ccr_backend.images]
+
+    def test_unsliceable_image_is_skipped_not_mangled(self, tmp_path):
+        paths = self._load_many(tmp_path, 3)
+        # A B/W conversion with a baked fine rotation: cuts placed on the
+        # display would land offset in the source, so it must be left alone.
+        ccr_backend.images[1].converted = True
+        ccr_backend.images[1].conversion_inputs = {
+            "mode": "bw", "bw": ((5.0, 5.0, 5.0), None), "fine_rot": 250}
+        sliced, pieces, skipped = ccr_backend.slice_all_images([0.5], [])
+        assert (sliced, skipped) == (2, 1)
+        assert ccr_backend.get_image_count() == 5
+        untouched = [im for im in ccr_backend.images if not im.source_ops]
+        assert len(untouched) == 1
+        assert untouched[0].file_path == paths[1]
+
+    def test_respects_each_image_own_crop(self, tmp_path):
+        paths = self._load_many(tmp_path, 2)
+        _, img = _coordinate_png(tmp_path, name="probe.png")
+        ccr_backend.images[0].converted = True
+        ccr_backend.images[0].crop_rect = (0.0, 0.0, 0.5, 1.0)
+        sliced, _pieces, skipped = ccr_backend.slice_all_images([0.5], [])
+        assert (sliced, skipped) == (2, 0)
+        # The cropped image's halves tile its crop (x 0..300), the plain
+        # image's halves tile the whole frame (x 0..600)
+        np.testing.assert_array_equal(ccr_backend.images[1].resized_raw,
+                                      img[:, 150:300])
+        np.testing.assert_array_equal(ccr_backend.images[3].resized_raw,
+                                      img[:, 300:600])
+
+    def test_no_images_is_a_noop(self, tmp_path):
+        ccr_backend.images = []
+        ccr_backend.file_paths = []
+        assert ccr_backend.slice_all_images([0.5], []) == (0, 0, 0)
+
+
 class TestEditInheritance:
     def _scan_png(self, tmp_path, w=600, h=400):
         rng = np.random.default_rng(21)
