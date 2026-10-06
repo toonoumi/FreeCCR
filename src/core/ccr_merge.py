@@ -267,7 +267,14 @@ def normalize_cfa_phases(plane: np.ndarray) -> np.ndarray:
 
     Computed per frame rather than baked, so it self-calibrates to any body; it
     is stable enough that this cannot flicker across a roll. Pure — unit-testable
-    without rawpy. See spec/mono-positive-render.md."""
+    without rawpy.
+
+    Applied by BOTH monochrome mosaic reads — the single-image one
+    (`CCRImage._read_mono_mosaic`) and the trichrome Monochrome merge detail
+    (`_decode_frame_plane`, mono branch) — since both make every photosite its
+    own pixel and so put neighbouring phases side by side.
+
+    See spec/mono-positive-render.md and spec/trichrome-mono-read.md."""
     p = np.array(plane, dtype=np.float32, copy=True)
     if p.ndim != 2:
         raise ValueError(f"expected a 2-D sensor plane, got shape {p.shape}")
@@ -301,8 +308,9 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False,
     `mono` (Merge detail → Monochrome) overrides everything below: the whole
     visible mosaic is read as a monochrome frame at full sensor resolution,
     BEFORE any sensor detection or guard — the declared CFA is ignored, which
-    is the point (a mono-converted body still reports RGGB). `preview` bins
-    2x2; sensor_full is always the unbinned mosaic size. See
+    is the point (a mono-converted body still reports RGGB). The per-phase
+    sensitivity residual is normalised away (`normalize_cfa_phases`) before
+    `preview` bins 2x2; sensor_full is always the unbinned mosaic size. See
     spec/trichrome-mono-read.md.
 
     `demosaic` (Bayer only; monochrome has no CFA and ignores it) switches the
@@ -351,6 +359,19 @@ def _decode_frame_plane(path: str, frame_pos: int, preview: bool = False,
             except Exception:
                 black_levels = None
             plane = mono_plane_from_mosaic(mosaic, colors, black_levels)
+            # Flatten the residual per-phase sensitivity a mono-CONVERTED sensor
+            # leaves behind, BEFORE any binning — exactly as the single-image
+            # monochrome read does (CCRImage._read_mono_mosaic). This read is the
+            # one merge detail that makes every photosite its own pixel, so
+            # neighbouring pixels come from DIFFERENT CFA phases and the fixed
+            # gain spread prints as a 2px lattice; Photosite (one phase per quad)
+            # and Demosaic (each plane from its own phase) turn the same spread
+            # into a flat per-channel gain that white balance absorbs. All three
+            # sources share the body, so untreated the lattice is neutral and
+            # survives the merge as a white mesh. bin2x2 averages the four phases
+            # and so hides it in previews while it survives at full resolution,
+            # where zoom and export would show it.
+            plane = normalize_cfa_phases(plane)
             full = (plane.shape[0], plane.shape[1])
             if preview:
                 plane = bin2x2(plane)

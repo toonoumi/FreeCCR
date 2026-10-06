@@ -94,6 +94,59 @@ def test_mono_plane_rejects_non_mosaic():
         ccr_merge.mono_plane_from_mosaic(np.zeros((4, 4, 3), np.uint16))
 
 
+class _FakeRaw:
+    """Minimal rawpy stand-in for the mono branch of _decode_frame_plane."""
+
+    def __init__(self, mosaic, colors, black):
+        self.raw_image_visible = mosaic
+        self.raw_colors_visible = colors
+        self.black_level_per_channel = list(black)
+        self.white_level = 16383.0
+        self.sizes = SimpleNamespace(height=mosaic.shape[0],
+                                     width=mosaic.shape[1])
+        self.num_colors = 3
+        self.color_desc = b"RGBG"
+        self.raw_pattern = np.array([[0, 1], [3, 2]])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_mono_merge_read_flattens_the_per_phase_lattice(monkeypatch):
+    """A mono-CONVERTED sensor leaves each 2x2 phase at a slightly different
+    gain. Monochrome is the one merge detail that makes every photosite its own
+    pixel, so neighbouring pixels come from DIFFERENT phases and that spread
+    prints as a 2px lattice — a neutral white mesh over flat areas, since all
+    three sources share the body. The read must flatten it (the single-image
+    mono read already does; see spec/mono-positive-render.md)."""
+    import rawpy
+
+    colors = np.tile(np.array([[0, 1], [3, 2]]), (16, 16))          # 32x32 RGGB
+    black = [100, 200, 300, 400]
+    # Flat scene, then the measured converted-body per-phase gains.
+    gains = {(0, 0): 1577.7, (0, 1): 1357.6, (1, 0): 1350.0, (1, 1): 1496.8}
+    value = np.full((32, 32), 4000.0, dtype=np.float32)
+    for (dy, dx), g in gains.items():
+        value[dy::2, dx::2] *= g / float(np.mean(list(gains.values())))
+    mosaic = (value + np.asarray(black, dtype=np.float32)[colors]).astype(np.uint16)
+    monkeypatch.setattr(rawpy, "imread",
+                        lambda *a, **k: _FakeRaw(mosaic, colors, black))
+
+    plane, white, is_mono, full = ccr_merge._decode_frame_plane(
+        "frame.arw", 0, preview=False, mono=True)
+
+    assert is_mono is True and full == (32, 32) and plane.shape == (32, 32)
+    # The lattice is gone: all four phases now read the same flat scene value.
+    means = [float(plane[dy::2, dx::2].mean()) for dy in (0, 1) for dx in (0, 1)]
+    spread = (max(means) - min(means)) / float(np.mean(means))
+    assert spread < 1e-5, f"per-phase lattice survived: {means}"
+    # ...and the frame's overall level is untouched (a pure redistribution).
+    assert abs(float(plane.mean()) - 4000.0) < 1.0
+
+
 def test_bin2x2_averages_and_drops_odd_edge():
     p = np.arange(15, dtype=np.float32).reshape(3, 5)
     out = ccr_merge.bin2x2(p)
@@ -118,10 +171,12 @@ def test_mono_read_is_the_whole_mosaic():
     # Same file for all three frames -> identical planes.
     np.testing.assert_array_equal(merged[..., 0], merged[..., 1])
     np.testing.assert_array_equal(merged[..., 0], merged[..., 2])
-    # Every photosite is its own sample: (raw - its black) * 65535/white.
+    # Every photosite is its own sample: (raw - its black), flattened for the
+    # per-phase sensitivity residual, * 65535/white.
+    plane = ccr_merge.normalize_cfa_phases(
+        np.maximum(mosaic.astype(np.float32) - black[colors], 0.0))
     y, x = slice(1000, 1064), slice(2000, 2064)
-    expect = np.clip((mosaic[y, x] - black[colors[y, x]]) * (65535.0 / white),
-                     0, 65535)
+    expect = np.clip(plane[y, x] * (65535.0 / white), 0, 65535)
     assert np.abs(merged[y, x, 0].astype(np.float32) - expect).max() <= 1.0
 
     prev, full_prev = ccr_merge.merge_raw_channels([ARW] * 3, preview=True,

@@ -110,10 +110,37 @@ plane = max(plane, 0)
 when `mono`, BEFORE any sensor detection or guard: read
 `raw.raw_image_visible`, `raw.raw_colors_visible`,
 `raw.black_level_per_channel`; `plane = mono_plane_from_mosaic(...)`;
-`full = plane.shape`; `plane = bin2x2(plane)` if preview; return
+`plane = normalize_cfa_phases(plane)`; `full = plane.shape`;
+`plane = bin2x2(plane)` if preview; return
 `(plane, white_level, True, full)`. Reporting `is_mono=True` makes the
 existing full-size rule (`sensor_full if any_mono or demosaic`) and the
 mixed-sensor guard (all frames mono) apply unchanged.
+
+**Why `normalize_cfa_phases` belongs here** (it was missing until the fix that
+added this paragraph, and the artefact was reported from the field): stripping a
+CFA is never perfect, so each of the four photosite phases keeps a slightly
+different gain — measured 1577.7 / 1357.6 / 1350.0 / 1496.8 on a converted body,
+a 15.75 % spread. Monochrome is the **only** merge detail that makes every
+photosite its own pixel, so adjacent pixels come from *different* phases and the
+spread becomes spatial: one strongly bright site per 2×2 quad (R, +9.1 %) on a
+2 px lattice, which a smooth zoom upscale renders as a mesh of light lines
+around darker quads. Photosite (one phase per quad) and Demosaic (each plane
+interpolated from its own phase) turn the same spread into a flat per-channel
+gain that white balance absorbs, which is why only this mode shows it. All three
+sources share the body, so untreated the mesh is **neutral** — a white lattice,
+not a colour cast.
+
+Normalisation is per frame, so the three sources may land on marginally
+different corrections; that difference is a single scalar per frame, i.e. a flat
+per-channel gain, absorbed by white balance. It must run **before** `bin2x2`:
+binning averages the four phases, which is exactly why a half-size preview hid
+this while full-resolution zoom and export showed it.
+
+This presumes a **converted** body, which is what the mode is for. On a live CFA
+the per-phase spread is real scene colour (the example `DSC07096.ARW` measures
+47.2 %: R 1005 / G 1247 / G 1247 / B 746) and normalising it is meaningless —
+but so is reading a live mosaic as luminance in the first place, so that
+combination was already garbage and is not newly broken.
 
 `merge_raw_channels(sources, preview=False, demosaic=False, mono=False)`
 forwards the flag.
@@ -151,7 +178,10 @@ loader already surfaces as a merge failure.
 1. **Pure read**: `mono_plane_from_mosaic` keeps full resolution, subtracts a
    per-CFA-index pedestal exactly (a mosaic of `black[idx] + v` returns `v`
    everywhere), clips at 0, rejects a 3-D array; `bin2x2` averages and drops
-   the odd edge.
+   the odd edge. **Phase lattice**: a flat scene carrying the measured
+   converted-body per-phase gains decodes through `_decode_frame_plane(mono=True)`
+   to a plane whose four phase means agree to <1e-5 relative, with the frame's
+   overall level unchanged (a redistribution, not a gain).
 2. **Real RAW** (example ARW, skipped if absent): `merge_raw_channels([arw]*3,
    mono=True)` returns the full visible mosaic size, `full_size ==
    merged.shape`, all three channels identical (same file, same plane);
