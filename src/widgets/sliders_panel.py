@@ -58,6 +58,11 @@ SYNC_GROUPS = [
     ("balance", "Channel Balance (R/G/B)", ("balance_r", "balance_g", "balance_b")),
     ("bands", "Subtractive Saturations (per color)",
      tuple(BAND_ADJUSTMENT_KEYS) + ("band_feather",)),
+    # Details (sharpening) — its own group: output sharpening is a per-capture
+    # judgement (focus, grain, how far the frame was downscaled), so a user
+    # syncs it independently of colour. See spec/sharpening.md.
+    ("details", "Details (sharpening)",
+     ("sharpen_amount", "sharpen_radius", "sharpen_masking")),
     # "curves" lives outside ADJUSTMENT_KEYS (it's a nested structure, not a
     # slider), so it's synced specially in _perform_sync_to_all, like crop.
     ("curves", "Curves", ()),
@@ -318,6 +323,9 @@ class SlidersPanel(QWidget):
         # Global spatial-feather amount for the band effect (created after the
         # per-band sliders, so it stays last in the positional zip).
         "band_feather",
+        # Details (sharpening) — created LAST of all, so these stay at the tail
+        # of the positional zip. See spec/sharpening.md.
+        "sharpen_amount", "sharpen_radius", "sharpen_masking",
     ]
 
     # Non-zero default values for specific adjustment keys. Keys not listed
@@ -325,7 +333,14 @@ class SlidersPanel(QWidget):
     # edge-softening out of the box (matches _BAND_FEATHER_DEFAULT in
     # ccr_processor). Used everywhere a slider is populated from a (possibly
     # partial) adjustment dict, so UI and render agree on the default.
-    SLIDER_DEFAULTS = {"band_feather": 10}
+    # Sharpening defaults to a VISIBLE 25 (the Lightroom raw convention) rather
+    # than a hidden baked-in value: the slider reads 25 on a new image, so the
+    # user can see what is applied and zero it. Radius 25 is exactly 1.0 native
+    # pixel (SHARPEN_RADIUS_DIV). Catalogs written before the Details section
+    # pin these to 0 on restore so old scans render unchanged — see
+    # catalog._restore_image and spec/sharpening.md.
+    SLIDER_DEFAULTS = {"band_feather": 10,
+                       "sharpen_amount": 25, "sharpen_radius": 25}
 
     def _default_for(self, key):
         return self.SLIDER_DEFAULTS.get(key, 0)
@@ -713,6 +728,10 @@ class SlidersPanel(QWidget):
         self.band_section = CollapsibleSection("Subtractive Saturations")
         scroll_layout.addWidget(self.band_section)
 
+        scroll_layout.addWidget(_section_separator())
+        self.details_section = CollapsibleSection("Details")
+        scroll_layout.addWidget(self.details_section)
+
         # --- Populate Channel Levels (the section widget itself is placed far
         # above, just under the Convert row) ---
         # MUST be created before the band sliders to keep the ADJUSTMENT_KEYS
@@ -842,6 +861,22 @@ class SlidersPanel(QWidget):
             self.create_slider("Feather", min_value=0, max_value=100,
                                default_value=self._default_for("band_feather")))
         self._show_band_page("red")
+
+        # --- Populate Details (sharpening) ---
+        # Created LAST so these map to the trailing sharpen_* keys in
+        # ADJUSTMENT_KEYS. Amount/Radius default to a VISIBLE 25; Radius 25 is
+        # 1.0 native pixel. The preview exaggerates the radius so the effect is
+        # actually visible at 1080 (spec/sharpening.md); at 100% zoom and on
+        # export it is exact.
+        self.details_section.add_layout(
+            self.create_slider("Amount", min_value=0, max_value=100,
+                               default_value=self._default_for("sharpen_amount")))
+        self.details_section.add_layout(
+            self.create_slider("Radius", min_value=0, max_value=100,
+                               default_value=self._default_for("sharpen_radius")))
+        self.details_section.add_layout(
+            self.create_slider("Masking", min_value=0, max_value=100,
+                               default_value=self._default_for("sharpen_masking")))
 
         # --- Populate Curves ---
         self.curve_editor = CurveEditor()

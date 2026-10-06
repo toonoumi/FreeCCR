@@ -641,9 +641,19 @@ def _restore_image(file_path: str, state: dict, live_merge_sources=None,
         merge_sources = None
         merge_demosaic = True
         merge_mono = False
+    adj = dict(state.get("adjustment_settings") or {})
+    # Sharpening defaults to 25 for NEW images, but a catalog written before the
+    # Details section has no sharpen_* keys — falling through to SLIDER_DEFAULTS
+    # would silently re-sharpen every scan ever made. A non-empty saved dict that
+    # predates the feature therefore pins sharpening OFF, so historical work keeps
+    # rendering exactly as it did. See spec/sharpening.md.
+    if adj and "sharpen_amount" not in adj:
+        adj["sharpen_amount"] = 0
+        adj["sharpen_radius"] = 0
+        adj["sharpen_masking"] = 0
     img = CCRImage(
         file_path,
-        adjustment_settings=dict(state.get("adjustment_settings") or {}),
+        adjustment_settings=adj,
         rotation_angle=state.get("rotation_angle", 0),
         fine_rotation_angle=state.get("fine_rotation_angle", 0),
         horizontal_mirrored=state.get("horizontal_mirrored", False),

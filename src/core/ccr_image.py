@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage, QPixmap  # or from PySide6.QtGui import QImage
 #import lensfunpy  # Make sure lensfunpy is installed
 from core.ccr_processor import (adjust_image, adjust_image_opencl,
                                 BAND_ADJUSTMENT_KEYS, apply_curves,
+                                apply_sharpening,
                                 apply_gamma_curve,
                                 apply_area_layers, apply_crop_to_image,
                                 apply_dust_removal, DUST_FEATHER_DEFAULT,
@@ -1209,8 +1210,22 @@ class CCRImage:
             # previous float divide + astype)
             return cv2.convertScaleAbs(img16, alpha=255.0 / 65535.0)
 
-        # Apply adjustments first
-        adjusted_img = self.apply_adjustments(self.resized_raw)
+        # Apply adjustments first.
+        # The preview is the ONE caller that exaggerates the sharpening radius: a
+        # 1px halo at 6000px is 0.18px here and invisible, so the preview would
+        # show nothing of a feature whose whole point is letting the user see the
+        # grain. Scaling by full/preview puts the halo at roughly the SCREEN size
+        # it occupies when inspecting the full-res file at 100%. Export and zoom
+        # tiles decode at the resolution they need and leave scale at 1.0, where
+        # the radius is exact — and the default must stay 1.0, because deriving
+        # it from original_full_size/buffer would over-sharpen a CROPPED export
+        # (whose buffer is the crop at native resolution). See spec/sharpening.md.
+        full = getattr(self, "original_full_size", None)
+        prev_long = max(self.resized_raw.shape[:2])
+        sharpen_scale = (max(full) / prev_long
+                         if full and prev_long else 1.0)
+        adjusted_img = self.apply_adjustments(self.resized_raw,
+                                              sharpen_scale=sharpen_scale)
 
         # Display-only auto-brightness: the un-converted negative scan is very dark
         # (linear-gamma data sitting low in the 16-bit range). Stretch it so it's
@@ -1661,7 +1676,7 @@ class CCRImage:
                           color_profile=None, areas_override=None,
                           exposure_base=None, ws_windowed=None,
                           auto_gain_override=None, skip_dust=False,
-                          base_curve=None) -> np.ndarray:
+                          base_curve=None, sharpen_scale=1.0) -> np.ndarray:
         """Apply the slider adjustments. The optional overrides let the zoom
         hi-res worker render from a snapshot taken at request time instead of
         live state the GUI thread may be mutating concurrently — and let the
@@ -1817,6 +1832,23 @@ class CCRImage:
             adjusted = apply_area_layers(adjusted, areas, self._adjust_for_area)
         if profile == "bw":
             adjusted = self._to_grayscale(adjusted)
+        # Sharpening is the LAST stage — after gamma, curves, the area composite
+        # and the B&W collapse — because it is output-referred: it sharpens what
+        # the user actually sees. It sits here rather than inside adjust_image
+        # because _adjust_for_area renders through that too, and sharpening is
+        # global by design (spec/sharpening.md Non-Goals). Being outside both
+        # render paths also makes CPU/GPU parity trivial.
+        #
+        # skip_dust doubles as the skip: that flag already means "this is a
+        # detached sample patch, spatial stages are meaningless here" — it is
+        # what solve_neutral_* passes while rendering a small patch in a closed
+        # loop, where a sharpening halo would perturb the mean being solved.
+        if not skip_dust:
+            adjusted = apply_sharpening(adjusted,
+                                        s.get('sharpen_amount', 0),
+                                        s.get('sharpen_radius', 25),
+                                        s.get('sharpen_masking', 0),
+                                        sharpen_scale)
         return adjusted
 
     def _adjust_for_area(self, base_u16: np.ndarray, settings: dict) -> np.ndarray:

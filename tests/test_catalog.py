@@ -56,7 +56,13 @@ class TestCatalogRoundTrip:
         restored = catalog.create_images_for_path(path, path=cat)
         assert len(restored) == 1
         r = restored[0]
-        assert r.adjustment_settings == {"temperature": 12, "saturation": -5}
+        # The saved keys survive. sharpen_* are injected at 0 because this
+        # state predates the Details section — a catalog written before
+        # sharpening existed must keep rendering unsharpened rather than picking
+        # up the new visible default of 25. See spec/sharpening.md.
+        assert r.adjustment_settings["temperature"] == 12
+        assert r.adjustment_settings["saturation"] == -5
+        assert r.adjustment_settings["sharpen_amount"] == 0
         assert r.crop_rect == (0.1, 0.2, 0.8, 0.9)
         assert r.crop_angle == 3.5
         assert r.rotation_angle == 90
@@ -100,7 +106,9 @@ class TestCatalogRoundTrip:
         assert [r.display_name for r in restored] == \
                ["negative_s1.png", "negative_s2.png"]
         assert restored[0].source_ops == ccr_backend.images[0].source_ops
-        assert restored[0].adjustment_settings == {"contrast": 20}
+        assert restored[0].adjustment_settings["contrast"] == 20
+        # Pre-Details state -> sharpening pinned off (spec/sharpening.md).
+        assert restored[0].adjustment_settings["sharpen_amount"] == 0
         for r, orig in zip(restored, originals):
             assert r.converted
             assert r.conversion_inputs["mode"] == "ref_params"

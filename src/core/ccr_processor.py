@@ -4966,3 +4966,72 @@ def apply_area_layers(base_u16: np.ndarray, areas, layer_fn) -> np.ndarray:
         m = build_area_mask(h, w, a)[..., None]
         acc += m * (layer - base)
     return np.clip(acc, 0, 65535).astype(np.uint16)
+
+# --- Sharpening (Details section) --------------------------------------------
+# spec/sharpening.md
+
+SHARPEN_MAX_AMOUNT = 1.5     # slider 100 -> this high-pass gain
+SHARPEN_RADIUS_DIV = 25.0    # slider value / this = native-pixel radius (25 -> 1.0px)
+SHARPEN_MAX_RADIUS = 8.0     # ceiling on the preview-exaggerated radius
+
+
+def apply_sharpening(img16: np.ndarray, amount: float = 0.0,
+                     radius: float = 25.0, masking: float = 0.0,
+                     scale: float = 1.0) -> np.ndarray:
+    """Luma-only unsharp mask — the LAST stage of the adjustment chain.
+
+    Sliders are the panel's usual 0-100 integers: `amount` is the high-pass gain
+    (100 -> SHARPEN_MAX_AMOUNT), `radius` is native pixels x SHARPEN_RADIUS_DIV
+    (25 -> 1.0px), `masking` restricts the effect to edges (0 -> everywhere).
+
+    `scale` exists because a 1px halo at 6000px is 0.18px at 1080px — invisible.
+    The 1080 preview passes full_long/1080 so the halo occupies roughly the
+    SCREEN size it would at 100% on the full-res file: a preview of intent, not
+    of pixels. Export and zoom tiles decode at the resolution they need and so
+    leave it at 1.0, where the radius is exact. It defaults to 1.0 deliberately —
+    deriving it from original_full_size/buffer would over-sharpen a CROPPED
+    export, whose buffer is the crop at native resolution.
+
+    Luma-only by construction: one scalar is added to R, G and B alike, so hue
+    and saturation are untouched and an inverted negative's chroma noise is never
+    amplified. Pure — unit-testable. See spec/sharpening.md."""
+    if amount <= 0 or radius <= 0:
+        return img16
+    h, w = img16.shape[:2]
+    if min(h, w) < 4:
+        return img16
+    r_native = float(radius) / SHARPEN_RADIUS_DIV
+    r_eff = float(np.clip(r_native * max(float(scale), 1.0),
+                          r_native, SHARPEN_MAX_RADIUS))
+    if r_eff <= 0:
+        return img16
+
+    img = img16.astype(np.float32)
+    if img.ndim == 2:
+        luma = img
+    else:
+        luma = (0.2126 * img[..., 0] + 0.7152 * img[..., 1]
+                + 0.0722 * img[..., 2])
+    sigma = r_eff / 2.0
+    blur = cv2.GaussianBlur(luma, (0, 0), sigmaX=sigma, sigmaY=sigma,
+                            borderType=cv2.BORDER_REPLICATE)
+    hp = luma - blur
+
+    if masking > 0:
+        # Gradient of the BLURRED luma, so grain and read noise do not register
+        # as edges and get themselves sharpened.
+        gx = cv2.Scharr(blur, cv2.CV_32F, 1, 0)
+        gy = cv2.Scharr(blur, cv2.CV_32F, 0, 1)
+        g = cv2.magnitude(gx, gy)
+        # Threshold relative to THIS frame's gradient distribution, so the
+        # control means the same thing on a flat sky and a dense cityscape.
+        p95 = float(np.percentile(g, 95.0))
+        t = (float(masking) / 100.0) * p95
+        if t > 0:
+            x = np.clip(g / t, 0.0, 1.0)
+            hp = hp * (x * x * (3.0 - 2.0 * x))      # smoothstep
+        # t == 0 (a wholly flat frame) leaves hp untouched: nothing to mask.
+
+    gain = (float(amount) / 100.0) * SHARPEN_MAX_AMOUNT
+    out = img + (gain * hp if img.ndim == 2 else (gain * hp)[..., None])
+    return np.clip(out, 0, 65535).astype(np.uint16)
