@@ -304,7 +304,8 @@ class MainWindow(QMainWindow):
         # selection) in the slope-source label right away.
         self.sliders_panel._update_bwp_mode_label()
 
-        self.installEventFilter(self)
+        # App-wide: Up/Down switch image no matter which widget has focus.
+        QApplication.instance().installEventFilter(self)
         self.create_menu()
 
         # Restore the active camera-profile selection (applied to every decode).
@@ -1921,7 +1922,12 @@ class MainWindow(QMainWindow):
             ccr_backend.set_white_point(wp)
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Up, Qt.Key_Down):
+        # Up/Down are dedicated to switching image: intercepted app-wide before
+        # any focused slider/spinbox/combo/text field can use them. Only for
+        # widgets in this window, so dialogs and open combo popups keep them.
+        if (event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Up, Qt.Key_Down)
+                and isinstance(obj, QWidget) and obj.window() is self):
             self.thumbnail_list.thumbnail_list.setFocus()
             self.thumbnail_list.thumbnail_list.keyPressEvent(event)
             return True

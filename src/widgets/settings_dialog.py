@@ -13,9 +13,10 @@ operations (they have their own dialogs). See spec/settings-page.md.
 """
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QGroupBox,
+    QAbstractSpinBox, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QGroupBox, QSlider,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea,
     QStackedWidget, QVBoxLayout, QWidget,
 )
@@ -24,6 +25,22 @@ from core import color_management
 from core.awb import AWB_ALGORITHMS, AWB_DEFAULT
 from core.ccr_backend import ccr_backend
 from ui import theme
+
+
+class _WheelScrollsPage(QObject):
+    """Stops a hovered combo/spinbox/slider from eating the mouse wheel: the
+    event is handed to the enclosing page's scrollbar instead, so the page
+    scrolls and the value under the cursor never changes."""
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Wheel:
+            return False
+        area = obj.parentWidget()
+        while area is not None and not isinstance(area, QScrollArea):
+            area = area.parentWidget()
+        if area is not None:
+            QApplication.sendEvent(area.verticalScrollBar(), event)
+        return True
 
 
 class SettingsDialog(QDialog):
@@ -39,7 +56,7 @@ class SettingsDialog(QDialog):
 
         scr = self.screen() or QApplication.primaryScreen()
         avail = scr.availableGeometry() if scr is not None else None
-        w, h = 760, 540
+        w, h = 1000, 760
         if avail is not None:
             w = min(w, avail.width() - 60)
             h = min(h, avail.height() - 80)
@@ -61,6 +78,13 @@ class SettingsDialog(QDialog):
 
         self._add_category("General", self._build_general_page())
         self._add_category("Color Management", self._build_color_management_page())
+
+        # Wheel scrolls the page, never the value under the cursor.
+        self._wheel_filter = _WheelScrollsPage(self)
+        for cls in (QComboBox, QAbstractSpinBox, QSlider):
+            for wdg in self._stack.findChildren(cls):
+                wdg.setFocusPolicy(Qt.StrongFocus)
+                wdg.installEventFilter(self._wheel_filter)
 
         root.addWidget(theme.section_separator())
         footer = QHBoxLayout()
