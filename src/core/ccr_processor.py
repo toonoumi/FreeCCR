@@ -1119,18 +1119,18 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr):
         return None
     # Threshold halfway across the measured base -> clear gap, per channel.
     thr = bp + cfg["gap_frac"] * np.maximum(clear - bp, 0.0)   # (3,) BGR
-    # A channel whose BASE is clipped (blue on a Sony A1 trichrome: base and
-    # holes both at the 63486 saturation) has its threshold AT the clip, and a
-    # strict `>` there can never pass, so letting it vote vetoes the whole
-    # mask. A clipped base carries no information either way, so it abstains.
-    # Only clipping excuses a channel: a base that is merely level with the
-    # brightest thing in an unsaturated channel still votes (and rejects).
-    # The best-separated channel has a gap (checked above), so one votes.
-    votes = ~((bp >= clear) & (clear >= clear.max()))
-    # AND across the voting channels: clear film is bright in EVERY channel;
-    # exposed scene content (even deep shadow) is denser than the zero-exposure
-    # base, so it is lower than base in every channel and structurally excluded.
-    mask = np.all(d[..., :3][..., votes] > thr[votes][None, None, :], axis=2)
+    # A clipped value is always clear film: cap every threshold one code value
+    # below the decode's saturation (the brightest measured clear level). When
+    # the BASE itself is clipped (blue on a Sony A1 trichrome: base and holes
+    # both at 63486) the threshold lands AT the clip and a strict `>` could
+    # never pass, vetoing the whole mask; capped, clipped pixels pass that
+    # channel and the channels that separate base from clear decide. A
+    # channel that is flat below saturation keeps its threshold (and rejects).
+    thr = np.minimum(thr, clear.max() - 1.0)
+    # AND across channels: clear film is bright in EVERY channel; exposed scene
+    # content (even deep shadow) is denser than the zero-exposure base, so it is
+    # lower than base in every channel and structurally excluded.
+    mask = np.all(d[..., :3] > thr[None, None, :], axis=2)
     if not mask.any():
         return None
     m = (mask.astype(np.uint8)) * 255

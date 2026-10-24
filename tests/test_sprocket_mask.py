@@ -61,8 +61,9 @@ def test_holes_found_when_base_sits_just_under_clip():
 def test_holes_found_when_base_is_clipped_in_one_channel():
     """Regression (Sony A1 trichrome, 20261023ScanBBYMtn): the sampled base's
     blue IS the 63486 clip, so blue's threshold sat at the clip and a strict
-    `>` vetoed every pixel — no holes masked. A clipped channel abstains; the
-    channels that separate decide."""
+    `>` vetoed every pixel — no holes masked. A clipped value counts as
+    masked (threshold capped one code below the clip); the channels that
+    separate base from clear decide."""
     bp = (63486, 43446, 62903)
     img = _base_plate(1080, 1080, bp)
     img = _with_square(img, 400, 680, 400, 680, (63486, 63486, 63486))
