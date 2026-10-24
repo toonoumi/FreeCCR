@@ -1118,13 +1118,19 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr):
     if float(gap_d.max()) < cfg["min_clear_d"]:
         return None
     # Threshold halfway across the measured base -> clear gap, per channel.
-    # A channel with no gap (base and holes both clipped) degenerates to
-    # "above base" and leaves the decision to the channels that do separate.
     thr = bp + cfg["gap_frac"] * np.maximum(clear - bp, 0.0)   # (3,) BGR
-    # AND across channels: clear film is bright in EVERY channel; exposed scene
-    # content (even deep shadow) is denser than the zero-exposure base, so it is
-    # lower than base in every channel and structurally excluded.
-    mask = np.all(d[..., :3] > thr[None, None, :], axis=2)
+    # A channel whose BASE is clipped (blue on a Sony A1 trichrome: base and
+    # holes both at the 63486 saturation) has its threshold AT the clip, and a
+    # strict `>` there can never pass, so letting it vote vetoes the whole
+    # mask. A clipped base carries no information either way, so it abstains.
+    # Only clipping excuses a channel: a base that is merely level with the
+    # brightest thing in an unsaturated channel still votes (and rejects).
+    # The best-separated channel has a gap (checked above), so one votes.
+    votes = ~((bp >= clear) & (clear >= clear.max()))
+    # AND across the voting channels: clear film is bright in EVERY channel;
+    # exposed scene content (even deep shadow) is denser than the zero-exposure
+    # base, so it is lower than base in every channel and structurally excluded.
+    mask = np.all(d[..., :3][..., votes] > thr[votes][None, None, :], axis=2)
     if not mask.any():
         return None
     m = (mask.astype(np.uint8)) * 255

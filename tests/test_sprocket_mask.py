@@ -58,6 +58,22 @@ def test_holes_found_when_base_sits_just_under_clip():
     assert alpha[100, 100] == 0                   # base
 
 
+def test_holes_found_when_base_is_clipped_in_one_channel():
+    """Regression (Sony A1 trichrome, 20261023ScanBBYMtn): the sampled base's
+    blue IS the 63486 clip, so blue's threshold sat at the clip and a strict
+    `>` vetoed every pixel — no holes masked. A clipped channel abstains; the
+    channels that separate decide."""
+    bp = (63486, 43446, 62903)
+    img = _base_plate(1080, 1080, bp)
+    img = _with_square(img, 400, 680, 400, 680, (63486, 63486, 63486))
+    img = _with_square(img, 100, 300, 700, 900, (63486, 30000, 50000))  # scene
+    alpha = compute_sprocket_alpha(img, bp)
+    assert alpha is not None
+    assert alpha[540, 540] == 255
+    assert alpha[100, 100] == 0                   # base
+    assert alpha[200, 800] == 0                   # scene, clipped in blue only
+
+
 def test_near_base_shadow_not_whitened():
     """Shadows approach the base (noise, uneven light, a base sampled a touch
     denser): even 40% of the way to the measured clear level they stay
