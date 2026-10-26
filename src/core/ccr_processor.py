@@ -1118,9 +1118,15 @@ def compute_sprocket_alpha(raw_bgr, black_point_bgr):
     if float(gap_d.max()) < cfg["min_clear_d"]:
         return None
     # Threshold halfway across the measured base -> clear gap, per channel.
-    # A channel with no gap (base and holes both clipped) degenerates to
-    # "above base" and leaves the decision to the channels that do separate.
     thr = bp + cfg["gap_frac"] * np.maximum(clear - bp, 0.0)   # (3,) BGR
+    # A clipped value is always clear film: cap every threshold one code value
+    # below the decode's saturation (the brightest measured clear level). When
+    # the BASE itself is clipped (blue on a Sony A1 trichrome: base and holes
+    # both at 63486) the threshold lands AT the clip and a strict `>` could
+    # never pass, vetoing the whole mask; capped, clipped pixels pass that
+    # channel and the channels that separate base from clear decide. A
+    # channel that is flat below saturation keeps its threshold (and rejects).
+    thr = np.minimum(thr, clear.max() - 1.0)
     # AND across channels: clear film is bright in EVERY channel; exposed scene
     # content (even deep shadow) is denser than the zero-exposure base, so it is
     # lower than base in every channel and structurally excluded.
