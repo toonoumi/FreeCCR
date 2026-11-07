@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QSlider, QLabel, QHBoxLayout,
                                 QSizePolicy, QStyleOptionSlider, QFrame, QStyle,
                                 QPushButton, QDialog, QMessageBox, QScrollArea,
-                                QCheckBox, QComboBox, QInputDialog, QMenu)
+                                QCheckBox, QComboBox, QInputDialog, QMenu,
+                                QLineEdit)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QRectF, QSettings
 from PySide6.QtGui import (QKeySequence, QShortcut, QPainter, QColor,
                            QLinearGradient, QPen)
@@ -11,6 +12,10 @@ from core.ccr_processor import (COLOR_BANDS, BAND_PARAMS, BAND_ADJUSTMENT_KEYS,
 from core.film_stocks import (decode_film_stocks, encode_film_stocks,
                               find_film_stock, upsert_film_stock,
                               remove_film_stock)
+from core.adjustment_profiles import (decode_profiles, encode_profiles,
+                                      find_profile, upsert_profile,
+                                      remove_profile, build_profile,
+                                      merge_profile_settings, profile_matches)
 from widgets.curve_editor import CurveEditor
 from widgets.histogram_widget import HistogramWidget
 from widgets.long_press_button import LongPressButton
@@ -73,6 +78,13 @@ SYNC_GROUPS = [
     ("curves", "Curves", ()),
 ]
 
+# Groups a saved adjustment profile may carry: every SYNC_GROUPS entry except
+# the geometry ones — crop, orientation and de-squeeze are per-frame / per-lens
+# facts, not a look. See spec/adjustment-profiles.md.
+PROFILE_GROUP_IDS = tuple(gid for gid, _l, _k in SYNC_GROUPS
+                          if gid not in ("crop", "orientation", "desqueeze"))
+PROFILE_GROUP_KEYS = {gid: keys for gid, _l, keys in SYNC_GROUPS}
+
 
 def _orientation_of(img):
     """The "orientation" group's value for an image: coarse rotation + mirrors.
@@ -99,16 +111,26 @@ class SyncSettingsDialog(QDialog):
 
     def __init__(self, parent=None, selection=None, title="Sync to All",
                  prompt="Sync these settings to all images:",
-                 action_label="Sync"):
+                 action_label="Sync", groups=None, name_prompt=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(theme.DIALOG_W_SM)
         layout = QVBoxLayout(self)
         theme.apply_panel_spacing(layout)
+
+        # Optional name field (Save Profile) above the group list.
+        self._name_edit = None
+        if name_prompt is not None:
+            layout.addWidget(QLabel(name_prompt))
+            self._name_edit = QLineEdit()
+            layout.addWidget(self._name_edit)
+
         layout.addWidget(QLabel(prompt))
 
         self._checkboxes = {}
         for gid, label, _keys in SYNC_GROUPS:
+            if groups is not None and gid not in groups:
+                continue
             checkbox = QCheckBox(label)
             checkbox.setChecked(True if selection is None else selection.get(gid, True))
             layout.addWidget(checkbox)
@@ -149,6 +171,9 @@ class SyncSettingsDialog(QDialog):
 
     def selection(self) -> dict:
         return {gid: checkbox.isChecked() for gid, checkbox in self._checkboxes.items()}
+
+    def name(self) -> str:
+        return self._name_edit.text().strip() if self._name_edit is not None else ""
 
 class CollapsibleSection(QWidget):
     """A toggle-button header that shows/hides its content widget. Default: collapsed."""
@@ -995,47 +1020,190 @@ class SlidersPanel(QWidget):
         label.setFixedHeight(theme.CONTROL_H)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        self.color_profile_combo = QComboBox()
-        self.color_profile_combo.addItems(["Color", "Black & White"])
+        # Eliding: besides Color / Black & White it lists user-named adjustment
+        # profiles (spec/adjustment-profiles.md), which can be arbitrarily long.
+        self.color_profile_combo = theme.ElidingComboBox()
         self.color_profile_combo.setFixedHeight(theme.CONTROL_H)
         theme.shrinkable_combo(self.color_profile_combo)
         self.color_profile_combo.currentIndexChanged.connect(self.on_color_profile_changed)
 
+        self.save_adjust_profile_btn = QPushButton("＋")
+        self.save_adjust_profile_btn.setFixedWidth(theme.GLYPH_W)
+        self.save_adjust_profile_btn.setFixedHeight(theme.CONTROL_H)
+        self.save_adjust_profile_btn.setToolTip(
+            "Save this image's adjustments as a named profile")
+        self.save_adjust_profile_btn.clicked.connect(self._on_save_adjust_profile)
+        self.delete_adjust_profile_btn = QPushButton("−")
+        self.delete_adjust_profile_btn.setFixedWidth(theme.GLYPH_W)
+        self.delete_adjust_profile_btn.setFixedHeight(theme.CONTROL_H)
+        theme.style_button(self.delete_adjust_profile_btn, "danger", glyph_only=True)
+        self.delete_adjust_profile_btn.setToolTip("Delete the selected profile")
+        self.delete_adjust_profile_btn.clicked.connect(self._on_delete_adjust_profile)
+
+        self._profile_group_selection = None  # Save dialog's remembered choice
+        self._adjust_profiles = decode_profiles(
+            self._settings.value("adjust/profiles", "", type=str))
+        self._reload_color_profile_combo()
+
         row = QHBoxLayout()
         row.setSpacing(theme.GAP_TIGHT)
         row.addWidget(label, alignment=Qt.AlignVCenter)
-        row.addWidget(self.color_profile_combo, alignment=Qt.AlignVCenter)
+        row.addWidget(self.color_profile_combo, 1, alignment=Qt.AlignVCenter)
+        row.addWidget(self.save_adjust_profile_btn)
+        row.addWidget(self.delete_adjust_profile_btn)
         return row
 
+    def _reload_color_profile_combo(self):
+        """Rebuild the combo: built-ins, a separator, then the user profiles.
+        Every row carries "builtin:<value>" / "user:<name>" item data, so
+        handlers never count around the separator."""
+        combo = self.color_profile_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Color", "builtin:color")
+        combo.addItem("Black & White", "builtin:bw")
+        if self._adjust_profiles:
+            combo.insertSeparator(combo.count())
+            for profile in self._adjust_profiles:
+                combo.addItem(profile["name"], "user:" + profile["name"])
+        combo.blockSignals(False)
+        self._sync_color_profile_combo(getattr(self, "current_idx", None))
+
     def _sync_color_profile_combo(self, idx):
-        """Reflect the image's stored color profile in the dropdown without
-        firing the change handler."""
+        """Reflect the image in the dropdown without firing the change
+        handler: the first user profile whose values the image's global layer
+        already carries, else its Color / Black & White flag. Derived, never
+        stored — see spec/adjustment-profiles.md."""
         img = ccr_backend.get_image_by_index(idx) if idx is not None else None
         profile = getattr(img, "color_profile", "color") if img is not None else "color"
-        try:
-            row = self.COLOR_PROFILES.index(profile)
-        except ValueError:
-            row = 0
-        self.color_profile_combo.blockSignals(True)
-        self.color_profile_combo.setCurrentIndex(row)
-        self.color_profile_combo.blockSignals(False)
+        data = "builtin:" + (profile if profile in self.COLOR_PROFILES else "color")
+        if img is not None:
+            for p in self._adjust_profiles:
+                if profile_matches(img.adjustment_settings, profile, p,
+                                   PROFILE_GROUP_KEYS, self._default_for):
+                    data = "user:" + p["name"]
+                    break
+        combo = self.color_profile_combo
+        row = combo.findData(data)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(row if row >= 0 else 0)
+        combo.blockSignals(False)
+        self.delete_adjust_profile_btn.setEnabled(
+            combo.isEnabled() and data.startswith("user:"))
+
+    def _save_adjust_profiles_to_settings(self):
+        self._settings.setValue("adjust/profiles",
+                                encode_profiles(self._adjust_profiles))
+
+    def _on_save_adjust_profile(self):
+        """Snapshot the current image's GLOBAL layer for the chosen groups
+        under a name, and show it selected (it matches by construction)."""
+        img = (ccr_backend.get_image_by_index(self.current_idx)
+               if self.current_idx is not None else None)
+        if img is None:
+            self.set_temporary_hint("No image selected to save a profile from",
+                                    duration=3000)
+            return
+        dialog = SyncSettingsDialog(
+            self, self._profile_group_selection, title="Save Profile",
+            prompt="Include these settings:", action_label="Save",
+            groups=PROFILE_GROUP_IDS, name_prompt="Profile name:")
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selection = dialog.selection()
+        self._profile_group_selection = selection
+        groups = [gid for gid in PROFILE_GROUP_IDS if selection.get(gid)]
+        name = dialog.name()
+        if not name or not groups:
+            self.set_temporary_hint(
+                "A profile needs a name and at least one setting group.",
+                duration=4000)
+            return
+        if find_profile(self._adjust_profiles, name) is not None:
+            if QMessageBox.question(
+                    self, "Replace Profile",
+                    f'A profile named "{name}" already exists. Replace it?',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+        record = build_profile(
+            name, groups, img.adjustment_settings,
+            getattr(img, "color_profile", "color"), PROFILE_GROUP_KEYS,
+            self._default_for, created=date.today().isoformat())
+        self._adjust_profiles = upsert_profile(self._adjust_profiles, record)
+        self._save_adjust_profiles_to_settings()
+        self._reload_color_profile_combo()
+        self.set_temporary_hint(f'Profile "{name}" saved.', duration=4000)
+
+    def _on_delete_adjust_profile(self):
+        """Delete the displayed user profile. The image keeps its settings;
+        the combo falls back to Color / Black & White."""
+        data = self.color_profile_combo.currentData() or ""
+        if not data.startswith("user:"):
+            return
+        name = data.split(":", 1)[1]
+        if QMessageBox.question(
+                self, "Delete Profile",
+                f'Delete profile "{name}"? Images keep their current settings.',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._adjust_profiles = remove_profile(self._adjust_profiles, name)
+        self._save_adjust_profiles_to_settings()
+        self._reload_color_profile_combo()
+        self.set_temporary_hint(f'Profile "{name}" deleted.', duration=4000)
+
+    def _adjust_profile_result(self, img, profile):
+        """(global settings, color_profile) the image would have after applying
+        a user profile, or None when that changes nothing. Global layer only —
+        the dropdown is a whole-image control, so an active area is left alone."""
+        # Semantic no-op test (defaults ≡ absent keys): an unedited image's {}
+        # already "carries" an all-defaults profile.
+        if profile_matches(img.adjustment_settings, img.color_profile, profile,
+                           PROFILE_GROUP_KEYS, self._default_for):
+            return None
+        merged = merge_profile_settings(
+            img.adjustment_settings, profile, PROFILE_GROUP_KEYS,
+            self.adjustment_keys, self._default_for)
+        new_profile = (profile["color_profile"] if "profile" in profile["groups"]
+                       else img.color_profile)
+        return merged, new_profile
 
     def on_color_profile_changed(self, index):
-        """Switch the current image between Color and Black & White. A single
-        undoable action; reprocesses the preview/thumbnail (and invalidates
-        the hi-res zoom cache via the adjustment signature)."""
+        """Switch the current image between Color and Black & White, or apply a
+        saved user profile. A single undoable action; reprocesses the
+        preview/thumbnail (and invalidates the hi-res zoom cache via the
+        adjustment signature)."""
         if self.current_idx is None:
             return
         img = ccr_backend.get_image_by_index(self.current_idx)
         if img is None:
             return
-        profile = self.COLOR_PROFILES[index] if 0 <= index < len(self.COLOR_PROFILES) else "color"
-        if img.color_profile == profile:
+        data = self.color_profile_combo.itemData(index)
+        if not data:
+            return  # separator
+        kind, value = data.split(":", 1)
+        result = None
+        if kind == "user":
+            user = find_profile(self._adjust_profiles, value)
+            result = self._adjust_profile_result(img, user) if user else None
+            unchanged = result is None
+        else:
+            unchanged = img.color_profile == value
+        if unchanged:
+            # Nothing to do (e.g. re-picking Color while a matched profile was
+            # shown) — just re-derive what the combo should display.
+            self._sync_color_profile_combo(self.current_idx)
             return
         # Discrete action — don't merge into an in-progress slider undo burst.
         self.end_undo_burst()
         img.push_undo_state()
-        img.color_profile = profile
+        if result is not None:
+            img.adjustment_settings, img.color_profile = result
+            self._load_active_layer(self.current_idx)
+        else:
+            img.color_profile = value
+        self._sync_color_profile_combo(self.current_idx)
         img.update_thumbnail_and_preview()
         mw = self.parent().parent()
         try:
@@ -1057,6 +1225,9 @@ class SlidersPanel(QWidget):
         self.auto_wb_btn.setEnabled(enabled)
         self.crop_btn.setEnabled(enabled)
         self.color_profile_combo.setEnabled(enabled)
+        self.save_adjust_profile_btn.setEnabled(enabled)
+        self.delete_adjust_profile_btn.setEnabled(
+            enabled and (self.color_profile_combo.currentData() or "").startswith("user:"))
         self.curve_editor.setEnabled(enabled)
         # Area editing presupposes a converted positive — gate the Layers list
         # with the same flag as the sliders.
