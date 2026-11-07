@@ -532,6 +532,15 @@ class ThumbnailList(QWidget):
                 transform.scale(1, -1)  # Vertical flip
             transformed_thumbnail = transformed_thumbnail.transformed(transform)
 
+        # Anamorphic de-squeeze LAST — a stretch of the displayed width, as on
+        # the canvas and in the export. See spec/anamorphic-desqueeze.md.
+        desqueeze = ccr_backend.get_image_desqueeze_by_index(idx)
+        if desqueeze != 1.0:
+            transform = QTransform()
+            transform.scale(desqueeze, 1.0)
+            transformed_thumbnail = transformed_thumbnail.transformed(
+                transform, Qt.SmoothTransformation)
+
         # Ensure the transformed thumbnail fits within the icon size (156x156)
         # while maintaining aspect ratio to prevent overlapping
         icon_size = 156

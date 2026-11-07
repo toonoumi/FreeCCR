@@ -159,6 +159,7 @@ class CCRImage:
         ws_windowed: bool = False,
         merge_mono: bool = False,
         input_transfer: Optional[str] = None,
+        desqueeze: float = 1.0,
         ):
         # Normalize file path to handle Unicode characters properly
         self.file_path = os.path.normpath(file_path)
@@ -247,6 +248,10 @@ class CCRImage:
         self.fine_rotation_angle = fine_rotation_angle
         self.horizontal_mirrored = horizontal_mirrored
         self.vertical_mirrored = vertical_mirrored
+        # Anamorphic de-squeeze: horizontal stretch of the DISPLAYED frame
+        # (after orientation), 1.0 = off. Display/export geometry only — never
+        # touches resized_raw. See spec/anamorphic-desqueeze.md.
+        self.desqueeze = float(desqueeze or 1.0)
         self.converted = converted  # Indicates if the image has been converted to CCR format
         # Snapshot of the inputs the CURRENT conversion was baked with —
         # set by the converters, cleared on reload/unconvert. The zoom
@@ -2026,6 +2031,7 @@ class CCRImage:
             "fine_rotation_angle": self.fine_rotation_angle,
             "horizontal_mirrored": self.horizontal_mirrored,
             "vertical_mirrored": self.vertical_mirrored,
+            "desqueeze": getattr(self, "desqueeze", 1.0),
             # Deep copy: each area nests a settings dict (with a curves
             # sub-dict) and a geometry dict — a shallow copy would alias the
             # live structure and a later edit would corrupt the snapshot.
@@ -2060,6 +2066,7 @@ class CCRImage:
         self.fine_rotation_angle = state["fine_rotation_angle"]
         self.horizontal_mirrored = state["horizontal_mirrored"]
         self.vertical_mirrored = state["vertical_mirrored"]
+        self.desqueeze = state.get("desqueeze", 1.0)
         self.area_layers = copy.deepcopy(state.get("area_layers", []))
         self.dust_spots = copy.deepcopy(state.get("dust_spots", []))
         # The previously-active area may have been added back/removed by this

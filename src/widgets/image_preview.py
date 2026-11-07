@@ -891,6 +891,7 @@ class ImagePreview(QWidget):
         self.current_rotation = 0
         self.current_vertical_flip = False
         self.current_horizontal_flip = False
+        self.current_desqueeze = 1.0       # anamorphic de-squeeze (view-level stretch)
 
         self.pixmap_item = None
         self.reference_rect_item = None
@@ -1224,6 +1225,7 @@ class ImagePreview(QWidget):
         self.current_rotation = ccr_backend.get_image_rotation_by_index(idx)
         self.current_vertical_flip = ccr_backend.get_image_vertical_flip_by_index(idx)
         self.current_horizontal_flip = ccr_backend.get_image_horizontal_flip_by_index(idx)
+        self.current_desqueeze = ccr_backend.get_image_desqueeze_by_index(idx)
 
         self.scene.clear()
         self.pixmap_item = None
@@ -1354,18 +1356,43 @@ class ImagePreview(QWidget):
             self.reference_rect_item.setRect(rect)
         self.reference_rect_item.setTransform(base_transform)
 
+    def _desqueeze(self):
+        """Anamorphic de-squeeze factor of the displayed image (1.0 = off)."""
+        k = getattr(self, "current_desqueeze", 1.0) or 1.0
+        return float(k) if k > 0 else 1.0
+
+    def _fit_desqueezed(self, rect, k):
+        """fitInView for an anamorphic frame: the de-squeeze is a horizontal
+        stretch of the VIEW transform, never of the items, so every scene
+        coordinate (crop, sampling, dust, frames) stays exactly what it is
+        without the stretch. The fit therefore sizes the stretched width.
+        See spec/anamorphic-desqueeze.md."""
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        vp = self.view.viewport().rect().adjusted(2, 2, -2, -2)  # fitInView's margin
+        s = min(vp.width() / (rect.width() * k), vp.height() / rect.height())
+        self.view.setTransform(QTransform.fromScale(s * k, s))
+        self.view.centerOn(rect.center())
+
     def _fit_view_to_content(self):
         """Consistently fit the view to the content, prioritizing the pixmap
         item — unless the user is zoomed in, in which case the current
         zoom/pan must never be yanked back to fit."""
+        k = self._desqueeze()
         if self._zoom > 1.0:
             pass
+        elif self.pixmap_item and k != 1.0:
+            self._fit_desqueezed(self.pixmap_item.mapToScene(
+                self.pixmap_item.boundingRect()).boundingRect(), k)
         elif self.pixmap_item:
             # Fit to the transformed pixmap item for consistent zoom behavior
             self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
         elif self.scene.sceneRect() and not self.scene.sceneRect().isNull():
             # Fallback to scene rect if no pixmap item
-            self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+            if k != 1.0:
+                self._fit_desqueezed(self.scene.sceneRect(), k)
+            else:
+                self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
         # Crop handle glyph sizes are baked at draw time from the view scale,
         # which fitInView just changed (window resize, rotate, ...) — rebuild
         # so the drawn handles keep matching their hit-test zones.
@@ -1621,7 +1648,10 @@ class ImagePreview(QWidget):
         vp = self.view.viewport().rect()
         if br.width() <= 0 or br.height() <= 0:
             return 1.0
-        return min(vp.width() / br.width(), vp.height() / br.height())
+        # Vertical scale, like _view_scale: the de-squeeze widens the fitted
+        # content by k on screen.
+        return min(vp.width() / (br.width() * self._desqueeze()),
+                   vp.height() / br.height())
 
     def _preview_to_source_ratio(self):
         """preview-pixmap pixels per source (actual-size) pixel. The displayed
@@ -3464,7 +3494,10 @@ class ImagePreview(QWidget):
     _CORNER_SIGNS = {"tl": (-1, -1), "tr": (1, -1), "bl": (-1, 1), "br": (1, 1)}
 
     def _view_scale(self):
-        m = self.view.transform().m11()
+        # m22, the VERTICAL scale: an anamorphic de-squeeze stretches only the
+        # horizontal axis (m11 = k·m22), and every caller wants view px per
+        # source px. Identical to m11 when there is no de-squeeze.
+        m = self.view.transform().m22()
         return abs(m) if m else 1.0
 
     def _box_transform(self, sel):

@@ -703,6 +703,27 @@ def apply_orientation(img: np.ndarray, rotation_angle: int = 0,
     return img
 
 
+def apply_desqueeze(img: np.ndarray, factor: float = 1.0) -> np.ndarray:
+    """Anamorphic de-squeeze: stretch the (already oriented) frame
+    horizontally by `factor`. Runs AFTER apply_orientation — the lens squeezed
+    the frame's displayed width, whatever way it was scanned. Lanczos, with a
+    float input clipped back to its own range so the kernel's ringing cannot
+    push values outside it (uint16 saturates in cv2 already). Identity, and no
+    copy, when the factor is 1. See spec/anamorphic-desqueeze.md."""
+    factor = float(factor or 1.0)
+    if abs(factor - 1.0) < 1e-6 or img is None or img.ndim < 2:
+        return img
+    h, w = img.shape[:2]
+    new_w = max(1, int(round(w * factor)))
+    out = cv2.resize(np.ascontiguousarray(img), (new_w, h),
+                     interpolation=cv2.INTER_LANCZOS4)
+    if np.issubdtype(img.dtype, np.floating):
+        out = np.clip(out, img.min(), img.max())
+    if img.ndim == 3 and out.ndim == 2:
+        out = out[:, :, None]  # cv2 drops a singleton channel axis
+    return out
+
+
 def ccr_normalize_with_reference(ccr_image,output_path=None,jpg_out=False,jpg_quality=95,max_long_side=None,output_colorspace="srgb",reference_rect=None,fine_rot=None) -> np.ndarray:
     """
     Normalize and align the image using the CCR algorithm, using a reference rectangle
@@ -2136,7 +2157,7 @@ def write_export_image(ccr_image, rgb_u16, output_path, jpg_out, jpg_quality,
                        max_long_side, output_colorspace="srgb"):
     """Single export write chokepoint shared by all three conversion pipelines.
 
-    Resizes to the requested long edge, maps the (sRGB-encoded) result into the
+    Applies the anamorphic de-squeeze, resizes to the requested long edge, maps the (sRGB-encoded) result into the
     chosen output colour space, then writes a 16-bit TIFF (deflate) or 8-bit
     JPEG with the matching ICC profile embedded so a colour-managed viewer
     interprets the file correctly. Returns the resolved output path.
@@ -2147,6 +2168,10 @@ def write_export_image(ccr_image, rgb_u16, output_path, jpg_out, jpg_quality,
     1-component JPEG, and a grey ICC profile in both — so other software reads
     it as greyscale. See spec/monochrome-raw-mode.md §4.3.
     """
+    # Anamorphic de-squeeze BEFORE the long-edge limit, so the limit bounds
+    # the final (stretched) file. Every pipeline has applied orientation by
+    # now, which is the order the canvas shows. See spec/anamorphic-desqueeze.md.
+    rgb_u16 = apply_desqueeze(rgb_u16, getattr(ccr_image, "desqueeze", 1.0))
     if max_long_side:
         rgb_u16 = ccr_image.resize_image_to_max_pixel(rgb_u16, max_long_side)
     mono = renders_monochrome(ccr_image)

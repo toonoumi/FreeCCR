@@ -572,6 +572,12 @@ class CCRBackend:
             return self.images[idx]
         return None
 
+    def get_image_desqueeze_by_index(self, idx: int) -> float:
+        """Anamorphic de-squeeze factor (1.0 = off). See spec/anamorphic-desqueeze.md."""
+        if idx is not None and 0 <= idx < len(self.images):
+            return float(getattr(self.images[idx], "desqueeze", 1.0) or 1.0)
+        return 1.0
+
     def get_image_horizontal_flip_by_index(self, idx: int) -> bool:
         if idx is not None and 0 <= idx < len(self.images):
             return self.images[idx].horizontal_mirrored
@@ -828,6 +834,7 @@ class CCRBackend:
         image_obj.fine_rotation_angle = 0
         image_obj.horizontal_mirrored = False
         image_obj.vertical_mirrored = False
+        image_obj.desqueeze = 1.0
         image_obj.color_profile = "color"
         # The conversion is gone, so the undo history (which never captured
         # the conversion anyway) would be inconsistent — drop it.
@@ -1924,6 +1931,7 @@ class CCRBackend:
                 fine_rotation_angle=img.fine_rotation_angle,
                 horizontal_mirrored=img.horizontal_mirrored,
                 vertical_mirrored=img.vertical_mirrored,
+                desqueeze=getattr(img, "desqueeze", 1.0),
                 converted=img.converted,
                 source_ops=list(img.source_ops),
                 preloaded_img=img.resized_raw.copy(),
@@ -2207,6 +2215,7 @@ class CCRBackend:
                     rotation_angle=img_obj.rotation_angle,
                     horizontal_mirrored=img_obj.horizontal_mirrored,
                     vertical_mirrored=img_obj.vertical_mirrored,
+                    desqueeze=getattr(img_obj, "desqueeze", 1.0),
                     converted=child_ci is not None,
                     source_ops=(img_obj.source_ops + crop_ops
                                 + [(baked_rotation, tile)]),
@@ -2407,6 +2416,7 @@ class CCRBackend:
                 fine_rotation_angle=baked_rotation,
                 horizontal_mirrored=template.horizontal_mirrored,
                 vertical_mirrored=template.vertical_mirrored,
+                desqueeze=getattr(template, "desqueeze", 1.0),
                 converted=False,
                 source_ops=parent_ops,
                 display_name=parent_name,
