@@ -2,7 +2,13 @@ PySide6==6.7.1
 numpy>=1.24,<2.0
 exifread
 opencv-python
-rawpy
+# >=0.28: bundles LibRaw 0.22, whose Fujifilm X-T3/X-T4/X-T30/X100V/X-S10
+# colour matrix has the correct sign on the blue row (-580). LibRaw 0.21
+# shipped +580, which rendered skin tones yellow. See tests/test_libraw_version.py.
+# Intel macOS is the exception: rawpy stopped shipping x86_64 macOS wheels
+# after 0.25.1 (LibRaw 0.21), so that build still has the old matrix.
+rawpy>=0.28.0; not (sys_platform == 'darwin' and platform_machine == 'x86_64')
+rawpy; sys_platform == 'darwin' and platform_machine == 'x86_64'
 tifffile
 imagecodecs
 requests
