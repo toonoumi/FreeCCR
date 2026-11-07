@@ -1,5 +1,5 @@
-from PySide6.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QProgressDialog
-from PySide6.QtGui import QIcon, QShortcut, QKeySequence
+from PySide6.QtWidgets import QApplication, QMainWindow, QHBoxLayout, QWidget, QFileDialog, QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QProgressDialog, QInputDialog
+from PySide6.QtGui import QIcon, QShortcut, QKeySequence, QActionGroup
 from PySide6.QtCore import (Qt, QEvent, QThread, Signal, QObject, QSettings,
                             QTimer, QMetaObject, Q_ARG)
 from widgets.thumbnail_list import ThumbnailList
@@ -640,6 +640,10 @@ class MainWindow(QMainWindow):
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(self.open_settings)
 
+        # Edit menu — geometry edits that apply to the selected images.
+        self.edit_menu = menu_bar.addMenu("Edit")
+        self._build_desqueeze_menu(self.edit_menu)
+
         # Add Help menu with About, Licenses, and Help actions
         help_menu = menu_bar.addMenu("Help")
         about_action = help_menu.addAction("About")
@@ -650,6 +654,96 @@ class MainWindow(QMainWindow):
 
         help_action = help_menu.addAction("Help")
         help_action.triggered.connect(self.open_help_website)
+
+    # --- Anamorphic de-squeeze (Edit menu) ---------------------------------
+    # Common anamorphic squeeze factors: 1.33x (4:3 -> 16:9 adapters), the
+    # 1.5-1.8x modern still/cine lenses, 2.0x classic CinemaScope. 1.0 = off.
+    # See spec/anamorphic-desqueeze.md.
+    DESQUEEZE_PRESETS = (1.2, 1.25, 1.33, 1.4, 1.44, 1.5, 1.55, 1.6, 1.65,
+                         1.8, 2.0)
+    DESQUEEZE_MIN = 1.0
+    DESQUEEZE_MAX = 3.0
+
+    def _build_desqueeze_menu(self, parent_menu):
+        menu = parent_menu.addMenu("Anamorphic De-squeeze")
+        self.desqueeze_menu = menu
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._desqueeze_actions = {}
+        none_action = menu.addAction("None (1.0×)")
+        none_action.setCheckable(True)
+        none_action.triggered.connect(lambda _=False: self.set_desqueeze(1.0))
+        group.addAction(none_action)
+        self._desqueeze_actions[1.0] = none_action
+        menu.addSeparator()
+        for f in self.DESQUEEZE_PRESETS:
+            act = menu.addAction(f"{f:g}×")
+            act.setCheckable(True)
+            act.triggered.connect(lambda _=False, f=f: self.set_desqueeze(f))
+            group.addAction(act)
+            self._desqueeze_actions[f] = act
+        menu.addSeparator()
+        self.desqueeze_custom_action = menu.addAction("Custom…")
+        self.desqueeze_custom_action.setCheckable(True)
+        self.desqueeze_custom_action.triggered.connect(self._prompt_custom_desqueeze)
+        group.addAction(self.desqueeze_custom_action)
+        menu.aboutToShow.connect(self._refresh_desqueeze_menu)
+
+    def _current_desqueeze(self):
+        idx = self.image_preview.current_idx
+        return ccr_backend.get_image_desqueeze_by_index(idx) if idx is not None else 1.0
+
+    def _refresh_desqueeze_menu(self):
+        """Check the entry matching the displayed image's factor."""
+        k = round(self._current_desqueeze(), 4)
+        preset = self._desqueeze_actions.get(k)
+        if preset is not None:
+            preset.setChecked(True)
+            self.desqueeze_custom_action.setText("Custom…")
+        else:
+            self.desqueeze_custom_action.setChecked(True)
+            self.desqueeze_custom_action.setText(f"Custom ({k:g}×)…")
+
+    def _prompt_custom_desqueeze(self):
+        value, ok = QInputDialog.getDouble(
+            self, "Anamorphic De-squeeze",
+            "Horizontal de-squeeze factor:",
+            self._current_desqueeze(), self.DESQUEEZE_MIN, self.DESQUEEZE_MAX, 2)
+        if ok:
+            self.set_desqueeze(value)
+        else:
+            self._refresh_desqueeze_menu()  # cancelled: restore the real check
+
+    def set_desqueeze(self, factor):
+        """Set the anamorphic de-squeeze on every selected image (the displayed
+        one when nothing is selected). Display/export geometry only: no
+        reprocess, one undo snapshot per changed image."""
+        factor = round(max(self.DESQUEEZE_MIN, min(self.DESQUEEZE_MAX, float(factor))), 4)
+        indices = list(self.thumbnail_list.selected_indices())
+        cur = self.image_preview.current_idx
+        if not indices and cur is not None:
+            indices = [cur]
+        changed = []
+        for idx in indices:
+            img = ccr_backend.get_image_by_index(idx)
+            if img is None or getattr(img, "desqueeze", 1.0) == factor:
+                continue
+            img.push_undo_state()
+            img.desqueeze = factor
+            changed.append(idx)
+        if not changed:
+            return
+        for idx in changed:
+            self.thumbnail_list.update_thumbnail(idx)
+        if cur in changed:
+            # The on-screen width changes — a kept zoom would strand the view.
+            self.image_preview._reset_zoom()
+            self.image_preview.update_preview(cur)
+        label = "off" if factor == 1.0 else f"{factor:g}×"
+        n = len(changed)
+        plural = "s" if n != 1 else ""
+        self.sliders_panel.set_temporary_hint(
+            f"Anamorphic de-squeeze {label} on {n} image{plural}.", duration=2500)
 
     # --- Color management (global input profile, lives in Settings) -------
     def open_settings(self):
@@ -1775,11 +1869,12 @@ class MainWindow(QMainWindow):
         fine = getattr(src, "fine_rotation_angle", 0)
         hflip = getattr(src, "horizontal_mirrored", False)
         vflip = getattr(src, "vertical_mirrored", False)
+        desqueeze = float(getattr(src, "desqueeze", 1.0) or 1.0)
         crop = getattr(src, "crop_rect", None)
         crop_angle = getattr(src, "crop_angle", 0.0) or 0.0
         profile = getattr(src, "color_profile", "color")
         if not (adj or areas or rot or fine or hflip or vflip
-                or crop is not None or crop_angle or profile != "color"):
+                or desqueeze != 1.0 or crop is not None or crop_angle or profile != "color"):
             return None
         return {
             "adjustment_settings": copy.deepcopy(adj),
@@ -1788,6 +1883,7 @@ class MainWindow(QMainWindow):
             "fine_rotation_angle": fine,
             "horizontal_mirrored": hflip,
             "vertical_mirrored": vflip,
+            "desqueeze": desqueeze,
             "crop_rect": crop,
             "crop_angle": crop_angle,
             "color_profile": profile,
@@ -1804,6 +1900,7 @@ class MainWindow(QMainWindow):
         img.fine_rotation_angle = t["fine_rotation_angle"]
         img.horizontal_mirrored = t["horizontal_mirrored"]
         img.vertical_mirrored = t["vertical_mirrored"]
+        img.desqueeze = t.get("desqueeze", 1.0)
         img.crop_rect = t["crop_rect"]
         img.crop_angle = t["crop_angle"]
         img.color_profile = t["color_profile"]

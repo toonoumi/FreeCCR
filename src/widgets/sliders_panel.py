@@ -43,6 +43,11 @@ SYNC_GROUPS = [
     # edge, and the straighten a user sets rides "crop" as the crop angle.
     # See spec/orientation-sync-group.md.
     ("orientation", "Orientation (rotate 90° / mirror)", ()),
+    # Anamorphic de-squeeze factor — a per-roll lens property, synced like
+    # orientation (display/export geometry, no reprocess). Own group so a user
+    # can push the lens factor without touching each frame's rotation.
+    # See spec/anamorphic-desqueeze.md.
+    ("desqueeze", "Anamorphic De-squeeze", ()),
     ("channels", "Channel Levels (incl. Master Gain)", (
         "ch_input_gain", "ch_master_shift", "ch_master_gain",
         "ch_r_shift", "ch_r_gain", "ch_r_blackpoint",
@@ -370,6 +375,7 @@ class SlidersPanel(QWidget):
         # (rotation_angle, horizontal_mirrored, vertical_mirrored) when the
         # orientation group was copied. See spec/orientation-sync-group.md.
         self.copied_orientation = None
+        self.copied_desqueeze = None   # float factor when that group was copied
         self._hint_timer = QTimer(self)  # Timer for temporary hints
         self._hint_timer.setSingleShot(True)
         
@@ -1604,6 +1610,7 @@ class SlidersPanel(QWidget):
         sync_profile = bool(selection.get("profile"))
         sync_curves = bool(selection.get("curves"))
         sync_orientation = bool(selection.get("orientation"))
+        sync_desqueeze = bool(selection.get("desqueeze"))
         # Sync always copies the SOURCE image's GLOBAL (whole-image) layer, not
         # the live sliders — those may currently reflect an active area, and
         # areas are per-image (never synced). Read from the global dict.
@@ -1615,6 +1622,7 @@ class SlidersPanel(QWidget):
         crop_angle = getattr(src, "crop_angle", 0.0) if src is not None else 0.0
         src_profile = getattr(src, "color_profile", "color") if src is not None else "color"
         src_orientation = _orientation_of(src)
+        src_desqueeze = float(getattr(src, "desqueeze", 1.0) or 1.0) if src is not None else 1.0
         print(f"Syncing groups {sorted(g for g, on in selection.items() if on)} to all images")
 
         for img in ccr_backend.images:
@@ -1626,8 +1634,11 @@ class SlidersPanel(QWidget):
             profile_changes = sync_profile and getattr(img, "color_profile", "color") != src_profile
             curves_changes = sync_curves and img.adjustment_settings.get("curves") != src_curves
             orient_changes = sync_orientation and _orientation_of(img) != src_orientation
+            desqueeze_changes = (sync_desqueeze
+                                 and getattr(img, "desqueeze", 1.0) != src_desqueeze)
             if (not adj_changes and not crop_changes and not profile_changes
-                    and not curves_changes and not orient_changes):
+                    and not curves_changes and not orient_changes
+                    and not desqueeze_changes):
                 continue  # nothing to change — and no dead undo snapshot
             img.push_undo_state()
             if adj_changes:
@@ -1665,6 +1676,8 @@ class SlidersPanel(QWidget):
                 # Display-level only (no reprocess): the thumbnail refresh and
                 # update_preview below re-apply it from these attributes.
                 _apply_orientation(img, src_orientation)
+            if desqueeze_changes:
+                img.desqueeze = src_desqueeze  # display-level, like orientation
             if adj_changes or profile_changes or curves_changes or crop_changes:
                 # Adjustments, curves, and the color profile all change pixels;
                 # a crop change moves the region the histogram is computed over
@@ -2194,6 +2207,9 @@ class SlidersPanel(QWidget):
         self.copied_orientation = (_orientation_of(img)
                                    if selection.get("orientation") and img is not None
                                    else None)
+        self.copied_desqueeze = (float(getattr(img, "desqueeze", 1.0) or 1.0)
+                                 if selection.get("desqueeze") and img is not None
+                                 else None)
         self.copied_selection = selection
         print(f"Copied groups {sorted(g for g, on in selection.items() if on)}: "
               f"{self.copied_adjustment}")
@@ -2277,6 +2293,14 @@ class SlidersPanel(QWidget):
                 # paste re-orients what's on screen — a kept zoom would strand
                 # the viewport, exactly as for rotate_left/right and undo.
                 _apply_orientation(img, self.copied_orientation)
+                reset_zoom = getattr(self.parent().parent().image_preview,
+                                     "_reset_zoom", None)
+                if callable(reset_zoom):
+                    reset_zoom()
+            if (selection.get("desqueeze") and self.copied_desqueeze is not None
+                    and getattr(img, "desqueeze", 1.0) != self.copied_desqueeze):
+                # Changes the on-screen width — same zoom reset as orientation.
+                img.desqueeze = self.copied_desqueeze
                 reset_zoom = getattr(self.parent().parent().image_preview,
                                      "_reset_zoom", None)
                 if callable(reset_zoom):

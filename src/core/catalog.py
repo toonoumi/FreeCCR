@@ -237,6 +237,9 @@ def serialize_image(img) -> dict:
         "fine_rotation_angle": int(img.fine_rotation_angle),
         "horizontal_mirrored": bool(img.horizontal_mirrored),
         "vertical_mirrored": bool(img.vertical_mirrored),
+        # Anamorphic de-squeeze (1.0 = off). Additive: an absent key restores
+        # as 1.0. See spec/anamorphic-desqueeze.md.
+        "desqueeze": float(getattr(img, "desqueeze", 1.0) or 1.0),
         "contrast_base": int(img.contrast_base),
         "temperature_base": int(img.temperature_base),
         "brightness_base": int(img.brightness_base),
@@ -281,6 +284,7 @@ def _is_pristine(state: dict) -> bool:
             and state["crop_rect"] is None
             and state["rotation_angle"] == 0 and state["fine_rotation_angle"] == 0
             and not state["horizontal_mirrored"] and not state["vertical_mirrored"]
+            and float(state.get("desqueeze", 1.0)) == 1.0
             and state["reference_frame"] is None)
 
 
@@ -658,6 +662,7 @@ def _restore_image(file_path: str, state: dict, live_merge_sources=None,
         fine_rotation_angle=state.get("fine_rotation_angle", 0),
         horizontal_mirrored=state.get("horizontal_mirrored", False),
         vertical_mirrored=state.get("vertical_mirrored", False),
+        desqueeze=state.get("desqueeze", 1.0),
         source_ops=source_ops,
         display_name=state.get("display_name"),
         slice_group=state.get("slice_group"),
